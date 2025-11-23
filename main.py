@@ -44,7 +44,7 @@ class ProjectionMappingApp(QMainWindow):
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
 
-        self.worker = Worker()
+        self.worker = Worker(parent=None)
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
 
