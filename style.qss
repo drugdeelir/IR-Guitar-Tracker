@@ -1,0 +1,71 @@
+
+QWidget {
+    background-color: #2e2e2e;
+    color: #ffffff;
+    border: none;
+    font-size: 14px;
+}
+
+QMainWindow {
+    background-color: #2e2e2e;
+}
+
+QGroupBox {
+    background-color: #404040;
+    border: 1px solid #555555;
+    border-radius: 5px;
+    margin-top: 1ex; /* leave space at the top for the title */
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top center;
+    padding: 0 3px;
+    background-color: #404040;
+}
+
+QPushButton {
+    background-color: #555555;
+    color: #ffffff;
+    border: 1px solid #666666;
+    padding: 5px;
+    border-radius: 5px;
+}
+
+QPushButton:hover {
+    background-color: #666666;
+}
+
+QPushButton:pressed {
+    background-color: #444444;
+}
+
+QPushButton:checked {
+    background-color: #007acc;
+    border-color: #005c99;
+}
+
+QComboBox {
+    background-color: #404040;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 1px 18px 1px 3px;
+    min-width: 6em;
+}
+
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 15px;
+    border-left-width: 1px;
+    border-left-color: #555555;
+    border-left-style: solid;
+    border-top-right-radius: 3px;
+    border-bottom-right-radius: 3px;
+}
+
+QListWidget {
+    background-color: #404040;
+    border: 1px solid #555555;
+    border-radius: 5px;
+}
