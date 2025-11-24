@@ -3,10 +3,12 @@ import cv2
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal, QThread
 from PyQt5.QtGui import QImage
+from itertools import combinations
 
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
     projector_frame_ready = pyqtSignal(QImage)
+    still_frame_ready = pyqtSignal(QImage)
     trackers_detected = pyqtSignal(int)
     camera_error = pyqtSignal(int)
 
@@ -22,6 +24,30 @@ class Worker(QObject):
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
         self._calibrate_depth_flag = False
+        self._capture_still_frame_flag = False
+        self.marker_config = None
+
+    def set_marker_points(self, points):
+        # The points are QPoints, convert them to tuples
+        self.marker_config = [ (p.x(), p.y()) for p in points]
+
+        # Calculate the "fingerprint" of the markers (distances between all pairs)
+        if len(self.marker_config) > 1:
+            distances = []
+            for p1, p2 in combinations(self.marker_config, 2):
+                dist = np.linalg.norm(np.array(p1) - np.array(p2))
+                distances.append(dist)
+            self.marker_fingerprint = sorted(distances)
+            print(f"Marker fingerprint calculated: {self.marker_fingerprint}")
+        else:
+            self.marker_fingerprint = []
+
+    def clear_marker_config(self):
+        self.marker_config = None
+        self.marker_fingerprint = []
+
+    def capture_still_frame(self):
+        self._capture_still_frame_flag = True
 
     def calibrate_depth(self):
         self._calibrate_depth_flag = True
@@ -70,14 +96,82 @@ class Worker(QObject):
             contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             
             tracked_points = []
+
+            # First, extract all potential points from contours
+            all_detected_points = []
             for contour in contours:
-                # Filter contours by area to remove noise
-                if cv2.contourArea(contour) > 20:
+                if cv2.contourArea(contour) > 20: # Area filter
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         cX = int(M["m10"] / M["m00"])
                         cY = int(M["m01"] / M["m00"])
-                        tracked_points.append((cX, cY))
+                        all_detected_points.append((cX, cY))
+
+            # If a marker configuration has been set, use the advanced tracking
+            if self.marker_config and hasattr(self, 'marker_fingerprint') and len(self.marker_config) > 1 and len(all_detected_points) >= len(self.marker_config):
+
+                # To prevent performance issues, only check a reasonable number of points
+                # Sort points by some criteria (e.g., size) and take the top N could be an option
+                # For now, we'll just cap the number of points to consider.
+                points_to_check = all_detected_points[:20]
+
+                num_markers = len(self.marker_config)
+
+                # Iterate through all combinations of detected points that match the number of configured markers
+                for point_combo in combinations(points_to_check, num_markers):
+
+                    # Calculate the fingerprint for the current combination
+                    current_distances = []
+                    for p1, p2 in combinations(point_combo, 2):
+                        dist = np.linalg.norm(np.array(p1) - np.array(p2))
+                        current_distances.append(dist)
+                    current_fingerprint = sorted(current_distances)
+
+                    # Compare with the stored fingerprint (with a tolerance)
+                    is_match = True
+                    if len(current_fingerprint) == len(self.marker_fingerprint):
+                        for i in range(len(current_fingerprint)):
+                            if not np.isclose(current_fingerprint[i], self.marker_fingerprint[i], rtol=0.15): # 15% tolerance
+                                is_match = False
+                                break
+                    else:
+                        is_match = False
+
+                    if is_match:
+                        # The constellation matches. Now, we must order the points correctly.
+                        # We find the perspective transform that maps the original marker configuration
+                        # to the current detected points. This is robust to rotation and perspective shifts.
+
+                        src_pts = np.float32(self.marker_config).reshape(-1, 1, 2)
+                        dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
+
+                        # Find the homography matrix
+                        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+                        if matrix is not None:
+                            # Transform the original points to their new predicted locations
+                            transformed_src = cv2.perspectiveTransform(src_pts, matrix)
+
+                            # Now, match the actual detected points (dst_pts) to these
+                            # transformed source points to get the correct order.
+                            ordered_points = [None] * num_markers
+                            remaining_dst = list(point_combo)
+
+                            for i in range(num_markers):
+                                predicted_pt = transformed_src[i][0]
+                                closest_actual_pt = min(remaining_dst, key=lambda p: np.linalg.norm(np.array(p) - predicted_pt))
+
+                                ordered_points[i] = closest_actual_pt
+                                remaining_dst.remove(closest_actual_pt)
+
+                            tracked_points = ordered_points
+                            break
+                        else:
+                            # If we can't find a homography, this isn't a valid match
+                            continue
+            else:
+                # Fallback to old behavior if no config is set
+                tracked_points = all_detected_points
             
             self.trackers_detected.emit(len(tracked_points))
 
@@ -111,7 +205,12 @@ class Worker(QObject):
                         src_pts = np.float32(mask.source_points)
 
                         # The destination points are the live tracker positions
-                        dst_pts_raw = np.float32([tracked_points[i] for i in mask.tracker_ids[:4]])
+                        # With the new system, we use all tracked points that correspond to the mask vertices
+                        if len(tracked_points) != len(mask.source_points):
+                            # Not enough trackers were found for this mask, so skip it
+                            continue
+
+                        dst_pts_raw = np.float32(tracked_points)
                         
                         # Apply depth scaling
                         if self.baseline_distance > 0 and len(tracked_points) >= 2:
@@ -135,6 +234,13 @@ class Worker(QObject):
                         projector_output = cv2.bitwise_and(projector_output, cv2.bitwise_not(mask_image))
                         projector_output = cv2.add(projector_output, cv2.bitwise_and(warped_cue, mask_image))
 
+
+            # Still frame capture for marker selection
+            if self._capture_still_frame_flag:
+                rgb_image_still = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                qt_image_still = QImage(rgb_image_still.data, w, h, w * 3, QImage.Format_RGB888)
+                self.still_frame_ready.emit(qt_image_still)
+                self._capture_still_frame_flag = False
 
             # Main display processing (shows the raw camera feed with trackers)
             rgb_image_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)

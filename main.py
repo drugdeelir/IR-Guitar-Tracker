@@ -3,8 +3,9 @@ import sys
 import time
 import cv2
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog, QLineEdit, QSlider, QListWidget, QStatusBar
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from widgets import VideoDisplay, ProjectorWindow
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
@@ -28,6 +29,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setWindowTitle("Projection Mapping Tool")
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
+        self.selected_markers = []
 
         self.setStatusBar(QStatusBar(self))
 
@@ -53,9 +55,50 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.warp_points_changed.connect(self.worker.set_warp_points)
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.camera_error.connect(self.show_camera_error)
+        self.marker_selection_dialog = MarkerSelectionDialog(self)
+        self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
+
+    def open_marker_selection_dialog(self):
+        self.marker_selection_dialog.clear_selection()
+        # Disconnect any previous connections to avoid multiple calls
+        try:
+            self.marker_selection_dialog.take_picture_button.clicked.disconnect()
+        except TypeError:
+            pass # No connections to disconnect
+        self.marker_selection_dialog.take_picture_button.clicked.connect(self.start_marker_capture_countdown)
+
+        if self.marker_selection_dialog.exec_(): # This is a blocking call
+            self.selected_markers = self.marker_selection_dialog.get_selected_points()
+            print(f"Selected {len(self.selected_markers)} markers.")
+            self.worker.set_marker_points(self.selected_markers)
+
+    def start_marker_capture_countdown(self):
+        self.marker_selection_dialog.take_picture_button.setEnabled(False)
+        self.countdown_timer = QTimer(self)
+        self.countdown_seconds = 7
+        self.countdown_timer.timeout.connect(self.update_countdown)
+        self.countdown_timer.start(1000)
+
+    def update_countdown(self):
+        if self.countdown_seconds > 0:
+            self.marker_selection_dialog.take_picture_button.setText(f"{self.countdown_seconds}...")
+            self.countdown_seconds -= 1
+        else:
+            self.countdown_timer.stop()
+            self.marker_selection_dialog.take_picture_button.setText("Take Picture")
+            self.marker_selection_dialog.take_picture_button.setEnabled(True)
+            self.worker.capture_still_frame()
+
+    def set_marker_selection_image(self, image):
+        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image))
+
+    def clear_marker_selection(self):
+        self.selected_markers = []
+        self.worker.clear_marker_config()
+        self.statusBar().showMessage("Marker selection cleared.", 3000)
 
     def create_control_panel(self):
         self.control_panel = QWidget()
@@ -122,6 +165,16 @@ class ProjectionMappingApp(QMainWindow):
         ir_layout.addWidget(QLabel("IR Threshold:"))
         ir_layout.addWidget(self.ir_threshold_slider)
         ir_layout.addWidget(self.ir_trackers_label)
+
+        self.select_markers_button = QPushButton("Select Guitar Markers")
+        self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
+
+        self.clear_markers_button = QPushButton("Clear Marker Selection")
+        self.clear_markers_button.clicked.connect(self.clear_marker_selection)
+
+        ir_layout.addWidget(self.select_markers_button)
+        ir_layout.addWidget(self.clear_markers_button)
+
         ir_group.setLayout(ir_layout)
         self.control_layout.addWidget(ir_group)
 
@@ -137,20 +190,11 @@ class ProjectionMappingApp(QMainWindow):
         self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
         self.cancel_mask_button.setEnabled(False)
         self.mask_points_list = QListWidget()
-        
-        tracker_link_layout = QHBoxLayout()
-        self.tracker_link_input = QLineEdit("0,1,2,3")
-        self.link_trackers_button = QPushButton("Link Trackers")
-        self.link_trackers_button.clicked.connect(self.link_trackers_to_mask)
-        tracker_link_layout.addWidget(QLabel("Trackers:"))
-        tracker_link_layout.addWidget(self.tracker_link_input)
-        tracker_link_layout.addWidget(self.link_trackers_button)
 
         mask_layout.addWidget(self.create_mask_button)
         mask_layout.addWidget(self.finish_mask_button)
         mask_layout.addWidget(self.cancel_mask_button)
         mask_layout.addWidget(self.mask_points_list)
-        mask_layout.addLayout(tracker_link_layout)
         mask_group.setLayout(mask_layout)
         self.control_layout.addWidget(mask_group)
 
@@ -217,22 +261,6 @@ class ProjectionMappingApp(QMainWindow):
 
     def add_mask_point_to_list(self, point):
         self.mask_points_list.addItem(f"({point.x()}, {point.y()})")
-
-    def link_trackers_to_mask(self):
-        current_item = self.cue_list_widget.currentItem()
-        if current_item:
-            row = self.cue_list_widget.row(current_item)
-            if 0 <= row < len(self.masks):
-                try:
-                    tracker_ids_str = self.tracker_link_input.text().split(',')
-                    tracker_ids = [int(i.strip()) for i in tracker_ids_str]
-                    if len(tracker_ids) == 4:
-                        self.masks[row].tracker_ids = tracker_ids
-                        self.statusBar().showMessage(f"Trackers {tracker_ids} linked to {self.masks[row].name}", 3000)
-                    else:
-                        self.statusBar().showMessage("Error: Please enter 4 tracker indices.", 3000)
-                except ValueError:
-                    self.statusBar().showMessage("Error: Invalid tracker indices.", 3000)
 
     def update_ir_threshold(self, value):
         self.worker.set_ir_threshold(value)
