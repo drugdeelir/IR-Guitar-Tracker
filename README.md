@@ -48,7 +48,8 @@ This project uses `py2app` to create a standalone macOS application. This is the
     pip install -r requirements.txt
     ```
 
-2.  **Clean Previous Builds:**
+2.  **Clean Previous Builds (Important):**
+    Before each build, make sure to remove any old build artifacts to prevent errors.
     ```bash
     rm -rf build dist
     ```
