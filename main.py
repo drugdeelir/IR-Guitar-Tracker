@@ -195,6 +195,11 @@ class ProjectionMappingApp(QMainWindow):
         mask_layout.addWidget(self.finish_mask_button)
         mask_layout.addWidget(self.cancel_mask_button)
         mask_layout.addWidget(self.mask_points_list)
+
+        self.link_mask_button = QPushButton("Link Mask to Markers")
+        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
+        mask_layout.addWidget(self.link_mask_button)
+
         mask_group.setLayout(mask_layout)
         self.control_layout.addWidget(mask_group)
 
@@ -261,6 +266,28 @@ class ProjectionMappingApp(QMainWindow):
 
     def add_mask_point_to_list(self, point):
         self.mask_points_list.addItem(f"({point.x()}, {point.y()})")
+
+    def link_mask_to_markers(self):
+        current_item = self.cue_list_widget.currentItem()
+        if not current_item:
+            self.statusBar().showMessage("Please select a cue to link.", 3000)
+            return
+
+        if not self.selected_markers:
+            self.statusBar().showMessage("Please select IR markers first.", 3000)
+            return
+
+        row = self.cue_list_widget.row(current_item)
+        if 0 <= row < len(self.masks):
+            mask = self.masks[row]
+            if len(mask.source_points) != len(self.selected_markers):
+                self.statusBar().showMessage(f"Error: Mask has {len(mask.source_points)} points, but {len(self.selected_markers)} markers are selected.", 5000)
+            else:
+                # The association is now implicit. The worker will use the currently
+                # selected markers for any mask that has the correct number of vertices.
+                # We can add a property to the mask to make this explicit.
+                mask.linked_marker_count = len(self.selected_markers)
+                self.statusBar().showMessage(f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000)
 
     def update_ir_threshold(self, value):
         self.worker.set_ir_threshold(value)

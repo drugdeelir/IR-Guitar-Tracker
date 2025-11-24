@@ -16,9 +16,10 @@ class SplashScreen(QSplashScreen):
         
         self.cap = cv2.VideoCapture('logo.mkv')
         if not self.cap.isOpened():
-            print("Error: Could not open logo.mkv")
-            # Fallback to a static image or just close
-            self.close()
+            print("Warning: Could not open logo.mkv. Attempting to use logo.png fallback.")
+            pixmap = QPixmap('logo.png')
+            if not pixmap.isNull():
+                self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             return
             
         self.timer = QTimer(self)

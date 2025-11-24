@@ -187,7 +187,8 @@ class Worker(QObject):
 
             # Process cues and warp masks
             for mask in self.masks:
-                if mask.type == 'dynamic' and len(tracked_points) >= 4:
+                # Only process masks that are linked to the current number of tracked markers
+                if mask.type == 'dynamic' and mask.linked_marker_count == len(tracked_points):
                     if mask.video_path not in self.video_captures:
                         self.video_captures[mask.video_path] = cv2.VideoCapture(mask.video_path)
                     
