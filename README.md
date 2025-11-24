@@ -43,12 +43,18 @@ These instructions are for running the application directly from the source code
 
 This project uses `py2app` to create a standalone macOS application. This is the recommended way to use the tool for live performances.
 
-1.  **Install py2app:**
+1.  **Install Dependencies:**
     ```bash
-    pip install py2app
+    pip install -r requirements.txt
     ```
 
-2.  **Build the Application:**
+2.  **Clean Previous Builds (Important):**
+    Before each build, make sure to remove any old build artifacts to prevent errors.
+    ```bash
+    rm -rf build dist
+    ```
+
+3.  **Build the Application:**
     ```bash
     python3 setup.py py2app
     ```

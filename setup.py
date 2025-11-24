@@ -13,6 +13,7 @@ DATA_FILES = ['style.qss', 'logo.png']
 OPTIONS = {
     'argv_emulation': True,
     'packages': ['cv2', 'numpy', 'PyQt5'],
+    'excludes': ['wheel'],
     'iconfile': 'app.icns', # Assuming you might want an icon later
     'plist': {
         'CFBundleName': 'ProjectionMapper',
