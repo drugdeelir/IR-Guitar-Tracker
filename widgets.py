@@ -1,7 +1,62 @@
 
-from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal
+from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QDialog
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon
+
+class MarkerSelectionDialog(QDialog):
+    marker_selected = pyqtSignal(QPoint)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select IR Markers")
+        self.setMinimumSize(800, 600)
+        self.selected_points = []
+        self.original_pixmap = None
+
+        self.layout = QVBoxLayout(self)
+        self.image_label = QLabel("Press 'Take Picture' to begin.")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.mousePressEvent = self.image_clicked
+        self.take_picture_button = QPushButton("Take Picture")
+
+        self.confirm_button = QPushButton("Confirm Markers")
+        self.confirm_button.clicked.connect(self.accept)
+
+        self.layout.addWidget(self.image_label)
+        self.layout.addWidget(self.take_picture_button)
+        self.layout.addWidget(self.confirm_button)
+
+    def set_pixmap(self, pixmap):
+        self.original_pixmap = pixmap
+        self.image_label.setPixmap(self.original_pixmap)
+
+    def image_clicked(self, event):
+        point = event.pos()
+        self.selected_points.append(point)
+        self.marker_selected.emit(point)
+        self.update() # Trigger a repaint to draw the selected points
+
+    def get_selected_points(self):
+        return self.selected_points
+
+    def clear_selection(self):
+        self.selected_points = []
+        if self.original_pixmap:
+            self.image_label.setPixmap(self.original_pixmap)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.original_pixmap:
+            # Create a new pixmap to draw on
+            pixmap = self.original_pixmap.copy()
+            painter = QPainter(pixmap)
+            pen = QPen(Qt.green, 10)
+            painter.setPen(pen)
+            for point in self.selected_points:
+                painter.drawPoint(point)
+            painter.end()
+            self.image_label.setPixmap(pixmap)
 
 class VideoDisplay(QWidget):
     mask_point_added = pyqtSignal(QPoint)
