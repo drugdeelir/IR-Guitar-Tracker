@@ -89,7 +89,18 @@ class MIDIMappingDialog(QDialog):
             ('BG LFO Toggle', 'lfo_bg_toggle'),
             ('BG LFO Speed', 'lfo_bg_speed'),
             ('BG LFO Cycle Target', 'lfo_bg_cycle'),
+            ('Style: Acid', 'style_acid'),
+            ('Style: Noir', 'style_noir'),
+            ('Style: Retro', 'style_retro'),
+            ('Style: Clear', 'style_none'),
+            ('Particles: Dust', 'part_dust'),
+            ('Particles: Rain', 'part_rain'),
+            ('Particles: Off', 'part_none'),
         ]
+
+        for i in range(8):
+            self.actions.append((f'Save Snapshot {i+1}', f'snap_save_{i}'))
+            self.actions.append((f'Load Snapshot {i+1}', f'snap_load_{i}'))
 
         for i in range(8):
             self.actions.append((f'Switch Amp to Cue {i+1}', f'cue_amp_{i}'))
@@ -125,6 +136,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 900)
         self.masks = []
         self.selected_markers = []
+        self.snapshots = [None] * 8
 
         # Default MIDI Mappings
         self.midi_mappings = {
@@ -409,7 +421,94 @@ class ProjectionMappingApp(QMainWindow):
         depth_group.setLayout(depth_layout)
         self.control_layout.addWidget(depth_group)
 
+        # Performance FX
+        perf_group = QGroupBox("Performance FX")
+        perf_layout = QVBoxLayout()
+
+        self.particle_combo = QComboBox()
+        self.particle_combo.addItems(["none", "dust", "rain"])
+        self.particle_combo.currentIndexChanged.connect(lambda i: self.worker.set_particle_preset(self.particle_combo.currentText()))
+        perf_layout.addWidget(QLabel("Particles:"))
+        perf_layout.addWidget(self.particle_combo)
+
+        self.proximity_combo = QComboBox()
+        self.proximity_combo.addItems(["none", "kaleidoscope", "glitch", "rgb_shift"])
+        self.proximity_combo.currentIndexChanged.connect(lambda i: self.worker.set_proximity_mode(self.proximity_combo.currentText()))
+        perf_layout.addWidget(QLabel("Proximity Mod:"))
+        perf_layout.addWidget(self.proximity_combo)
+
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(["none", "acid", "noir", "retro"])
+        self.style_combo.currentIndexChanged.connect(lambda i: self.worker.set_style(self.style_combo.currentText()))
+        perf_layout.addWidget(QLabel("Visual Style:"))
+        perf_layout.addWidget(self.style_combo)
+
+        perf_group.setLayout(perf_layout)
+        self.control_layout.addWidget(perf_group)
+
+        # Audio Settings
+        audio_group = QGroupBox("Audio Reactivity")
+        audio_layout = QVBoxLayout()
+
+        self.audio_combo = QComboBox()
+        self.audio_devices = ["None"]
+        try:
+            from audio_handler import get_audio_devices
+            devices = get_audio_devices()
+            self.audio_devices += [d['name'] for d in devices if d['max_input_channels'] > 0]
+        except Exception: pass
+        self.audio_combo.addItems(self.audio_devices)
+        self.audio_combo.currentIndexChanged.connect(self.change_audio_device)
+        audio_layout.addWidget(QLabel("Input Device:"))
+        audio_layout.addWidget(self.audio_combo)
+
+        self.audio_target_combo = QComboBox()
+        self.audio_target_combo.addItems(["none", "strobe", "glitch", "scale"])
+        self.audio_target_combo.currentIndexChanged.connect(lambda i: self.worker.set_audio_target(self.audio_target_combo.currentText()))
+        audio_layout.addWidget(QLabel("Reactive Target:"))
+        audio_layout.addWidget(self.audio_target_combo)
+
+        self.audio_gain_slider = QSlider(Qt.Horizontal)
+        self.audio_gain_slider.setRange(0, 400)
+        self.audio_gain_slider.setValue(100)
+        self.audio_gain_slider.valueChanged.connect(lambda v: self.worker.set_audio_gain(v / 100.0))
+        audio_layout.addWidget(QLabel("Audio Gain:"))
+        audio_layout.addWidget(self.audio_gain_slider)
+
+        audio_group.setLayout(audio_layout)
+        self.control_layout.addWidget(audio_group)
+
+        # Snapshots
+        snap_group = QGroupBox("Snapshots")
+        snap_layout = QHBoxLayout()
+        for i in range(4): # 4 buttons for quick recall
+            btn = QPushButton(f"S{i+1}")
+            btn.clicked.connect(lambda checked, idx=i: self.load_snapshot(idx))
+            snap_layout.addWidget(btn)
+        snap_group.setLayout(snap_layout)
+        self.control_layout.addWidget(snap_group)
+
         self.control_layout.addStretch()
+
+    def change_audio_device(self, index):
+        if hasattr(self, 'audio_handler'):
+            self.audio_handler.stop()
+
+        if index > 0:
+            from audio_handler import AudioHandler, get_audio_devices
+            # Subtract 1 because "None" is at index 0
+            device_name = self.audio_devices[index]
+            # Find the actual index for the device name
+            devices = get_audio_devices()
+            actual_index = None
+            for i, d in enumerate(devices):
+                if d['name'] == device_name and d['max_input_channels'] > 0:
+                    actual_index = i
+                    break
+
+            self.audio_handler = AudioHandler(device_index=actual_index)
+            self.audio_handler.bands_updated.connect(self.worker.set_audio_bands)
+            self.audio_handler.start()
 
     def open_midi_mapping(self):
         self.mapping_dialog = MIDIMappingDialog(self)
@@ -515,6 +614,31 @@ class ProjectionMappingApp(QMainWindow):
             if mapping[0] == 'cc' and mapping[1] == cc:
                 self.execute_midi_action(key, value)
 
+    def save_snapshot(self, index):
+        state = {
+            'masks': [mask.to_dict() for mask in self.masks],
+            'style': self.style_combo.currentText(),
+            'particles': self.particle_combo.currentText(),
+            'audio_target': self.audio_target_combo.currentText()
+        }
+        self.snapshots[index] = state
+        self.statusBar().showMessage(f"Snapshot {index+1} saved.", 3000)
+
+    def load_snapshot(self, index):
+        state = self.snapshots[index]
+        if not state: return
+
+        # Restore masks
+        self.masks = [Mask.from_dict(d) for d in state['masks']]
+        self.worker.set_masks(self.masks)
+
+        # Restore UI combos
+        self.style_combo.setCurrentText(state.get('style', 'none'))
+        self.particle_combo.setCurrentText(state.get('particles', 'none'))
+        self.audio_target_combo.setCurrentText(state.get('audio_target', 'none'))
+
+        self.statusBar().showMessage(f"Snapshot {index+1} loaded.", 3000)
+
     def execute_midi_action(self, key, value):
         if key.startswith('cue_amp_'):
             idx = int(key.split('_')[-1])
@@ -556,6 +680,20 @@ class ProjectionMappingApp(QMainWindow):
                         curr = mask.fx_params.get('lfo_target', 'none')
                         idx = (targets.index(curr) + 1) % len(targets)
                         mask.fx_params['lfo_target'] = targets[idx]
+        elif key.startswith('style_'):
+            style_name = key.split('_')[1]
+            if value > 64:
+                self.worker.set_style(style_name)
+        elif key.startswith('part_'):
+            part_name = key.split('_')[1]
+            if value > 64:
+                self.worker.set_particle_preset(part_name)
+        elif key.startswith('snap_save_'):
+            idx = int(key.split('_')[-1])
+            if value > 64: self.save_snapshot(idx)
+        elif key.startswith('snap_load_'):
+            idx = int(key.split('_')[-1])
+            if value > 64: self.load_snapshot(idx)
 
     def handle_bpm(self, bpm):
         self.bpm_label.setText(f"BPM: {bpm:.1f}")
@@ -684,6 +822,8 @@ class ProjectionMappingApp(QMainWindow):
             if hasattr(self, 'midi_thread'):
                 self.midi_thread.quit()
                 self.midi_thread.wait()
+        if hasattr(self, 'audio_handler'):
+            self.audio_handler.stop()
         event.accept()
 
 

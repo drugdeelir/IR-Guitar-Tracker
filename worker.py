@@ -47,7 +47,10 @@ class Worker(QObject):
         super().__init__(parent)
         self._running = True
         self.video_source = 0
-        self.warp_points = [[0, 0], [1, 0], [1, 1], [0, 1]]
+        self.warp_points = []
+        for y in [0.0, 0.5, 1.0]:
+            for x in [0.0, 0.5, 1.0]:
+                self.warp_points.append([x, y])
         self.masks = []
         self.video_players = {}
         self.ir_threshold = 200
@@ -76,6 +79,20 @@ class Worker(QObject):
         # FX Buffers
         self.trail_buffers = {} # mask_id -> last_frame
         self.noise_offset = 0
+
+        # Particle System
+        self.particles = []
+        self.particle_preset = 'none' # 'none', 'dust', 'rain', 'trail'
+        self.particle_max_count = 100
+
+        # Proximity Modulation
+        self.proximity_mode = 'none' # 'none', 'kaleidoscope', 'glitch', 'rgb_shift'
+        self.proximity_val = 1.0
+
+        # Audio Reactivity
+        self.audio_bands = [0, 0, 0] # bass, mid, high
+        self.audio_reactive_target = 'none' # 'none', 'glitch', 'strobe', 'blur', 'scale'
+        self.audio_gain = 1.0
 
     def set_marker_points(self, points):
         self.marker_config = [ (p.x(), p.y()) for p in points]
@@ -120,6 +137,34 @@ class Worker(QObject):
 
     def set_bpm(self, bpm):
         self.bpm = bpm
+
+    def set_particle_preset(self, preset):
+        self.particle_preset = preset
+        self.particles = []
+
+    def set_proximity_mode(self, mode):
+        self.proximity_mode = mode
+
+    def set_audio_bands(self, bass, mid, high):
+        self.audio_bands = [bass * self.audio_gain, mid * self.audio_gain, high * self.audio_gain]
+
+    def set_audio_target(self, target):
+        self.audio_reactive_target = target
+
+    def set_audio_gain(self, gain):
+        self.audio_gain = gain
+
+    def set_style(self, style_name):
+        # Clears all FX and sets a specific preset style
+        for mask in self.masks:
+            mask.active_fx = []
+            if style_name == 'acid':
+                mask.active_fx = ['kaleidoscope', 'hue_cycle', 'glitch']
+            elif style_name == 'noir':
+                mask.active_fx = ['edges', 'trails', 'invert']
+            elif style_name == 'retro':
+                mask.active_fx = ['rgb_shift', 'trails', 'tint']
+                mask.tint_color = (255, 0, 255) # Magenta
 
     def switch_video(self, tag, video_path):
         for mask in self.masks:
@@ -171,19 +216,33 @@ class Worker(QObject):
             processed[h//2:, w//2:] = cv2.flip(quad, -1)
 
         if 'strobe' in mask.active_fx:
-            period = 60.0 / self.bpm
-            if (time.time() % period) < (period / 2.0):
+            trigger = False
+            if self.audio_reactive_target == 'strobe':
+                if self.audio_bands[0] > 0.6: # Bass trigger
+                    trigger = True
+            else:
+                period = 60.0 / self.bpm
+                if (time.time() % period) < (period / 2.0):
+                    trigger = True
+
+            if trigger:
                 processed = np.zeros_like(processed)
 
         if 'rgb_shift' in mask.active_fx:
-            shift = int(10 * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
+            mod = 1.0
+            if self.proximity_mode == 'rgb_shift': mod = self.proximity_val
+            shift = int(10 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
             b, g, r = cv2.split(processed)
             b = np.roll(b, shift, axis=1)
             r = np.roll(r, -shift, axis=1)
             processed = cv2.merge([b, g, r])
 
         if 'glitch' in mask.active_fx:
-            for _ in range(3):
+            mod = 1.0
+            if self.proximity_mode == 'glitch': mod = self.proximity_val
+            if self.audio_reactive_target == 'glitch': mod *= (self.audio_bands[0] * 2)
+
+            for _ in range(int(3 * mod)):
                 y = np.random.randint(0, h-10)
                 sh = np.random.randint(-20, 20)
                 processed[y:y+10, :] = np.roll(processed[y:y+10, :], sh, axis=1)
@@ -382,12 +441,20 @@ class Worker(QObject):
             tracked_points = self.get_tracked_points(main_frame)
             self.trackers_detected.emit(len(tracked_points))
 
-            if self._calibrate_depth_flag and len(tracked_points) >= 2:
-                self.baseline_distance = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
-                self._calibrate_depth_flag = False
+            if len(tracked_points) >= 2:
+                current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
+                if self._calibrate_depth_flag:
+                    self.baseline_distance = current_dist
+                    self._calibrate_depth_flag = False
+
+                if self.baseline_distance > 0:
+                    self.proximity_val = current_dist / self.baseline_distance
 
             for point in tracked_points:
                 cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
+
+            self.update_particles(tracked_points, h, w)
+            self.draw_particles(projector_output)
 
             sorted_masks = sorted(self.masks, key=lambda m: 0 if m.tag == 'background' else 1)
             for mask in sorted_masks:
@@ -437,9 +504,15 @@ class Worker(QObject):
                             current_distance = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
                             scale_factor = (current_distance / self.baseline_distance - 1.0) * self.depth_sensitivity + 1.0
                             center = np.mean(dst_pts_raw, axis=0)
+                            if self.audio_reactive_target == 'scale':
+                                scale_factor *= (1.0 + self.audio_bands[0] * 0.5)
                             dst_pts = (dst_pts_raw - center) * scale_factor + center
                         else:
                             dst_pts = dst_pts_raw
+                            if self.audio_reactive_target == 'scale':
+                                center = np.mean(dst_pts_raw, axis=0)
+                                scale_factor = 1.0 + self.audio_bands[0] * 0.5
+                                dst_pts = (dst_pts_raw - center) * scale_factor + center
                         matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
                         warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
                         mask_img = np.zeros_like(projector_output)
@@ -465,16 +538,85 @@ class Worker(QObject):
             rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
             self.frame_ready.emit(QImage(rgb_main.data, w, h, w * 3, QImage.Format_RGB888))
 
-            src_pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-            dst_pts = np.float32([[p[0] * w, p[1] * h] for p in self.warp_points])
-            matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-            warped_output = cv2.warpPerspective(projector_output, matrix, (w, h))
+            # 9-point grid warping (2x2 perspective blocks)
+            warped_output = np.zeros_like(projector_output)
+            wp = np.array(self.warp_points)
+            wp[:, 0] *= w
+            wp[:, 1] *= h
+
+            # Sub-grids: 0-1-4-3, 1-2-5-4, 3-4-7-6, 4-5-8-7
+            quads = [
+                (0, 1, 4, 3), (1, 2, 5, 4),
+                (3, 4, 7, 6), (4, 5, 8, 7)
+            ]
+
+            for i, (p1, p2, p3, p4) in enumerate(quads):
+                # Source sub-quad (linear grid)
+                src_x = (i % 2) * (w // 2)
+                src_y = (i // 2) * (h // 2)
+                src_q = np.float32([
+                    [src_x, src_y], [src_x + w // 2, src_y],
+                    [src_x + w // 2, src_y + h // 2], [src_x, src_y + h // 2]
+                ])
+
+                # Destination sub-quad
+                dst_q = np.float32([wp[p1], wp[p2], wp[p3], wp[p4]])
+
+                M = cv2.getPerspectiveTransform(src_q, dst_q)
+                quad_warp = cv2.warpPerspective(projector_output, M, (w, h))
+
+                # Mask for the quad
+                mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillConvexPoly(mask, np.int32(dst_q), 255)
+
+                warped_output = cv2.bitwise_and(warped_output, cv2.bitwise_not(cv2.merge([mask, mask, mask])))
+                warped_output = cv2.add(warped_output, cv2.bitwise_and(quad_warp, cv2.merge([mask, mask, mask])))
+
             rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
             self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888))
             QThread.msleep(30)
 
         main_cap.release()
         for player in self.video_players.values(): player.stop()
+
+    def update_particles(self, tracked_points, h, w):
+        if self.particle_preset == 'none':
+            self.particles = []
+            return
+
+        # Emit new particles
+        if tracked_points and len(self.particles) < self.particle_max_count:
+            for pt in tracked_points:
+                if np.random.random() > 0.7:
+                    p = {
+                        'x': float(pt[0]),
+                        'y': float(pt[1]),
+                        'vx': np.random.uniform(-2, 2),
+                        'vy': np.random.uniform(-2, 2),
+                        'life': 1.0,
+                        'decay': np.random.uniform(0.01, 0.05)
+                    }
+                    if self.particle_preset == 'rain':
+                        p['vy'] = np.random.uniform(5, 10)
+                        p['vx'] = 0
+                    elif self.particle_preset == 'dust':
+                        p['vy'] = np.random.uniform(-1, 0.5)
+                    self.particles.append(p)
+
+        # Update existing
+        for p in self.particles[:]:
+            p['x'] += p['vx']
+            p['y'] += p['vy']
+            p['life'] -= p['decay']
+            if p['life'] <= 0 or p['x'] < 0 or p['x'] >= w or p['y'] < 0 or p['y'] >= h:
+                self.particles.remove(p)
+
+    def draw_particles(self, frame):
+        if self.particle_preset == 'none': return
+        for p in self.particles:
+            color = (0, 255, 0) if self.particle_preset == 'rain' else (255, 255, 200)
+            alpha = int(p['life'] * 255)
+            cv2.circle(frame, (int(p['x']), int(p['y'])), 2, color, -1)
 
     def get_generative_frame(self, h, w):
         self.noise_offset += 0.05

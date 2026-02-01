@@ -118,7 +118,12 @@ class ProjectorWindow(QWidget):
         self.setStyleSheet("background-color: black;")
 
         self.calibration_mode = False
-        self.warp_points = [QPoint(0, 0), QPoint(1, 0), QPoint(1, 1), QPoint(0, 1)]
+        # 3x3 Grid
+        self.warp_points = []
+        for y in [0.0, 0.5, 1.0]:
+            for x in [0.0, 0.5, 1.0]:
+                self.warp_points.append(QPoint(x, y))
+
         self.dragging_point_index = -1
         self.show()
 
@@ -130,7 +135,10 @@ class ProjectorWindow(QWidget):
         self.update() # Trigger a repaint
 
     def reset_warp_points(self):
-        self.warp_points = [QPoint(0, 0), QPoint(1, 0), QPoint(1, 1), QPoint(0, 1)]
+        self.warp_points = []
+        for y in [0.0, 0.5, 1.0]:
+            for x in [0.0, 0.5, 1.0]:
+                self.warp_points.append(QPoint(x, y))
         self.warp_points_changed.emit(self.get_warp_points_normalized())
         self.update()
 
