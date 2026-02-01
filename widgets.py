@@ -1,7 +1,7 @@
 
 from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QDialog
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer, QPointF
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon, QPolygonF
 
 class MarkerSelectionDialog(QDialog):
     marker_selected = pyqtSignal(QPoint)
@@ -122,7 +122,7 @@ class ProjectorWindow(QWidget):
         self.warp_points = []
         for y in [0.0, 0.5, 1.0]:
             for x in [0.0, 0.5, 1.0]:
-                self.warp_points.append(QPoint(x, y))
+                self.warp_points.append(QPointF(x, y))
 
         self.dragging_point_index = -1
         self.show()
@@ -138,7 +138,7 @@ class ProjectorWindow(QWidget):
         self.warp_points = []
         for y in [0.0, 0.5, 1.0]:
             for x in [0.0, 0.5, 1.0]:
-                self.warp_points.append(QPoint(x, y))
+                self.warp_points.append(QPointF(x, y))
         self.warp_points_changed.emit(self.get_warp_points_normalized())
         self.update()
 
@@ -183,7 +183,7 @@ class ProjectorWindow(QWidget):
         return -1
 
     def normalize_point(self, pos):
-        return QPoint(pos.x() / self.width(), pos.y() / self.height())
+        return QPointF(pos.x() / self.width(), pos.y() / self.height())
 
     def get_warp_points_normalized(self):
         return [[p.x(), p.y()] for p in self.warp_points]

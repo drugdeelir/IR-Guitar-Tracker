@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
                              QDialog, QFormLayout, QInputDialog)
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
@@ -42,7 +42,7 @@ class MIDIMappingDialog(QDialog):
 
         # Define actions
         self.actions = []
-        for tag_label, tag in [('Amp', 'amp'), ('BG', 'bg')]:
+        for tag_label, tag in [('Amp', 'amp'), ('BG', 'bg'), ('Master', 'master')]:
             self.actions += [
                 (f'Toggle {tag_label} Visibility', f'toggle_{tag}'),
                 (f'{tag_label} Strobe', f'fx_{tag}_strobe'),
@@ -76,6 +76,8 @@ class MIDIMappingDialog(QDialog):
 
         self.actions += [
             ('Auto-Pilot Toggle', 'auto_pilot_toggle'),
+            ('Toggle HUD', 'hud_toggle'),
+            ('Toggle Safety Mode', 'safety_toggle'),
             ('Style: Acid', 'style_acid'),
             ('Style: Noir', 'style_noir'),
             ('Style: Retro', 'style_retro'),
@@ -288,10 +290,17 @@ class ProjectionMappingApp(QMainWindow):
         self.add_cue_button.clicked.connect(self.add_cue)
         self.remove_cue_button = QPushButton("Remove Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
+        self.move_up_button = QPushButton("Move Layer Up")
+        self.move_up_button.clicked.connect(self.move_cue_up)
+        self.move_down_button = QPushButton("Move Layer Down")
+        self.move_down_button.clicked.connect(self.move_cue_down)
+
         cue_layout.addWidget(self.cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
         cue_layout.addWidget(self.add_gen_button)
         cue_layout.addWidget(self.remove_cue_button)
+        cue_layout.addWidget(self.move_up_button)
+        cue_layout.addWidget(self.move_down_button)
         cue_group.setLayout(cue_layout)
         self.control_layout.addWidget(cue_group)
 
@@ -453,8 +462,44 @@ class ProjectionMappingApp(QMainWindow):
         self.auto_pilot_check.toggled.connect(lambda c: setattr(self.worker, 'auto_pilot', c))
         perf_layout.addWidget(self.auto_pilot_check)
 
+        self.hud_check = QCheckBox("Show Debug HUD")
+        self.hud_check.setChecked(True)
+        self.hud_check.toggled.connect(lambda c: setattr(self.worker, 'show_hud', c))
+        perf_layout.addWidget(self.hud_check)
+
+        self.safety_check = QCheckBox("Safety Fallback Mode")
+        self.safety_check.setChecked(True)
+        self.safety_check.toggled.connect(lambda c: setattr(self.worker, 'safety_mode_enabled', c))
+        perf_layout.addWidget(self.safety_check)
+
         perf_group.setLayout(perf_layout)
         self.control_layout.addWidget(perf_group)
+
+        # Master Output FX & Color Moods
+        master_group = QGroupBox("Master & Global Looks")
+        master_layout = QVBoxLayout()
+
+        self.mood_combo = QComboBox()
+        self.moods = {
+            "Default": None,
+            "Cyberpunk": ((255, 0, 255), (255, 255, 0)), # Magenta, Cyan
+            "Ocean": ((255, 0, 0), (255, 255, 0)), # Blue, Cyan
+            "Inferno": ((0, 0, 255), (0, 127, 255)), # Red, Orange
+            "Toxic": ((0, 255, 0), (0, 255, 127)), # Green, Lime
+        }
+        self.mood_combo.addItems(self.moods.keys())
+        self.mood_combo.currentIndexChanged.connect(self.apply_mood)
+        master_layout.addWidget(QLabel("Global Color Mood:"))
+        master_layout.addWidget(self.mood_combo)
+
+        master_layout.addWidget(QLabel("Master FX:"))
+        self.master_fx_list = ["strobe", "blur", "invert", "edges", "rgb_shift", "glitch", "trails", "hue_cycle"]
+        for fx in self.master_fx_list:
+            cb = QCheckBox(fx.title())
+            cb.toggled.connect(lambda checked, f=fx: self.worker.set_fx('master', f, checked))
+            master_layout.addWidget(cb)
+        master_group.setLayout(master_layout)
+        self.control_layout.addWidget(master_group)
 
         # Audio Settings
         audio_group = QGroupBox("Audio Reactivity")
@@ -484,6 +529,17 @@ class ProjectionMappingApp(QMainWindow):
         self.audio_gain_slider.valueChanged.connect(lambda v: self.worker.set_audio_gain(v / 100.0))
         audio_layout.addWidget(QLabel("Audio Gain:"))
         audio_layout.addWidget(self.audio_gain_slider)
+
+        self.audio_mappings_layout = QFormLayout()
+        self.audio_target_fx = ["blur", "glitch", "rgb_shift", "tint", "hue_cycle"]
+        self.audio_combos = {}
+        for fx in self.audio_target_fx:
+            cb = QComboBox()
+            cb.addItems(["None", "Bass", "Mid", "High"])
+            cb.currentIndexChanged.connect(lambda i, f=fx: self.worker.set_audio_param_mapping(f, i-1))
+            self.audio_mappings_layout.addRow(f"{fx.title()} Mod:", cb)
+            self.audio_combos[fx] = cb
+        audio_layout.addLayout(self.audio_mappings_layout)
 
         audio_group.setLayout(audio_layout)
         self.control_layout.addWidget(audio_group)
@@ -564,7 +620,7 @@ class ProjectionMappingApp(QMainWindow):
         if filename:
             project_data = {
                 'masks': [mask.to_dict() for mask in self.masks],
-                'warp_points': self.projector_window.warp_points,
+                'warp_points': self.projector_window.get_warp_points_normalized(),
                 'ir_threshold': self.ir_threshold_slider.value(),
                 'auto_ir': self.auto_ir_check.isChecked(),
                 'depth_sensitivity': self.depth_sensitivity_slider.value(),
@@ -592,7 +648,7 @@ class ProjectionMappingApp(QMainWindow):
 
                 warp_points = data.get('warp_points')
                 if warp_points:
-                    self.projector_window.warp_points = warp_points
+                    self.projector_window.warp_points = [QPointF(p[0], p[1]) for p in warp_points]
                     self.worker.set_warp_points(warp_points)
 
                 self.auto_ir_check.setChecked(data.get('auto_ir', False))
@@ -740,6 +796,12 @@ class ProjectionMappingApp(QMainWindow):
         elif key == 'auto_pilot_toggle':
             if value > 64:
                 self.auto_pilot_check.setChecked(not self.auto_pilot_check.isChecked())
+        elif key == 'hud_toggle':
+            if value > 64:
+                self.hud_check.setChecked(not self.hud_check.isChecked())
+        elif key == 'safety_toggle':
+            if value > 64:
+                self.safety_check.setChecked(not self.safety_check.isChecked())
         elif key.startswith('snap_save_'):
             idx = int(key.split('_')[-1])
             if value > 64: self.save_snapshot(idx)
@@ -753,6 +815,23 @@ class ProjectionMappingApp(QMainWindow):
 
     def handle_beat_pulse(self):
         self.worker.trigger_beat()
+
+    def apply_mood(self):
+        mood_name = self.mood_combo.currentText()
+        colors = self.moods[mood_name]
+        if not colors: return
+
+        primary, secondary = colors
+        for i, mask in enumerate(self.masks):
+            # Alternate colors or just use primary for amp, secondary for bg
+            if mask.tag == 'amp':
+                mask.tint_color = primary
+            else:
+                mask.tint_color = secondary
+
+        # Also set master tint
+        self.worker.master_tint_color = primary
+        self.statusBar().showMessage(f"Applied {mood_name} mood.", 3000)
 
     def calibrate_depth(self):
         self.worker.calibrate_depth()
@@ -879,6 +958,26 @@ class ProjectionMappingApp(QMainWindow):
             row = self.cue_list_widget.row(current_item)
             self.cue_list_widget.takeItem(row)
             del self.masks[row]
+            self.worker.set_masks(self.masks)
+
+    def move_cue_up(self):
+        row = self.cue_list_widget.currentRow()
+        if row > 0:
+            item = self.cue_list_widget.takeItem(row)
+            self.cue_list_widget.insertItem(row - 1, item)
+            self.cue_list_widget.setCurrentRow(row - 1)
+            mask = self.masks.pop(row)
+            self.masks.insert(row - 1, mask)
+            self.worker.set_masks(self.masks)
+
+    def move_cue_down(self):
+        row = self.cue_list_widget.currentRow()
+        if row < len(self.masks) - 1:
+            item = self.cue_list_widget.takeItem(row)
+            self.cue_list_widget.insertItem(row + 1, item)
+            self.cue_list_widget.setCurrentRow(row + 1)
+            mask = self.masks.pop(row)
+            self.masks.insert(row + 1, mask)
             self.worker.set_masks(self.masks)
 
     def closeEvent(self, event):

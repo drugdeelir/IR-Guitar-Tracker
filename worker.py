@@ -67,6 +67,7 @@ class Worker(QObject):
         self.roi_padding = 50
 
         # Smoothing and Confidence
+        self.kalman_filters = []
         self.smoothed_points = None
         self.smoothing_factor = 0.5
         self.confidence = 0.0
@@ -92,17 +93,42 @@ class Worker(QObject):
 
         # Audio Reactivity
         self.audio_bands = [0, 0, 0] # bass, mid, high
-        self.audio_reactive_target = 'none' # 'none', 'glitch', 'strobe', 'blur', 'scale'
+        self.audio_reactive_target = 'none' # legacy trigger target
         self.audio_gain = 1.0
+        self.audio_param_mappings = {} # fx_name -> band_index (0,1,2)
 
         # Beat Automation
         self.auto_pilot = False
         self.beat_counter = 0
         self.auto_pilot_interval = 8 # beats
 
+        # Stats for HUD
+        self.fps = 0
+        self.frame_count = 0
+        self.last_stats_time = time.time()
+        self.show_hud = True
+
+        # Safety Mode
+        self.safety_mode_enabled = True
+        self.fallback_generator = 'radial'
+
+        # Master FX
+        self.master_active_fx = []
+        self.master_tint_color = (255, 255, 255)
+
+    def init_kalman(self, count):
+        self.kalman_filters = []
+        for _ in range(count):
+            kf = cv2.KalmanFilter(4, 2)
+            kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+            kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+            self.kalman_filters.append(kf)
+
     def set_marker_points(self, points):
         self.marker_config = [ (p.x(), p.y()) for p in points]
         if len(self.marker_config) > 1:
+            self.init_kalman(len(self.marker_config))
             distances = []
             for p1, p2 in combinations(self.marker_config, 2):
                 dist = np.linalg.norm(np.array(p1) - np.array(p2))
@@ -169,6 +195,13 @@ class Worker(QObject):
     def set_audio_gain(self, gain):
         self.audio_gain = gain
 
+    def set_audio_param_mapping(self, fx_name, band_index):
+        if band_index == -1:
+            if fx_name in self.audio_param_mappings:
+                del self.audio_param_mappings[fx_name]
+        else:
+            self.audio_param_mappings[fx_name] = band_index
+
     def set_style(self, style_name):
         # Clears all FX and sets a specific preset style
         for mask in self.masks:
@@ -197,6 +230,13 @@ class Worker(QObject):
                 mask.visible = visible
 
     def set_fx(self, tag, fx_name, enabled):
+        if tag == 'master':
+            if enabled and fx_name not in self.master_active_fx:
+                self.master_active_fx.append(fx_name)
+            elif not enabled and fx_name in self.master_active_fx:
+                self.master_active_fx.remove(fx_name)
+            return
+
         for mask in self.masks:
             if mask.tag == tag:
                 if enabled and fx_name not in mask.active_fx:
@@ -259,6 +299,9 @@ class Worker(QObject):
         if 'rgb_shift' in mask.active_fx:
             mod = 1.0
             if self.proximity_mode == 'rgb_shift': mod = self.proximity_val
+            if 'rgb_shift' in self.audio_param_mappings:
+                mod *= (self.audio_bands[self.audio_param_mappings['rgb_shift']] * 5)
+
             shift = int(10 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
             b, g, r = cv2.split(processed)
             b = np.roll(b, shift, axis=1)
@@ -298,7 +341,11 @@ class Worker(QObject):
             processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
         if 'blur' in mask.active_fx:
-            ksize = int(15 * (lfo_val if mask.fx_params.get('lfo_target') == 'blur' else 1.0))
+            mod = 1.0
+            if 'blur' in self.audio_param_mappings:
+                mod *= (self.audio_bands[self.audio_param_mappings['blur']] * 3)
+
+            ksize = int(15 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'blur' else 1.0))
             if ksize % 2 == 0: ksize += 1
             if ksize > 0:
                 processed = cv2.GaussianBlur(processed, (max(1, ksize), max(1, ksize)), 0)
@@ -312,7 +359,11 @@ class Worker(QObject):
             processed = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
 
         if 'tint' in mask.active_fx:
-            alpha = 0.3 * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
+            mod = 1.0
+            if 'tint' in self.audio_param_mappings:
+                mod *= (self.audio_bands[self.audio_param_mappings['tint']] * 3)
+
+            alpha = 0.3 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
             tint = np.full_like(processed, mask.tint_color)
             processed = cv2.addWeighted(processed, 1.0 - alpha, tint, alpha, 0)
 
@@ -442,14 +493,29 @@ class Worker(QObject):
                                 ordered_points.append(closest)
                                 remaining_dst.remove(closest)
 
+                            # Kalman Correction
+                            kalman_pts = []
+                            for i, pt in enumerate(ordered_points):
+                                self.kalman_filters[i].correct(np.array([[np.float32(pt[0])], [np.float32(pt[1])]]))
+                                pred = self.kalman_filters[i].predict()
+                                kalman_pts.append((pred[0, 0], pred[1, 0]))
+
                             if self.smoothed_points is None:
-                                self.smoothed_points = np.array(ordered_points, dtype=np.float32)
+                                self.smoothed_points = np.array(kalman_pts, dtype=np.float32)
                             else:
                                 alpha = 1.0 - self.smoothing_factor
-                                self.smoothed_points = self.smoothed_points * (1.0 - alpha) + np.array(ordered_points, dtype=np.float32) * alpha
+                                self.smoothed_points = self.smoothed_points * (1.0 - alpha) + np.array(kalman_pts, dtype=np.float32) * alpha
 
                             self.confidence = min(1.0, self.confidence + self.confidence_gain)
                             self.last_tracked_points = [tuple(p.astype(int)) for p in self.smoothed_points]
+
+                            # Predictive ROI Scaling based on velocity
+                            max_v = 0
+                            for kf in self.kalman_filters:
+                                v = np.linalg.norm(kf.statePost[2:])
+                                max_v = max(max_v, v)
+                            self.roi_padding = int(50 + max_v * 5)
+
                             return self.last_tracked_points
 
         if self.last_tracked_points is not None:
@@ -547,22 +613,33 @@ class Worker(QObject):
                         if self.confidence < 1.0:
                             effective_frame_cue = (frame_cue * self.confidence).astype(np.uint8)
 
-                    if mask.type == 'dynamic' and mask.linked_marker_count == len(tracked_points):
+                    # Safety Fallback
+                    is_safe = True
+                    if mask.type == 'dynamic' and self.confidence < 0.2 and self.safety_mode_enabled:
+                        is_safe = False
+                        # Override frame with fallback generator
+                        frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
+
+                    if mask.type == 'dynamic' and (mask.linked_marker_count == len(tracked_points) or not is_safe):
                         src_pts = np.float32(mask.source_points)
                         dst_pts_raw = np.float32(tracked_points)
-                        if self.baseline_distance > 0 and len(tracked_points) >= 2:
+                        if is_safe and self.baseline_distance > 0 and len(tracked_points) >= 2:
                             current_distance = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
                             scale_factor = (current_distance / self.baseline_distance - 1.0) * self.depth_sensitivity + 1.0
                             center = np.mean(dst_pts_raw, axis=0)
                             if self.audio_reactive_target == 'scale':
                                 scale_factor *= (1.0 + self.audio_bands[0] * 0.5)
                             dst_pts = (dst_pts_raw - center) * scale_factor + center
-                        else:
+                        elif is_safe:
                             dst_pts = dst_pts_raw
                             if self.audio_reactive_target == 'scale':
                                 center = np.mean(dst_pts_raw, axis=0)
                                 scale_factor = 1.0 + self.audio_bands[0] * 0.5
                                 dst_pts = (dst_pts_raw - center) * scale_factor + center
+                        else:
+                            # Tracking lost: stay static at mask source points but full screen scale?
+                            # Or just map to full screen
+                            dst_pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
 
                         if len(src_pts) == 4 and len(dst_pts) == 4:
                             matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -609,6 +686,21 @@ class Worker(QObject):
                 self.still_frame_ready.emit(QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888))
                 self._capture_still_frame_flag = False
 
+            self.frame_count += 1
+            now = time.time()
+            if now - self.last_stats_time >= 1.0:
+                self.fps = self.frame_count / (now - self.last_stats_time)
+                self.frame_count = 0
+                self.last_stats_time = now
+
+            if self.show_hud:
+                hud_color = (0, 255, 255)
+                cv2.putText(main_frame, f"FPS: {self.fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+                cv2.putText(main_frame, f"Conf: {self.confidence:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+                cv2.putText(main_frame, f"BPM: {self.bpm:.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+                if self.auto_pilot:
+                    cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
             rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
             self.frame_ready.emit(QImage(rgb_main.data, w, h, w * 3, QImage.Format_RGB888))
 
@@ -645,6 +737,15 @@ class Worker(QObject):
 
                 warped_output = cv2.bitwise_and(warped_output, cv2.bitwise_not(cv2.merge([mask, mask, mask])))
                 warped_output = cv2.add(warped_output, cv2.bitwise_and(quad_warp, cv2.merge([mask, mask, mask])))
+
+            # Apply Master FX to the composition before warping
+            if self.master_active_fx:
+                # Mock mask for apply_fx (uses tint and fx params)
+                from mask import Mask
+                master_proxy = Mask("Master", [], None)
+                master_proxy.active_fx = self.master_active_fx
+                master_proxy.tint_color = self.master_tint_color
+                projector_output = self.apply_fx(projector_output, master_proxy)
 
             rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
             self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888))
@@ -747,12 +848,18 @@ class Worker(QObject):
 
     def stop(self): self._running = False
     def set_warp_points(self, points): self.warp_points = points
-    def set_masks(self, masks):
-        self.masks = masks
+    def cleanup_resources(self):
+        # Aggressively stop unused players
         current_cues = {mask.video_path for mask in self.masks if mask.video_path}
         fade_cues = {f['prev_path'] for f in self.fades.values()}
         needed_cues = current_cues.union(fade_cues)
+
         for path in list(self.video_players.keys()):
             if path not in needed_cues:
+                print(f"Purging player for: {path}")
                 self.video_players[path].stop()
                 del self.video_players[path]
+
+    def set_masks(self, masks):
+        self.masks = masks
+        self.cleanup_resources()
