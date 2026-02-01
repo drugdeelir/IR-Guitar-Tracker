@@ -7,6 +7,7 @@ class MIDIHandler(QObject):
     note_on = pyqtSignal(int, int) # note, velocity
     control_change = pyqtSignal(int, int) # cc, value
     beat = pyqtSignal(float) # bpm
+    beat_pulse = pyqtSignal() # emitted once per quarter note
     learned_message = pyqtSignal(str, int) # type ('note' or 'cc'), number
 
     def __init__(self, port_name=None):
@@ -67,6 +68,8 @@ class MIDIHandler(QObject):
 
         self.last_clock_time = current_time
         self.clock_count = (self.clock_count + 1) % 24
+        if self.clock_count == 0:
+            self.beat_pulse.emit()
 
     def stop(self):
         if self.inport:

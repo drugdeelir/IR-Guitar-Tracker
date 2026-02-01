@@ -6,7 +6,7 @@ import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                              QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
-                             QDialog, QFormLayout)
+                             QDialog, QFormLayout, QInputDialog)
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
@@ -14,6 +14,7 @@ from worker import Worker
 from mask import Mask
 from splash import SplashScreen
 from midi_handler import MIDIHandler, get_midi_ports
+from osc_handler import OSCHandler
 
 def get_available_cameras():
     """Returns a list of available camera indices."""
@@ -40,55 +41,41 @@ class MIDIMappingDialog(QDialog):
         self.learn_buttons = {}
 
         # Define actions
-        self.actions = [
-            ('Toggle Amp Visibility', 'toggle_amp'),
-            ('Toggle Background Visibility', 'toggle_bg'),
-            ('Amp Strobe', 'fx_amp_strobe'),
-            ('Amp Blur', 'fx_amp_blur'),
-            ('Amp Invert', 'fx_amp_invert'),
-            ('Amp Edges', 'fx_amp_edges'),
-            ('Amp Tint', 'fx_amp_tint'),
-            ('Amp Hue Cycle', 'fx_amp_hue_cycle'),
-            ('Amp Feedback', 'fx_amp_feedback'),
-            ('Amp RGB Shift', 'fx_amp_rgb_shift'),
-            ('Amp Glitch', 'fx_amp_glitch'),
-            ('Amp Trails', 'fx_amp_trails'),
-            ('Amp Kaleidoscope', 'fx_amp_kaleidoscope'),
-            ('Amp Mirror H', 'fx_amp_mirror_h'),
-            ('Amp Mirror V', 'fx_amp_mirror_v'),
-            ('Amp Design: Spiral', 'design_amp_spiral'),
-            ('Amp Design: Moon', 'design_amp_moon'),
-            ('Amp Design: Mushroom', 'design_amp_mushroom'),
-            ('Amp Design: Star', 'design_amp_star'),
-            ('Amp Design: Hexagon', 'design_amp_hexagon'),
-            ('Amp Design: Heart', 'design_amp_heart'),
-            ('Amp Design: None', 'design_amp_none'),
-            ('Amp LFO Toggle', 'lfo_amp_toggle'),
-            ('Amp LFO Speed', 'lfo_amp_speed'),
-            ('Amp LFO Cycle Target', 'lfo_amp_cycle'),
-            ('BG Strobe', 'fx_bg_strobe'),
-            ('BG Blur', 'fx_bg_blur'),
-            ('BG Invert', 'fx_bg_invert'),
-            ('BG Edges', 'fx_bg_edges'),
-            ('BG Tint', 'fx_bg_tint'),
-            ('BG Hue Cycle', 'fx_bg_hue_cycle'),
-            ('BG Feedback', 'fx_bg_feedback'),
-            ('BG RGB Shift', 'fx_bg_rgb_shift'),
-            ('BG Glitch', 'fx_bg_glitch'),
-            ('BG Trails', 'fx_bg_trails'),
-            ('BG Kaleidoscope', 'fx_bg_kaleidoscope'),
-            ('BG Mirror H', 'fx_bg_mirror_h'),
-            ('BG Mirror V', 'fx_bg_mirror_v'),
-            ('BG Design: Spiral', 'design_bg_spiral'),
-            ('BG Design: Moon', 'design_bg_moon'),
-            ('BG Design: Mushroom', 'design_bg_mushroom'),
-            ('BG Design: Star', 'design_bg_star'),
-            ('BG Design: Hexagon', 'design_bg_hexagon'),
-            ('BG Design: Heart', 'design_bg_heart'),
-            ('BG Design: None', 'design_bg_none'),
-            ('BG LFO Toggle', 'lfo_bg_toggle'),
-            ('BG LFO Speed', 'lfo_bg_speed'),
-            ('BG LFO Cycle Target', 'lfo_bg_cycle'),
+        self.actions = []
+        for tag_label, tag in [('Amp', 'amp'), ('BG', 'bg')]:
+            self.actions += [
+                (f'Toggle {tag_label} Visibility', f'toggle_{tag}'),
+                (f'{tag_label} Strobe', f'fx_{tag}_strobe'),
+                (f'{tag_label} Blur', f'fx_{tag}_blur'),
+                (f'{tag_label} Invert', f'fx_{tag}_invert'),
+                (f'{tag_label} Edges', f'fx_{tag}_edges'),
+                (f'{tag_label} Tint', f'fx_{tag}_tint'),
+                (f'{tag_label} Duotone', f'fx_{tag}_duotone'),
+                (f'{tag_label} Chromakey', f'fx_{tag}_chromakey'),
+                (f'{tag_label} Hue Cycle', f'fx_{tag}_hue_cycle'),
+                (f'{tag_label} Feedback', f'fx_{tag}_feedback'),
+                (f'{tag_label} RGB Shift', f'fx_{tag}_rgb_shift'),
+                (f'{tag_label} Glitch', f'fx_{tag}_glitch'),
+                (f'{tag_label} Trails', f'fx_{tag}_trails'),
+                (f'{tag_label} Kaleidoscope', f'fx_{tag}_kaleidoscope'),
+                (f'{tag_label} Mirror H', f'fx_{tag}_mirror_h'),
+                (f'{tag_label} Mirror V', f'fx_{tag}_mirror_v'),
+                (f'{tag_label} Design: Spiral', f'design_{tag}_spiral'),
+                (f'{tag_label} Design: Moon', f'design_{tag}_moon'),
+                (f'{tag_label} Design: Mushroom', f'design_{tag}_mushroom'),
+                (f'{tag_label} Design: Star', f'design_{tag}_star'),
+                (f'{tag_label} Design: Hexagon', f'design_{tag}_hexagon'),
+                (f'{tag_label} Design: Heart', f'design_{tag}_heart'),
+                (f'{tag_label} Design: None', f'design_{tag}_none'),
+                (f'{tag_label} LFO Toggle', f'lfo_{tag}_toggle'),
+                (f'{tag_label} LFO Speed', f'lfo_{tag}_speed'),
+                (f'{tag_label} LFO Shape Cycle', f'lfo_{tag}_shape'),
+                (f'{tag_label} LFO Cycle Target', f'lfo_{tag}_cycle'),
+                (f'{tag_label} Bezier Toggle', f'bezier_{tag}_toggle'),
+            ]
+
+        self.actions += [
+            ('Auto-Pilot Toggle', 'auto_pilot_toggle'),
             ('Style: Acid', 'style_acid'),
             ('Style: Noir', 'style_noir'),
             ('Style: Retro', 'style_retro'),
@@ -159,6 +146,8 @@ class ProjectionMappingApp(QMainWindow):
 
         self.create_control_panel()
         
+        self.start_osc_server()
+
         self.layout.addWidget(self.video_display)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
@@ -294,11 +283,14 @@ class ProjectionMappingApp(QMainWindow):
         cue_layout = QVBoxLayout()
         self.cue_list_widget = QListWidget()
         self.add_cue_button = QPushButton("Add Video Cue")
+        self.add_gen_button = QPushButton("Add VJ Generator")
+        self.add_gen_button.clicked.connect(self.add_vj_generator)
         self.add_cue_button.clicked.connect(self.add_cue)
         self.remove_cue_button = QPushButton("Remove Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
         cue_layout.addWidget(self.cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
+        cue_layout.addWidget(self.add_gen_button)
         cue_layout.addWidget(self.remove_cue_button)
         cue_group.setLayout(cue_layout)
         self.control_layout.addWidget(cue_group)
@@ -376,6 +368,20 @@ class ProjectionMappingApp(QMainWindow):
         mask_layout.addWidget(QLabel("Blend Mode:"))
         mask_layout.addWidget(self.mask_blend_combo)
 
+        self.bezier_check = QCheckBox("Bezier (Curved) Mask")
+        mask_layout.addWidget(self.bezier_check)
+
+        self.lfo_shape_combo = QComboBox()
+        self.lfo_shape_combo.addItems(["sine", "square", "triangle", "sawtooth"])
+        mask_layout.addWidget(QLabel("LFO Shape:"))
+        mask_layout.addWidget(self.lfo_shape_combo)
+
+        self.mask_feather_slider = QSlider(Qt.Horizontal)
+        self.mask_feather_slider.setRange(0, 100)
+        self.mask_feather_slider.setValue(0)
+        mask_layout.addWidget(QLabel("Mask Feathering:"))
+        mask_layout.addWidget(self.mask_feather_slider)
+
         self.finish_mask_button = QPushButton("Finish Mask")
         self.finish_mask_button.clicked.connect(self.finish_mask_creation)
         self.finish_mask_button.setEnabled(False)
@@ -443,6 +449,10 @@ class ProjectionMappingApp(QMainWindow):
         perf_layout.addWidget(QLabel("Visual Style:"))
         perf_layout.addWidget(self.style_combo)
 
+        self.auto_pilot_check = QCheckBox("Auto-Pilot Mode")
+        self.auto_pilot_check.toggled.connect(lambda c: setattr(self.worker, 'auto_pilot', c))
+        perf_layout.addWidget(self.auto_pilot_check)
+
         perf_group.setLayout(perf_layout)
         self.control_layout.addWidget(perf_group)
 
@@ -489,6 +499,34 @@ class ProjectionMappingApp(QMainWindow):
         self.control_layout.addWidget(snap_group)
 
         self.control_layout.addStretch()
+
+    def start_osc_server(self):
+        self.osc_handler = OSCHandler()
+        self.osc_handler.message_received.connect(self.handle_osc_message)
+        self.osc_handler.start()
+
+    def handle_osc_message(self, address, args):
+        # Example: /mask/amp/visible 1
+        # Example: /mask/amp/fx/blur 0.5
+        parts = address.strip('/').split('/')
+        if not parts: return
+
+        if parts[0] == 'mask' and len(parts) >= 3:
+            tag = parts[1]
+            action = parts[2]
+            val = args[0] if args else 0
+
+            if action == 'visible':
+                self.worker.toggle_mask(tag, val > 0.5)
+            elif action == 'fx' and len(parts) >= 4:
+                fx_name = parts[3]
+                self.worker.set_fx(tag, fx_name, val > 0.5)
+            elif action == 'video' and args:
+                self.worker.switch_video(tag, str(args[0]))
+        elif parts[0] == 'style' and args:
+            self.worker.set_style(str(args[0]))
+        elif parts[0] == 'snapshot' and args:
+            self.load_snapshot(int(args[0]))
 
     def change_audio_device(self, index):
         if hasattr(self, 'audio_handler'):
@@ -599,6 +637,7 @@ class ProjectionMappingApp(QMainWindow):
             self.midi_handler.note_on.connect(self.handle_midi_note)
             self.midi_handler.control_change.connect(self.handle_midi_cc)
             self.midi_handler.beat.connect(self.handle_bpm)
+            self.midi_handler.beat_pulse.connect(self.handle_beat_pulse)
             self.midi_handler.learned_message.connect(self.handle_learned_message)
             self.midi_thread.started.connect(self.midi_handler.start_listening)
             self.midi_thread.start()
@@ -676,10 +715,20 @@ class ProjectionMappingApp(QMainWindow):
                     elif param == 'speed':
                         mask.fx_params['lfo_speed'] = (value / 64.0)
                     elif param == 'cycle' and value > 64:
-                        targets = ["none", "blur", "tint", "rgb_shift"]
+                        targets = ["none", "blur", "tint", "rgb_shift", "hue"]
                         curr = mask.fx_params.get('lfo_target', 'none')
                         idx = (targets.index(curr) + 1) % len(targets)
                         mask.fx_params['lfo_target'] = targets[idx]
+                    elif param == 'shape' and value > 64:
+                        shapes = ["sine", "square", "triangle", "sawtooth"]
+                        curr = mask.fx_params.get('lfo_shape', 'sine')
+                        idx = (shapes.index(curr) + 1) % len(shapes)
+                        mask.fx_params['lfo_shape'] = shapes[idx]
+        elif key.startswith('bezier_'):
+            tag = key.split('_')[1]
+            for mask in self.masks:
+                if mask.tag == tag:
+                    mask.bezier_enabled = (value > 64)
         elif key.startswith('style_'):
             style_name = key.split('_')[1]
             if value > 64:
@@ -688,6 +737,9 @@ class ProjectionMappingApp(QMainWindow):
             part_name = key.split('_')[1]
             if value > 64:
                 self.worker.set_particle_preset(part_name)
+        elif key == 'auto_pilot_toggle':
+            if value > 64:
+                self.auto_pilot_check.setChecked(not self.auto_pilot_check.isChecked())
         elif key.startswith('snap_save_'):
             idx = int(key.split('_')[-1])
             if value > 64: self.save_snapshot(idx)
@@ -698,6 +750,9 @@ class ProjectionMappingApp(QMainWindow):
     def handle_bpm(self, bpm):
         self.bpm_label.setText(f"BPM: {bpm:.1f}")
         self.worker.set_bpm(bpm)
+
+    def handle_beat_pulse(self):
+        self.worker.trigger_beat()
 
     def calibrate_depth(self):
         self.worker.calibrate_depth()
@@ -728,7 +783,10 @@ class ProjectionMappingApp(QMainWindow):
                 self.masks[row].type = self.mask_type_combo.currentText()
                 self.masks[row].design_overlay = self.mask_design_combo.currentText()
                 self.masks[row].fx_params['lfo_target'] = self.lfo_target_combo.currentText()
+                self.masks[row].fx_params['lfo_shape'] = self.lfo_shape_combo.currentText()
                 self.masks[row].blend_mode = self.mask_blend_combo.currentText()
+                self.masks[row].bezier_enabled = self.bezier_check.isChecked()
+                self.masks[row].feather = self.mask_feather_slider.value()
                 self.worker.set_masks(self.masks)
                 print(f"Mask created for {self.masks[row].name} with tag {self.masks[row].tag}")
 
@@ -781,6 +839,16 @@ class ProjectionMappingApp(QMainWindow):
         else:
             self.enable_warping_button.setText("Enable Warping")
 
+    def add_vj_generator(self):
+        pattern, ok = QInputDialog.getItem(self, "Select Generator", "Pattern:", ["grid", "scan", "radial"], 0, False)
+        if ok and pattern:
+            video_path = f"generator:{pattern}"
+            mask_name = f"Gen: {pattern}"
+            new_mask = Mask(mask_name, [], video_path)
+            self.masks.append(new_mask)
+            self.cue_list_widget.addItem(mask_name)
+            self.worker.set_masks(self.masks)
+
     def add_cue(self):
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
         if not video_path:
@@ -824,6 +892,8 @@ class ProjectionMappingApp(QMainWindow):
                 self.midi_thread.wait()
         if hasattr(self, 'audio_handler'):
             self.audio_handler.stop()
+        if hasattr(self, 'osc_handler'):
+            self.osc_handler.stop()
         event.accept()
 
 

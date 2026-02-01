@@ -12,6 +12,8 @@ class Mask:
         self.tint_color = (255, 255, 255) # BGR
         self.design_overlay = 'none' # 'none', 'spiral', 'moon', 'mushroom', 'star', 'hexagon', 'heart'
         self.blend_mode = 'normal' # 'normal', 'add', 'screen', 'multiply'
+        self.bezier_enabled = False
+        self.feather = 0 # 0 to 100
         self.fx_params = {
             'kaleidoscope_segments': 6,
             'lfo_enabled': False,
@@ -32,6 +34,8 @@ class Mask:
             'tint_color': list(self.tint_color),
             'design_overlay': self.design_overlay,
             'blend_mode': self.blend_mode,
+            'bezier_enabled': self.bezier_enabled,
+            'feather': self.feather,
             'fx_params': self.fx_params
         }
 
@@ -44,5 +48,7 @@ class Mask:
         mask.tint_color = tuple(d.get('tint_color', [255, 255, 255]))
         mask.design_overlay = d.get('design_overlay', 'none')
         mask.blend_mode = d.get('blend_mode', 'normal')
+        mask.bezier_enabled = d.get('bezier_enabled', False)
+        mask.feather = d.get('feather', 0)
         mask.fx_params = d.get('fx_params', {'kaleidoscope_segments': 6})
         return mask

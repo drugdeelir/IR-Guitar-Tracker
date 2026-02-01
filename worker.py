@@ -5,6 +5,7 @@ import time
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
 from itertools import combinations
+from scipy.interpolate import interp1d
 
 class VideoPlayer(QThread):
     def __init__(self, video_path):
@@ -94,6 +95,11 @@ class Worker(QObject):
         self.audio_reactive_target = 'none' # 'none', 'glitch', 'strobe', 'blur', 'scale'
         self.audio_gain = 1.0
 
+        # Beat Automation
+        self.auto_pilot = False
+        self.beat_counter = 0
+        self.auto_pilot_interval = 8 # beats
+
     def set_marker_points(self, points):
         self.marker_config = [ (p.x(), p.y()) for p in points]
         if len(self.marker_config) > 1:
@@ -137,6 +143,15 @@ class Worker(QObject):
 
     def set_bpm(self, bpm):
         self.bpm = bpm
+
+    def trigger_beat(self):
+        self.beat_counter += 1
+        if self.auto_pilot and (self.beat_counter % self.auto_pilot_interval == 0):
+            self.run_auto_pilot()
+
+    def run_auto_pilot(self):
+        styles = ['none', 'acid', 'noir', 'retro']
+        self.set_style(np.random.choice(styles))
 
     def set_particle_preset(self, preset):
         self.particle_preset = preset
@@ -189,12 +204,25 @@ class Worker(QObject):
                 elif not enabled and fx_name in mask.active_fx:
                     mask.active_fx.remove(fx_name)
 
+    def get_lfo_value(self, mask):
+        speed = mask.fx_params.get('lfo_speed', 1.0)
+        t = time.time() * (self.bpm / 60.0) * speed
+        shape = mask.fx_params.get('lfo_shape', 'sine')
+
+        if shape == 'square':
+            return 1.0 if (np.sin(2 * np.pi * t) >= 0) else 0.0
+        elif shape == 'triangle':
+            return 2 * np.abs(2 * (t - np.floor(t + 0.5)))
+        elif shape == 'sawtooth':
+            return 2 * (t - np.floor(t))
+        else: # sine
+            return (np.sin(2 * np.pi * t) + 1) / 2
+
     def apply_fx(self, frame, mask):
         mask_id = id(mask)
         lfo_val = 1.0
         if mask.fx_params.get('lfo_enabled'):
-            speed = mask.fx_params.get('lfo_speed', 1.0)
-            lfo_val = (np.sin(2 * np.pi * time.time() * (self.bpm / 60.0) * speed) + 1) / 2
+            lfo_val = self.get_lfo_value(mask)
 
         if not mask.active_fx and mask.design_overlay == 'none':
             return frame
@@ -287,6 +315,25 @@ class Worker(QObject):
             alpha = 0.3 * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
             tint = np.full_like(processed, mask.tint_color)
             processed = cv2.addWeighted(processed, 1.0 - alpha, tint, alpha, 0)
+
+        if 'duotone' in mask.active_fx:
+            gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+            comp = (255 - mask.tint_color[0], 255 - mask.tint_color[1], 255 - mask.tint_color[2])
+            lut = np.zeros((256, 1, 3), dtype=np.uint8)
+            for i in range(256):
+                a = i / 255.0
+                lut[i, 0, 0] = int(comp[0] * (1 - a) + mask.tint_color[0] * a)
+                lut[i, 0, 1] = int(comp[1] * (1 - a) + mask.tint_color[1] * a)
+                lut[i, 0, 2] = int(comp[2] * (1 - a) + mask.tint_color[2] * a)
+            processed = cv2.LUT(cv2.merge([gray, gray, gray]), lut)
+
+        if 'chromakey' in mask.active_fx:
+            # Simple green screen removal
+            hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV)
+            lower = np.array([40, 40, 40])
+            upper = np.array([80, 255, 255])
+            m = cv2.inRange(hsv, lower, upper)
+            processed[m > 0] = [0, 0, 0]
 
         return processed
 
@@ -462,6 +509,9 @@ class Worker(QObject):
 
                 if mask.video_path == "generative":
                     frame_cue = self.get_generative_frame(h, w)
+                elif mask.video_path.startswith("generator:"):
+                    pattern = mask.video_path.split(":")[-1]
+                    frame_cue = self.get_vj_generator(pattern, h, w)
                 else:
                     if mask.video_path not in self.video_players:
                         player = VideoPlayer(mask.video_path)
@@ -513,10 +563,31 @@ class Worker(QObject):
                                 center = np.mean(dst_pts_raw, axis=0)
                                 scale_factor = 1.0 + self.audio_bands[0] * 0.5
                                 dst_pts = (dst_pts_raw - center) * scale_factor + center
-                        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+                        if len(src_pts) == 4 and len(dst_pts) == 4:
+                            matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                        else:
+                            matrix, _ = cv2.findHomography(src_pts, dst_pts)
+
                         warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
                         mask_img = np.zeros_like(projector_output)
-                        cv2.fillConvexPoly(mask_img, np.int32(dst_pts), (255, 255, 255))
+
+                        draw_pts = np.int32(dst_pts)
+                        if mask.bezier_enabled and len(dst_pts) >= 3:
+                            # Interpolate points for a smooth curve
+                            pts = np.array(dst_pts)
+                            # Close the loop
+                            pts = np.vstack([pts, pts[0]])
+                            t = np.linspace(0, 1, len(pts))
+                            t_new = np.linspace(0, 1, 100)
+                            f_x = interp1d(t, pts[:, 0], kind='quadratic')
+                            f_y = interp1d(t, pts[:, 1], kind='quadratic')
+                            draw_pts = np.stack([f_x(t_new), f_y(t_new)], axis=1).astype(np.int32)
+
+                        cv2.fillPoly(mask_img, [draw_pts], (255, 255, 255))
+                        if mask.feather > 0:
+                            k = int(mask.feather) | 1
+                            mask_img = cv2.GaussianBlur(mask_img, (k, k), 0)
                         projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
                     elif mask.type == 'static':
                         if not mask.source_points:
@@ -528,6 +599,9 @@ class Worker(QObject):
                             warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
                             mask_img = np.zeros_like(projector_output)
                             cv2.fillConvexPoly(mask_img, np.int32(dst_pts), (255, 255, 255))
+                            if mask.feather > 0:
+                                k = int(mask.feather) | 1
+                                mask_img = cv2.GaussianBlur(mask_img, (k, k), 0)
                             projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
 
             if self._capture_still_frame_flag:
@@ -617,6 +691,26 @@ class Worker(QObject):
             color = (0, 255, 0) if self.particle_preset == 'rain' else (255, 255, 200)
             alpha = int(p['life'] * 255)
             cv2.circle(frame, (int(p['x']), int(p['y'])), 2, color, -1)
+
+    def get_vj_generator(self, pattern, h, w):
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        t = time.time() * (self.bpm / 60.0)
+
+        if pattern == 'grid':
+            spacing = 40
+            offset = int((t * 20) % spacing)
+            for x in range(offset, w, spacing):
+                cv2.line(frame, (x, 0), (x, h), (0, 255, 0), 2)
+            for y in range(offset, h, spacing):
+                cv2.line(frame, (0, y), (w, y), (0, 255, 0), 2)
+        elif pattern == 'scan':
+            y = int((t * 100) % h)
+            cv2.line(frame, (0, y), (w, y), (255, 255, 255), 5)
+        elif pattern == 'radial':
+            center = (w // 2, h // 2)
+            for r in range(int((t * 50) % 100), max(w, h), 100):
+                cv2.circle(frame, center, r, (255, 0, 0), 3)
+        return frame
 
     def get_generative_frame(self, h, w):
         self.noise_offset += 0.05
