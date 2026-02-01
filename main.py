@@ -9,6 +9,7 @@ from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
+from midi_handler import MIDIHandler, get_midi_ports
 
 def get_available_cameras():
     """Returns a list of available camera indices."""
@@ -27,7 +28,7 @@ class ProjectionMappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projection Mapping Tool")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1200, 900)
         self.masks = []
         self.selected_markers = []
 
@@ -63,14 +64,13 @@ class ProjectionMappingApp(QMainWindow):
 
     def open_marker_selection_dialog(self):
         self.marker_selection_dialog.clear_selection()
-        # Disconnect any previous connections to avoid multiple calls
         try:
             self.marker_selection_dialog.take_picture_button.clicked.disconnect()
         except TypeError:
-            pass # No connections to disconnect
+            pass
         self.marker_selection_dialog.take_picture_button.clicked.connect(self.start_marker_capture_countdown)
 
-        if self.marker_selection_dialog.exec_(): # This is a blocking call
+        if self.marker_selection_dialog.exec_():
             self.selected_markers = self.marker_selection_dialog.get_selected_points()
             print(f"Selected {len(self.selected_markers)} markers.")
             self.worker.set_marker_points(self.selected_markers)
@@ -115,6 +115,20 @@ class ProjectionMappingApp(QMainWindow):
         camera_layout.addWidget(self.camera_combo)
         camera_group.setLayout(camera_layout)
         self.control_layout.addWidget(camera_group)
+
+        # MIDI Settings
+        midi_group = QGroupBox("MIDI Settings")
+        midi_layout = QVBoxLayout()
+        self.midi_combo = QComboBox()
+        self.midi_ports = get_midi_ports()
+        self.midi_combo.addItems(["None"] + self.midi_ports)
+        self.midi_combo.currentIndexChanged.connect(self.change_midi_port)
+        midi_layout.addWidget(QLabel("MIDI Input Port:"))
+        midi_layout.addWidget(self.midi_combo)
+        self.bpm_label = QLabel("BPM: 120.0")
+        midi_layout.addWidget(self.bpm_label)
+        midi_group.setLayout(midi_layout)
+        self.control_layout.addWidget(midi_group)
 
         # Projector selection
         projector_group = QGroupBox("Projector Display")
@@ -183,6 +197,17 @@ class ProjectionMappingApp(QMainWindow):
         mask_layout = QVBoxLayout()
         self.create_mask_button = QPushButton("Create Mask")
         self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
+
+        self.mask_tag_combo = QComboBox()
+        self.mask_tag_combo.addItems(["none", "amp", "background"])
+        mask_layout.addWidget(QLabel("Mask Tag:"))
+        mask_layout.addWidget(self.mask_tag_combo)
+
+        self.mask_type_combo = QComboBox()
+        self.mask_type_combo.addItems(["dynamic", "static"])
+        mask_layout.addWidget(QLabel("Mask Type:"))
+        mask_layout.addWidget(self.mask_type_combo)
+
         self.finish_mask_button = QPushButton("Finish Mask")
         self.finish_mask_button.clicked.connect(self.finish_mask_creation)
         self.finish_mask_button.setEnabled(False)
@@ -209,7 +234,7 @@ class ProjectionMappingApp(QMainWindow):
         self.calibrate_depth_button = QPushButton("Calibrate Depth")
         self.calibrate_depth_button.clicked.connect(self.calibrate_depth)
         self.depth_sensitivity_slider = QSlider(Qt.Horizontal)
-        self.depth_sensitivity_slider.setRange(0, 200) # 0-200%
+        self.depth_sensitivity_slider.setRange(0, 200)
         self.depth_sensitivity_slider.setValue(100)
         self.depth_sensitivity_slider.valueChanged.connect(self.update_depth_sensitivity)
         self.depth_calibration_label = QLabel("Not calibrated")
@@ -222,6 +247,65 @@ class ProjectionMappingApp(QMainWindow):
 
         self.control_layout.addStretch()
 
+    def change_midi_port(self, index):
+        if index == 0:
+            if hasattr(self, 'midi_handler'):
+                self.midi_handler.stop()
+        else:
+            port_name = self.midi_ports[index - 1]
+            if hasattr(self, 'midi_handler'):
+                self.midi_handler.stop()
+                self.midi_thread.quit()
+                self.midi_thread.wait()
+
+            self.midi_handler = MIDIHandler(port_name)
+            self.midi_thread = QThread()
+            self.midi_handler.moveToThread(self.midi_thread)
+            self.midi_handler.note_on.connect(self.handle_midi_note)
+            self.midi_handler.control_change.connect(self.handle_midi_cc)
+            self.midi_handler.beat.connect(self.handle_bpm)
+            self.midi_thread.started.connect(self.midi_handler.start_listening)
+            self.midi_thread.start()
+
+    def handle_midi_note(self, note, velocity):
+        # MIDI Mapping
+        # Note 60-67: Switch video for 'amp' mask to corresponding cue
+        if 60 <= note <= 67:
+            cue_index = note - 60
+            if cue_index < len(self.masks):
+                video_path = self.masks[cue_index].video_path
+                self.worker.switch_video('amp', video_path)
+        # Note 72-79: Switch video for 'background' mask
+        elif 72 <= note <= 79:
+            cue_index = note - 72
+            if cue_index < len(self.masks):
+                video_path = self.masks[cue_index].video_path
+                self.worker.switch_video('background', video_path)
+        # Note 48: Toggle Amp visibility
+        elif note == 48:
+            self.worker.toggle_mask('amp', velocity > 0)
+        # Note 50: Toggle Background visibility
+        elif note == 50:
+            self.worker.toggle_mask('background', velocity > 0)
+
+    def handle_midi_cc(self, cc, value):
+        # CC Mapping for FX
+        if cc == 20: self.worker.set_fx('amp', 'strobe', value > 64)
+        elif cc == 21: self.worker.set_fx('amp', 'blur', value > 64)
+        elif cc == 22: self.worker.set_fx('amp', 'invert', value > 64)
+        elif cc == 23: self.worker.set_fx('amp', 'edges', value > 64)
+        elif cc == 24: self.worker.set_fx('amp', 'tint', value > 64)
+
+        elif cc == 30: self.worker.set_fx('background', 'strobe', value > 64)
+        elif cc == 31: self.worker.set_fx('background', 'blur', value > 64)
+        elif cc == 32: self.worker.set_fx('background', 'invert', value > 64)
+        elif cc == 33: self.worker.set_fx('background', 'edges', value > 64)
+        elif cc == 34: self.worker.set_fx('background', 'tint', value > 64)
+
+    def handle_bpm(self, bpm):
+        self.bpm_label.setText(f"BPM: {bpm:.1f}")
+        self.worker.set_bpm(bpm)
+
     def calibrate_depth(self):
         self.worker.calibrate_depth()
         self.depth_calibration_label.setText("Calibrated!")
@@ -230,7 +314,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.set_depth_sensitivity(value / 100.0)
 
     def show_camera_error(self, index):
-        self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000) # 5 seconds
+        self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
 
     def enter_mask_creation_mode(self):
         self.video_display.set_mask_creation_mode(True)
@@ -247,8 +331,10 @@ class ProjectionMappingApp(QMainWindow):
             row = self.cue_list_widget.row(current_item)
             if 0 <= row < len(self.masks):
                 self.masks[row].source_points = [ (p.x(), p.y()) for p in mask_points]
+                self.masks[row].tag = self.mask_tag_combo.currentText()
+                self.masks[row].type = self.mask_type_combo.currentText()
                 self.worker.set_masks(self.masks)
-                print(f"Mask created for {self.masks[row].name} with {len(mask_points)} points.")
+                print(f"Mask created for {self.masks[row].name} with tag {self.masks[row].tag}")
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
@@ -283,9 +369,6 @@ class ProjectionMappingApp(QMainWindow):
             if len(mask.source_points) != len(self.selected_markers):
                 self.statusBar().showMessage(f"Error: Mask has {len(mask.source_points)} points, but {len(self.selected_markers)} markers are selected.", 5000)
             else:
-                # The association is now implicit. The worker will use the currently
-                # selected markers for any mask that has the correct number of vertices.
-                # We can add a property to the mask to make this explicit.
                 mask.linked_marker_count = len(self.selected_markers)
                 self.statusBar().showMessage(f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000)
 
@@ -306,7 +389,6 @@ class ProjectionMappingApp(QMainWindow):
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
         if video_path:
             mask_name = f"Cue {len(self.masks) + 1}: {video_path.split('/')[-1]}"
-            # Placeholder for mask points
             new_mask = Mask(mask_name, [], video_path)
             self.masks.append(new_mask)
             self.cue_list_widget.addItem(mask_name)
@@ -316,10 +398,6 @@ class ProjectionMappingApp(QMainWindow):
         if self.available_cameras:
             new_camera_index = self.available_cameras[index]
             self.worker.set_video_source(new_camera_index)
-            # You might need to restart the worker thread for the change to take effect
-            # self.thread.quit()
-            # self.thread.wait()
-            # self.thread.start()
 
     def change_projector(self, index):
         if index < len(self.screens):
@@ -339,6 +417,10 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()
+        if hasattr(self, 'midi_handler'):
+            self.midi_handler.stop()
+            self.midi_thread.quit()
+            self.midi_thread.wait()
         event.accept()
 
 
@@ -347,11 +429,8 @@ if __name__ == '__main__':
     
     splash = SplashScreen()
     splash.show()
-    
-    # Process events to show splash screen
     app.processEvents()
 
-    # Load and apply stylesheet
     try:
         with open('style.qss', 'r') as f:
             style = f.read()
@@ -360,7 +439,6 @@ if __name__ == '__main__':
         print("Stylesheet not found. Using default style.")
 
     main_win = ProjectionMappingApp()
-    
     main_win.show()
     splash.finish(main_win)
     sys.exit(app.exec_())

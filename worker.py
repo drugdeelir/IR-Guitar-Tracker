@@ -1,6 +1,7 @@
 
 import cv2
 import numpy as np
+import time
 from PyQt5.QtCore import QObject, pyqtSignal, QThread
 from PyQt5.QtGui import QImage
 from itertools import combinations
@@ -26,6 +27,7 @@ class Worker(QObject):
         self._calibrate_depth_flag = False
         self._capture_still_frame_flag = False
         self.marker_config = None
+        self.bpm = 120.0
 
     def set_marker_points(self, points):
         # The points are QPoints, convert them to tuples
@@ -62,6 +64,56 @@ class Worker(QObject):
         self.video_source = source
         self._camera_changed = True
 
+    def set_bpm(self, bpm):
+        self.bpm = bpm
+
+    def switch_video(self, tag, video_path):
+        for mask in self.masks:
+            if mask.tag == tag:
+                mask.video_path = video_path
+
+    def toggle_mask(self, tag, visible):
+        for mask in self.masks:
+            if mask.tag == tag:
+                mask.visible = visible
+
+    def set_fx(self, tag, fx_name, enabled):
+        for mask in self.masks:
+            if mask.tag == tag:
+                if enabled and fx_name not in mask.active_fx:
+                    mask.active_fx.append(fx_name)
+                elif not enabled and fx_name in mask.active_fx:
+                    if fx_name in mask.active_fx:
+                        mask.active_fx.remove(fx_name)
+
+    def apply_fx(self, frame, mask):
+        if not mask.active_fx:
+            return frame
+
+        processed = frame.copy()
+
+        if 'strobe' in mask.active_fx:
+            period = 60.0 / self.bpm
+            if (time.time() % period) < (period / 2.0):
+                processed = np.zeros_like(processed)
+
+        if 'blur' in mask.active_fx:
+            processed = cv2.GaussianBlur(processed, (15, 15), 0)
+
+        if 'invert' in mask.active_fx:
+            processed = cv2.bitwise_not(processed)
+
+        if 'edges' in mask.active_fx:
+            gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            processed = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+
+        if 'tint' in mask.active_fx:
+            tint = np.full_like(processed, mask.tint_color)
+            processed = cv2.addWeighted(processed, 0.7, tint, 0.3, 0)
+
+        return processed
+
     def process_video(self):
         main_cap = None
         
@@ -79,7 +131,6 @@ class Worker(QObject):
                 QThread.msleep(100)
                 continue
 
-            ret, main_frame = main_cap.read()
             ret, main_frame = main_cap.read()
             if not ret:
                 self.camera_error.emit(self.video_source)
@@ -110,145 +161,126 @@ class Worker(QObject):
             # If a marker configuration has been set, use the advanced tracking
             if self.marker_config and hasattr(self, 'marker_fingerprint') and len(self.marker_config) > 1 and len(all_detected_points) >= len(self.marker_config):
 
-                # To prevent performance issues, only check a reasonable number of points
-                # Sort points by some criteria (e.g., size) and take the top N could be an option
-                # For now, we'll just cap the number of points to consider.
                 points_to_check = all_detected_points[:20]
-
                 num_markers = len(self.marker_config)
 
-                # Iterate through all combinations of detected points that match the number of configured markers
                 for point_combo in combinations(points_to_check, num_markers):
-
-                    # Calculate the fingerprint for the current combination
                     current_distances = []
                     for p1, p2 in combinations(point_combo, 2):
                         dist = np.linalg.norm(np.array(p1) - np.array(p2))
                         current_distances.append(dist)
                     current_fingerprint = sorted(current_distances)
 
-                    # Compare with the stored fingerprint (with a tolerance)
                     is_match = True
                     if len(current_fingerprint) == len(self.marker_fingerprint):
                         for i in range(len(current_fingerprint)):
-                            if not np.isclose(current_fingerprint[i], self.marker_fingerprint[i], rtol=0.15): # 15% tolerance
+                            if not np.isclose(current_fingerprint[i], self.marker_fingerprint[i], rtol=0.15):
                                 is_match = False
                                 break
                     else:
                         is_match = False
 
                     if is_match:
-                        # The constellation matches. Now, we must order the points correctly.
-                        # We find the perspective transform that maps the original marker configuration
-                        # to the current detected points. This is robust to rotation and perspective shifts.
-
                         src_pts = np.float32(self.marker_config).reshape(-1, 1, 2)
                         dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
-
-                        # Find the homography matrix
-                        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                        matrix, mask_h = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
                         if matrix is not None:
-                            # Transform the original points to their new predicted locations
                             transformed_src = cv2.perspectiveTransform(src_pts, matrix)
-
-                            # Now, match the actual detected points (dst_pts) to these
-                            # transformed source points to get the correct order.
                             ordered_points = [None] * num_markers
                             remaining_dst = list(point_combo)
 
                             for i in range(num_markers):
                                 predicted_pt = transformed_src[i][0]
                                 closest_actual_pt = min(remaining_dst, key=lambda p: np.linalg.norm(np.array(p) - predicted_pt))
-
                                 ordered_points[i] = closest_actual_pt
                                 remaining_dst.remove(closest_actual_pt)
 
                             tracked_points = ordered_points
                             break
-                        else:
-                            # If we can't find a homography, this isn't a valid match
-                            continue
             else:
-                # Fallback to old behavior if no config is set
                 tracked_points = all_detected_points
             
             self.trackers_detected.emit(len(tracked_points))
 
-            # Depth calibration
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
                 self.baseline_distance = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
                 self._calibrate_depth_flag = False
-                print(f"Depth calibrated with baseline distance: {self.baseline_distance}")
 
-            # Draw trackers on main display feed
             for point in tracked_points:
                 cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
 
-            # Process cues and warp masks
-            for mask in self.masks:
-                # Only process masks that are linked to the current number of tracked markers
-                if mask.type == 'dynamic' and mask.linked_marker_count == len(tracked_points):
-                    if mask.video_path not in self.video_captures:
-                        self.video_captures[mask.video_path] = cv2.VideoCapture(mask.video_path)
-                    
-                    cap = self.video_captures[mask.video_path]
+            # Process masks (background first)
+            sorted_masks = sorted(self.masks, key=lambda m: 0 if m.tag == 'background' else 1)
+
+            for mask in sorted_masks:
+                if not mask.visible or not mask.video_path:
+                    continue
+
+                if mask.video_path not in self.video_captures:
+                    self.video_captures[mask.video_path] = cv2.VideoCapture(mask.video_path)
+
+                cap = self.video_captures[mask.video_path]
+                ret_cue, frame_cue = cap.read()
+                if not ret_cue:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret_cue, frame_cue = cap.read()
-                    
-                    if not ret_cue:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret_cue, frame_cue = cap.read()
 
-                    if ret_cue and mask.source_points:
-                        cue_h, cue_w, _ = frame_cue.shape
-                        
-                        # The source points for the transform are the corners of the custom mask
+                if ret_cue:
+                    frame_cue = self.apply_fx(frame_cue, mask)
+
+                    if mask.type == 'dynamic' and mask.linked_marker_count == len(tracked_points):
                         src_pts = np.float32(mask.source_points)
-
-                        # The destination points are the live tracker positions
-                        # With the new system, we use all tracked points that correspond to the mask vertices
-                        if len(tracked_points) != len(mask.source_points):
-                            # Not enough trackers were found for this mask, so skip it
-                            continue
-
                         dst_pts_raw = np.float32(tracked_points)
                         
-                        # Apply depth scaling
                         if self.baseline_distance > 0 and len(tracked_points) >= 2:
                             current_distance = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
                             scale_factor = (current_distance / self.baseline_distance - 1.0) * self.depth_sensitivity + 1.0
-                            
                             center = np.mean(dst_pts_raw, axis=0)
                             dst_pts = (dst_pts_raw - center) * scale_factor + center
                         else:
                             dst_pts = dst_pts_raw
 
-                        # Create a transform from the mask's original shape to the live tracker quad
                         matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
                         warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
 
-                        # Create a mask to apply the warped video only within the warped polygon
                         mask_image = np.zeros_like(projector_output)
                         cv2.fillConvexPoly(mask_image, np.int32(dst_pts), (255, 255, 255))
                         
-                        # Composite the result
                         projector_output = cv2.bitwise_and(projector_output, cv2.bitwise_not(mask_image))
                         projector_output = cv2.add(projector_output, cv2.bitwise_and(warped_cue, mask_image))
 
+                    elif mask.type == 'static':
+                        if not mask.source_points:
+                            # Full screen background
+                            projector_output = cv2.resize(frame_cue, (w, h))
+                        else:
+                            # Static polygon
+                            src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
+                            # If source_points for mask are used as the polygon on projector
+                            dst_pts = np.float32(mask.source_points)
+                            # Actually source_points in Mask class are the points drawn on the camera feed
+                            # For static background, we can use them as fixed points on the output
 
-            # Still frame capture for marker selection
+                            matrix, _ = cv2.findHomography(src_pts, dst_pts)
+                            warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
+
+                            mask_image = np.zeros_like(projector_output)
+                            cv2.fillConvexPoly(mask_image, np.int32(dst_pts), (255, 255, 255))
+
+                            projector_output = cv2.bitwise_and(projector_output, cv2.bitwise_not(mask_image))
+                            projector_output = cv2.add(projector_output, cv2.bitwise_and(warped_cue, mask_image))
+
             if self._capture_still_frame_flag:
                 rgb_image_still = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
                 qt_image_still = QImage(rgb_image_still.data, w, h, w * 3, QImage.Format_RGB888)
                 self.still_frame_ready.emit(qt_image_still)
                 self._capture_still_frame_flag = False
 
-            # Main display processing (shows the raw camera feed with trackers)
             rgb_image_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
             qt_image_main = QImage(rgb_image_main.data, w, h, w * 3, QImage.Format_RGB888)
             self.frame_ready.emit(qt_image_main)
 
-            # Projector output processing
             src_points = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
             dst_points = np.float32([[p[0] * w, p[1] * h] for p in self.warp_points])
             
@@ -268,16 +300,12 @@ class Worker(QObject):
     def stop(self):
         self._running = False
 
-    def set_video_source(self, source):
-        self.video_source = source
-    
     def set_warp_points(self, points):
         self.warp_points = points
     
     def set_masks(self, masks):
         self.masks = masks
-        # Clean up old video captures
-        current_cues = {mask.video_path for mask in self.masks}
+        current_cues = {mask.video_path for mask in self.masks if mask.video_path}
         for cue in list(self.video_captures.keys()):
             if cue not in current_cues:
                 self.video_captures[cue].release()
