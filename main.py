@@ -2,9 +2,10 @@
 import sys
 import time
 import cv2
+import json
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog, QLineEdit, QSlider, QListWidget, QStatusBar
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
@@ -104,6 +105,18 @@ class ProjectionMappingApp(QMainWindow):
         self.control_panel = QWidget()
         self.control_layout = QVBoxLayout(self.control_panel)
         self.layout.addWidget(self.control_panel)
+
+        # Project management
+        project_group = QGroupBox("Project")
+        project_layout = QHBoxLayout()
+        self.save_button = QPushButton("Save Project")
+        self.save_button.clicked.connect(self.save_project)
+        self.load_button = QPushButton("Load Project")
+        self.load_button.clicked.connect(self.load_project)
+        project_layout.addWidget(self.save_button)
+        project_layout.addWidget(self.load_button)
+        project_group.setLayout(project_layout)
+        self.control_layout.addWidget(project_group)
 
         # Camera selection
         camera_group = QGroupBox("Camera")
@@ -247,6 +260,60 @@ class ProjectionMappingApp(QMainWindow):
 
         self.control_layout.addStretch()
 
+    def save_project(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "Project Files (*.json)")
+        if filename:
+            project_data = {
+                'masks': [mask.to_dict() for mask in self.masks],
+                'warp_points': self.projector_window.warp_points,
+                'ir_threshold': self.ir_threshold_slider.value(),
+                'depth_sensitivity': self.depth_sensitivity_slider.value(),
+                'midi_port': self.midi_combo.currentText(),
+                'marker_config': self.worker.marker_config,
+                'baseline_distance': self.worker.baseline_distance
+            }
+            with open(filename, 'w') as f:
+                json.dump(project_data, f, indent=4)
+            self.statusBar().showMessage(f"Project saved to {filename}", 3000)
+
+    def load_project(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
+        if filename:
+            try:
+                with open(filename, 'r') as f:
+                    data = json.load(f)
+
+                self.masks = [Mask.from_dict(d) for d in data.get('masks', [])]
+                self.cue_list_widget.clear()
+                self.cue_list_widget.addItems([mask.name for mask in self.masks])
+                self.worker.set_masks(self.masks)
+
+                warp_points = data.get('warp_points')
+                if warp_points:
+                    self.projector_window.warp_points = warp_points
+                    self.worker.set_warp_points(warp_points)
+
+                self.ir_threshold_slider.setValue(data.get('ir_threshold', 200))
+                self.depth_sensitivity_slider.setValue(data.get('depth_sensitivity', 100))
+
+                midi_port = data.get('midi_port')
+                if midi_port and midi_port != "None":
+                    index = self.midi_combo.findText(midi_port)
+                    if index >= 0:
+                        self.midi_combo.setCurrentIndex(index)
+
+                marker_config = data.get('marker_config')
+                if marker_config:
+                    # Convert list of lists back to list of tuples
+                    config_pts = [tuple(p) for p in marker_config]
+                    self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
+
+                self.worker.baseline_distance = data.get('baseline_distance', 0)
+
+                self.statusBar().showMessage(f"Project loaded from {filename}", 3000)
+            except Exception as e:
+                self.statusBar().showMessage(f"Error loading project: {e}", 5000)
+
     def change_midi_port(self, index):
         if index == 0:
             if hasattr(self, 'midi_handler'):
@@ -255,8 +322,9 @@ class ProjectionMappingApp(QMainWindow):
             port_name = self.midi_ports[index - 1]
             if hasattr(self, 'midi_handler'):
                 self.midi_handler.stop()
-                self.midi_thread.quit()
-                self.midi_thread.wait()
+                if hasattr(self, 'midi_thread'):
+                    self.midi_thread.quit()
+                    self.midi_thread.wait()
 
             self.midi_handler = MIDIHandler(port_name)
             self.midi_thread = QThread()
@@ -419,8 +487,9 @@ class ProjectionMappingApp(QMainWindow):
         self.thread.wait()
         if hasattr(self, 'midi_handler'):
             self.midi_handler.stop()
-            self.midi_thread.quit()
-            self.midi_thread.wait()
+            if hasattr(self, 'midi_thread'):
+                self.midi_thread.quit()
+                self.midi_thread.wait()
         event.accept()
 
 

@@ -1,7 +1,7 @@
 
 import mido
 import time
-from PyQt5.QtCore import QObject, pyqtSignal, QThread
+from PyQt5.QtCore import QObject, pyqtSignal
 
 class MIDIHandler(QObject):
     note_on = pyqtSignal(int, int) # note, velocity
@@ -11,7 +11,7 @@ class MIDIHandler(QObject):
     def __init__(self, port_name=None):
         super().__init__()
         self.port_name = port_name
-        self._running = False
+        self.inport = None
         self.clock_count = 0
         self.last_clock_time = 0
         self.bpm = 120.0
@@ -21,29 +21,24 @@ class MIDIHandler(QObject):
         self.port_name = port_name
 
     def start_listening(self):
-        self._running = True
-        self.run()
-
-    def run(self):
         if not self.port_name:
             print("No MIDI port selected.")
             return
 
-        print(f"Listening for MIDI on {self.port_name}")
+        print(f"Opening MIDI port: {self.port_name}")
         try:
-            with mido.open_input(self.port_name) as inport:
-                while self._running:
-                    for msg in inport.iter_pending():
-                        if msg.type == 'note_on':
-                            if msg.velocity > 0:
-                                self.note_on.emit(msg.note, msg.velocity)
-                        elif msg.type == 'control_change':
-                            self.control_change.emit(msg.control, msg.value)
-                        elif msg.type == 'clock':
-                            self.handle_clock()
-                    time.sleep(0.001)
+            self.inport = mido.open_input(self.port_name, callback=self.midi_callback)
         except Exception as e:
             print(f"MIDI Error: {e}")
+
+    def midi_callback(self, msg):
+        if msg.type == 'note_on':
+            if msg.velocity > 0:
+                self.note_on.emit(msg.note, msg.velocity)
+        elif msg.type == 'control_change':
+            self.control_change.emit(msg.control, msg.value)
+        elif msg.type == 'clock':
+            self.handle_clock()
 
     def handle_clock(self):
         current_time = time.time()
@@ -66,7 +61,9 @@ class MIDIHandler(QObject):
         self.clock_count = (self.clock_count + 1) % 24
 
     def stop(self):
-        self._running = False
+        if self.inport:
+            self.inport.close()
+            self.inport = None
 
 def get_midi_ports():
     try:

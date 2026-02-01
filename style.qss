@@ -1,71 +1,87 @@
 
-QWidget {
-    background-color: #2e2e2e;
-    color: #ffffff;
-    border: none;
-    font-size: 14px;
+QMainWindow {
+    background-color: #121212;
+    color: #e0e0e0;
 }
 
-QMainWindow {
-    background-color: #2e2e2e;
+QWidget {
+    background-color: #121212;
+    color: #e0e0e0;
 }
 
 QGroupBox {
-    background-color: #404040;
-    border: 1px solid #555555;
+    border: 1px solid #333333;
     border-radius: 5px;
-    margin-top: 1ex; /* leave space at the top for the title */
+    margin-top: 10px;
+    font-weight: bold;
+    color: #bb86fc;
 }
 
 QGroupBox::title {
     subcontrol-origin: margin;
-    subcontrol-position: top center;
-    padding: 0 3px;
-    background-color: #404040;
+    left: 10px;
+    padding: 0 3px 0 3px;
 }
 
 QPushButton {
-    background-color: #555555;
-    color: #ffffff;
-    border: 1px solid #666666;
+    background-color: #1f1b24;
+    border: 1px solid #333333;
+    border-radius: 4px;
     padding: 5px;
-    border-radius: 5px;
+    color: #e0e0e0;
+    min-width: 80px;
 }
 
 QPushButton:hover {
-    background-color: #666666;
+    background-color: #332940;
+    border: 1px solid #bb86fc;
 }
 
 QPushButton:pressed {
-    background-color: #444444;
+    background-color: #bb86fc;
+    color: #121212;
 }
 
-QPushButton:checked {
-    background-color: #007acc;
-    border-color: #005c99;
+QPushButton:disabled {
+    background-color: #121212;
+    color: #666666;
+    border: 1px solid #222222;
 }
 
 QComboBox {
-    background-color: #404040;
-    border: 1px solid #555555;
-    border-radius: 3px;
-    padding: 1px 18px 1px 3px;
-    min-width: 6em;
-}
-
-QComboBox::drop-down {
-    subcontrol-origin: padding;
-    subcontrol-position: top right;
-    width: 15px;
-    border-left-width: 1px;
-    border-left-color: #555555;
-    border-left-style: solid;
-    border-top-right-radius: 3px;
-    border-bottom-right-radius: 3px;
+    background-color: #1f1b24;
+    border: 1px solid #333333;
+    border-radius: 4px;
+    padding: 2px 10px;
+    color: #e0e0e0;
 }
 
 QListWidget {
-    background-color: #404040;
-    border: 1px solid #555555;
-    border-radius: 5px;
+    background-color: #1e1e1e;
+    border: 1px solid #333333;
+    color: #e0e0e0;
+}
+
+QSlider::groove:horizontal {
+    border: 1px solid #333333;
+    height: 8px;
+    background: #1e1e1e;
+    margin: 2px 0;
+}
+
+QSlider::handle:horizontal {
+    background: #bb86fc;
+    border: 1px solid #bb86fc;
+    width: 18px;
+    margin: -2px 0;
+    border-radius: 9px;
+}
+
+QStatusBar {
+    background-color: #1f1b24;
+    color: #03dac6;
+}
+
+QLabel {
+    color: #e0e0e0;
 }
