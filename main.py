@@ -3,7 +3,10 @@ import sys
 import time
 import cv2
 import json
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog, QLineEdit, QSlider, QListWidget, QStatusBar
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+                             QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
+                             QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
+                             QDialog, QFormLayout)
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
@@ -25,6 +28,96 @@ def get_available_cameras():
         index += 1
     return arr
 
+class MIDIMappingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MIDI Mapping")
+        self.layout = QVBoxLayout(self)
+        self.form = QFormLayout()
+        self.layout.addLayout(self.form)
+
+        self.mappings = parent.midi_mappings
+        self.learn_buttons = {}
+
+        # Define actions
+        self.actions = [
+            ('Toggle Amp Visibility', 'toggle_amp'),
+            ('Toggle Background Visibility', 'toggle_bg'),
+            ('Amp Strobe', 'fx_amp_strobe'),
+            ('Amp Blur', 'fx_amp_blur'),
+            ('Amp Invert', 'fx_amp_invert'),
+            ('Amp Edges', 'fx_amp_edges'),
+            ('Amp Tint', 'fx_amp_tint'),
+            ('Amp Hue Cycle', 'fx_amp_hue_cycle'),
+            ('Amp Feedback', 'fx_amp_feedback'),
+            ('Amp RGB Shift', 'fx_amp_rgb_shift'),
+            ('Amp Glitch', 'fx_amp_glitch'),
+            ('Amp Trails', 'fx_amp_trails'),
+            ('Amp Kaleidoscope', 'fx_amp_kaleidoscope'),
+            ('Amp Mirror H', 'fx_amp_mirror_h'),
+            ('Amp Mirror V', 'fx_amp_mirror_v'),
+            ('Amp Design: Spiral', 'design_amp_spiral'),
+            ('Amp Design: Moon', 'design_amp_moon'),
+            ('Amp Design: Mushroom', 'design_amp_mushroom'),
+            ('Amp Design: Star', 'design_amp_star'),
+            ('Amp Design: Hexagon', 'design_amp_hexagon'),
+            ('Amp Design: Heart', 'design_amp_heart'),
+            ('Amp Design: None', 'design_amp_none'),
+            ('Amp LFO Toggle', 'lfo_amp_toggle'),
+            ('Amp LFO Speed', 'lfo_amp_speed'),
+            ('Amp LFO Cycle Target', 'lfo_amp_cycle'),
+            ('BG Strobe', 'fx_bg_strobe'),
+            ('BG Blur', 'fx_bg_blur'),
+            ('BG Invert', 'fx_bg_invert'),
+            ('BG Edges', 'fx_bg_edges'),
+            ('BG Tint', 'fx_bg_tint'),
+            ('BG Hue Cycle', 'fx_bg_hue_cycle'),
+            ('BG Feedback', 'fx_bg_feedback'),
+            ('BG RGB Shift', 'fx_bg_rgb_shift'),
+            ('BG Glitch', 'fx_bg_glitch'),
+            ('BG Trails', 'fx_bg_trails'),
+            ('BG Kaleidoscope', 'fx_bg_kaleidoscope'),
+            ('BG Mirror H', 'fx_bg_mirror_h'),
+            ('BG Mirror V', 'fx_bg_mirror_v'),
+            ('BG Design: Spiral', 'design_bg_spiral'),
+            ('BG Design: Moon', 'design_bg_moon'),
+            ('BG Design: Mushroom', 'design_bg_mushroom'),
+            ('BG Design: Star', 'design_bg_star'),
+            ('BG Design: Hexagon', 'design_bg_hexagon'),
+            ('BG Design: Heart', 'design_bg_heart'),
+            ('BG Design: None', 'design_bg_none'),
+            ('BG LFO Toggle', 'lfo_bg_toggle'),
+            ('BG LFO Speed', 'lfo_bg_speed'),
+            ('BG LFO Cycle Target', 'lfo_bg_cycle'),
+        ]
+
+        for i in range(8):
+            self.actions.append((f'Switch Amp to Cue {i+1}', f'cue_amp_{i}'))
+            self.actions.append((f'Switch BG to Cue {i+1}', f'cue_bg_{i}'))
+
+        for label, key in self.actions:
+            btn = QPushButton(self.get_mapping_text(key))
+            btn.clicked.connect(lambda checked, k=key: self.start_learning(k))
+            self.form.addRow(label, btn)
+            self.learn_buttons[key] = btn
+
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        self.layout.addWidget(self.close_btn)
+
+    def get_mapping_text(self, key):
+        m = self.mappings.get(key)
+        if not m: return "None (Click to Learn)"
+        return f"{m[0].upper()} {m[1]}"
+
+    def start_learning(self, key):
+        self.parent().start_midi_learn(key)
+        self.learn_buttons[key].setText("Listening...")
+
+    def update_mappings(self):
+        for label, key in self.actions:
+            self.learn_buttons[key].setText(self.get_mapping_text(key))
+
 class ProjectionMappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -32,6 +125,16 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 900)
         self.masks = []
         self.selected_markers = []
+
+        # Default MIDI Mappings
+        self.midi_mappings = {
+            'cue_amp_0': ('note', 60), 'cue_amp_1': ('note', 61), 'cue_amp_2': ('note', 62), 'cue_amp_3': ('note', 63),
+            'cue_bg_0': ('note', 72), 'cue_bg_1': ('note', 73), 'cue_bg_2': ('note', 74), 'cue_bg_3': ('note', 75),
+            'toggle_amp': ('note', 48), 'toggle_bg': ('note', 50),
+            'fx_amp_strobe': ('cc', 20), 'fx_amp_blur': ('cc', 21), 'fx_amp_invert': ('cc', 22), 'fx_amp_edges': ('cc', 23), 'fx_amp_tint': ('cc', 24),
+            'fx_bg_strobe': ('cc', 30), 'fx_bg_blur': ('cc', 31), 'fx_bg_invert': ('cc', 32), 'fx_bg_edges': ('cc', 33), 'fx_bg_tint': ('cc', 34),
+        }
+        self.learning_key = None
 
         self.setStatusBar(QStatusBar(self))
 
@@ -62,6 +165,21 @@ class ProjectionMappingApp(QMainWindow):
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
+
+    def start_midi_learn(self, key):
+        self.learning_key = key
+        if hasattr(self, 'midi_handler'):
+            self.midi_handler.learning_mode = True
+
+    def handle_learned_message(self, msg_type, number):
+        if self.learning_key:
+            self.midi_mappings[self.learning_key] = (msg_type, number)
+            self.learning_key = None
+            if hasattr(self, 'midi_handler'):
+                self.midi_handler.learning_mode = False
+            if hasattr(self, 'mapping_dialog') and self.mapping_dialog.isVisible():
+                self.mapping_dialog.update_mappings()
+            self.statusBar().showMessage(f"Mapped {msg_type} {number}", 3000)
 
     def open_marker_selection_dialog(self):
         self.marker_selection_dialog.clear_selection()
@@ -138,6 +256,11 @@ class ProjectionMappingApp(QMainWindow):
         self.midi_combo.currentIndexChanged.connect(self.change_midi_port)
         midi_layout.addWidget(QLabel("MIDI Input Port:"))
         midi_layout.addWidget(self.midi_combo)
+
+        self.midi_map_btn = QPushButton("Configure MIDI Mappings")
+        self.midi_map_btn.clicked.connect(self.open_midi_mapping)
+        midi_layout.addWidget(self.midi_map_btn)
+
         self.bpm_label = QLabel("BPM: 120.0")
         midi_layout.addWidget(self.bpm_label)
         midi_group.setLayout(midi_layout)
@@ -184,6 +307,11 @@ class ProjectionMappingApp(QMainWindow):
         # IR Tracking controls
         ir_group = QGroupBox("IR Tracking")
         ir_layout = QVBoxLayout()
+
+        self.auto_ir_check = QCheckBox("Auto Threshold")
+        self.auto_ir_check.toggled.connect(self.toggle_auto_ir)
+        ir_layout.addWidget(self.auto_ir_check)
+
         self.ir_threshold_slider = QSlider(Qt.Horizontal)
         self.ir_threshold_slider.setRange(0, 255)
         self.ir_threshold_slider.setValue(200)
@@ -221,6 +349,21 @@ class ProjectionMappingApp(QMainWindow):
         mask_layout.addWidget(QLabel("Mask Type:"))
         mask_layout.addWidget(self.mask_type_combo)
 
+        self.mask_design_combo = QComboBox()
+        self.mask_design_combo.addItems(["none", "spiral", "moon", "mushroom", "star", "hexagon", "heart"])
+        mask_layout.addWidget(QLabel("Design Overlay:"))
+        mask_layout.addWidget(self.mask_design_combo)
+
+        self.lfo_target_combo = QComboBox()
+        self.lfo_target_combo.addItems(["none", "blur", "tint", "rgb_shift", "hue"])
+        mask_layout.addWidget(QLabel("LFO Target:"))
+        mask_layout.addWidget(self.lfo_target_combo)
+
+        self.mask_blend_combo = QComboBox()
+        self.mask_blend_combo.addItems(["normal", "add", "screen", "multiply"])
+        mask_layout.addWidget(QLabel("Blend Mode:"))
+        mask_layout.addWidget(self.mask_blend_combo)
+
         self.finish_mask_button = QPushButton("Finish Mask")
         self.finish_mask_button.clicked.connect(self.finish_mask_creation)
         self.finish_mask_button.setEnabled(False)
@@ -246,6 +389,14 @@ class ProjectionMappingApp(QMainWindow):
         depth_layout = QVBoxLayout()
         self.calibrate_depth_button = QPushButton("Calibrate Depth")
         self.calibrate_depth_button.clicked.connect(self.calibrate_depth)
+
+        self.smoothing_slider = QSlider(Qt.Horizontal)
+        self.smoothing_slider.setRange(0, 100)
+        self.smoothing_slider.setValue(50)
+        self.smoothing_slider.valueChanged.connect(self.update_smoothing)
+        depth_layout.addWidget(QLabel("Smoothing:"))
+        depth_layout.addWidget(self.smoothing_slider)
+
         self.depth_sensitivity_slider = QSlider(Qt.Horizontal)
         self.depth_sensitivity_slider.setRange(0, 200)
         self.depth_sensitivity_slider.setValue(100)
@@ -260,6 +411,17 @@ class ProjectionMappingApp(QMainWindow):
 
         self.control_layout.addStretch()
 
+    def open_midi_mapping(self):
+        self.mapping_dialog = MIDIMappingDialog(self)
+        self.mapping_dialog.show()
+
+    def toggle_auto_ir(self, checked):
+        self.worker.set_auto_threshold(checked)
+        self.ir_threshold_slider.setEnabled(not checked)
+
+    def update_smoothing(self, value):
+        self.worker.set_smoothing(value / 100.0)
+
     def save_project(self):
         filename, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "Project Files (*.json)")
         if filename:
@@ -267,8 +429,11 @@ class ProjectionMappingApp(QMainWindow):
                 'masks': [mask.to_dict() for mask in self.masks],
                 'warp_points': self.projector_window.warp_points,
                 'ir_threshold': self.ir_threshold_slider.value(),
+                'auto_ir': self.auto_ir_check.isChecked(),
                 'depth_sensitivity': self.depth_sensitivity_slider.value(),
+                'smoothing': self.smoothing_slider.value(),
                 'midi_port': self.midi_combo.currentText(),
+                'midi_mappings': self.midi_mappings,
                 'marker_config': self.worker.marker_config,
                 'baseline_distance': self.worker.baseline_distance
             }
@@ -293,8 +458,10 @@ class ProjectionMappingApp(QMainWindow):
                     self.projector_window.warp_points = warp_points
                     self.worker.set_warp_points(warp_points)
 
+                self.auto_ir_check.setChecked(data.get('auto_ir', False))
                 self.ir_threshold_slider.setValue(data.get('ir_threshold', 200))
                 self.depth_sensitivity_slider.setValue(data.get('depth_sensitivity', 100))
+                self.smoothing_slider.setValue(data.get('smoothing', 50))
 
                 midi_port = data.get('midi_port')
                 if midi_port and midi_port != "None":
@@ -302,9 +469,10 @@ class ProjectionMappingApp(QMainWindow):
                     if index >= 0:
                         self.midi_combo.setCurrentIndex(index)
 
+                self.midi_mappings = data.get('midi_mappings', self.midi_mappings)
+
                 marker_config = data.get('marker_config')
                 if marker_config:
-                    # Convert list of lists back to list of tuples
                     config_pts = [tuple(p) for p in marker_config]
                     self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
 
@@ -332,43 +500,62 @@ class ProjectionMappingApp(QMainWindow):
             self.midi_handler.note_on.connect(self.handle_midi_note)
             self.midi_handler.control_change.connect(self.handle_midi_cc)
             self.midi_handler.beat.connect(self.handle_bpm)
+            self.midi_handler.learned_message.connect(self.handle_learned_message)
             self.midi_thread.started.connect(self.midi_handler.start_listening)
             self.midi_thread.start()
 
     def handle_midi_note(self, note, velocity):
-        # MIDI Mapping
-        # Note 60-67: Switch video for 'amp' mask to corresponding cue
-        if 60 <= note <= 67:
-            cue_index = note - 60
-            if cue_index < len(self.masks):
-                video_path = self.masks[cue_index].video_path
-                self.worker.switch_video('amp', video_path)
-        # Note 72-79: Switch video for 'background' mask
-        elif 72 <= note <= 79:
-            cue_index = note - 72
-            if cue_index < len(self.masks):
-                video_path = self.masks[cue_index].video_path
-                self.worker.switch_video('background', video_path)
-        # Note 48: Toggle Amp visibility
-        elif note == 48:
-            self.worker.toggle_mask('amp', velocity > 0)
-        # Note 50: Toggle Background visibility
-        elif note == 50:
-            self.worker.toggle_mask('background', velocity > 0)
+        # Use Dynamic Mappings
+        for key, mapping in self.midi_mappings.items():
+            if mapping[0] == 'note' and mapping[1] == note:
+                self.execute_midi_action(key, velocity)
 
     def handle_midi_cc(self, cc, value):
-        # CC Mapping for FX
-        if cc == 20: self.worker.set_fx('amp', 'strobe', value > 64)
-        elif cc == 21: self.worker.set_fx('amp', 'blur', value > 64)
-        elif cc == 22: self.worker.set_fx('amp', 'invert', value > 64)
-        elif cc == 23: self.worker.set_fx('amp', 'edges', value > 64)
-        elif cc == 24: self.worker.set_fx('amp', 'tint', value > 64)
+        for key, mapping in self.midi_mappings.items():
+            if mapping[0] == 'cc' and mapping[1] == cc:
+                self.execute_midi_action(key, value)
 
-        elif cc == 30: self.worker.set_fx('background', 'strobe', value > 64)
-        elif cc == 31: self.worker.set_fx('background', 'blur', value > 64)
-        elif cc == 32: self.worker.set_fx('background', 'invert', value > 64)
-        elif cc == 33: self.worker.set_fx('background', 'edges', value > 64)
-        elif cc == 34: self.worker.set_fx('background', 'tint', value > 64)
+    def execute_midi_action(self, key, value):
+        if key.startswith('cue_amp_'):
+            idx = int(key.split('_')[-1])
+            if idx < len(self.masks):
+                self.worker.switch_video('amp', self.masks[idx].video_path)
+        elif key.startswith('cue_bg_'):
+            idx = int(key.split('_')[-1])
+            if idx < len(self.masks):
+                self.worker.switch_video('background', self.masks[idx].video_path)
+        elif key == 'toggle_amp':
+            self.worker.toggle_mask('amp', value > 0)
+        elif key == 'toggle_bg':
+            self.worker.toggle_mask('background', value > 0)
+        elif key.startswith('fx_'):
+            parts = key.split('_')
+            tag = parts[1]
+            fx_name = "_".join(parts[2:])
+            self.worker.set_fx(tag, fx_name, value > 64)
+        elif key.startswith('design_'):
+            parts = key.split('_')
+            tag = parts[1]
+            design_name = parts[2]
+            if value > 64:
+                for mask in self.masks:
+                    if mask.tag == tag:
+                        mask.design_overlay = design_name
+        elif key.startswith('lfo_'):
+            parts = key.split('_')
+            tag = parts[1]
+            param = parts[2]
+            for mask in self.masks:
+                if mask.tag == tag:
+                    if param == 'toggle':
+                        mask.fx_params['lfo_enabled'] = (value > 64)
+                    elif param == 'speed':
+                        mask.fx_params['lfo_speed'] = (value / 64.0)
+                    elif param == 'cycle' and value > 64:
+                        targets = ["none", "blur", "tint", "rgb_shift"]
+                        curr = mask.fx_params.get('lfo_target', 'none')
+                        idx = (targets.index(curr) + 1) % len(targets)
+                        mask.fx_params['lfo_target'] = targets[idx]
 
     def handle_bpm(self, bpm):
         self.bpm_label.setText(f"BPM: {bpm:.1f}")
@@ -401,6 +588,9 @@ class ProjectionMappingApp(QMainWindow):
                 self.masks[row].source_points = [ (p.x(), p.y()) for p in mask_points]
                 self.masks[row].tag = self.mask_tag_combo.currentText()
                 self.masks[row].type = self.mask_type_combo.currentText()
+                self.masks[row].design_overlay = self.mask_design_combo.currentText()
+                self.masks[row].fx_params['lfo_target'] = self.lfo_target_combo.currentText()
+                self.masks[row].blend_mode = self.mask_blend_combo.currentText()
                 self.worker.set_masks(self.masks)
                 print(f"Mask created for {self.masks[row].name} with tag {self.masks[row].tag}")
 
@@ -455,6 +645,10 @@ class ProjectionMappingApp(QMainWindow):
 
     def add_cue(self):
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
+        if not video_path:
+            # Allow creating a generative cue
+            video_path = "generative"
+
         if video_path:
             mask_name = f"Cue {len(self.masks) + 1}: {video_path.split('/')[-1]}"
             new_mask = Mask(mask_name, [], video_path)

@@ -25,7 +25,6 @@ class VideoPlayer(QThread):
             with QMutexLocker(self.mutex):
                 self.latest_frame = frame
 
-            # Control playback speed roughly (30fps)
             time.sleep(1/30.0)
 
     def get_frame(self):
@@ -52,6 +51,7 @@ class Worker(QObject):
         self.masks = []
         self.video_players = {}
         self.ir_threshold = 200
+        self.auto_threshold = False
         self._camera_changed = True
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
@@ -62,9 +62,20 @@ class Worker(QObject):
         self.last_tracked_points = None
         self.roi_padding = 50
 
+        # Smoothing and Confidence
+        self.smoothed_points = None
+        self.smoothing_factor = 0.5
+        self.confidence = 0.0
+        self.confidence_gain = 0.2
+        self.confidence_decay = 0.1
+
         # Crossfade management
-        self.fades = {} # tag: {'prev_path': path, 'start_time': time}
+        self.fades = {}
         self.fade_duration = 1.0
+
+        # FX Buffers
+        self.trail_buffers = {} # mask_id -> last_frame
+        self.noise_offset = 0
 
     def set_marker_points(self, points):
         self.marker_config = [ (p.x(), p.y()) for p in points]
@@ -77,11 +88,19 @@ class Worker(QObject):
         else:
             self.marker_fingerprint = []
         self.last_tracked_points = None
+        self.smoothed_points = None
 
     def clear_marker_config(self):
         self.marker_config = None
         self.marker_fingerprint = []
         self.last_tracked_points = None
+        self.smoothed_points = None
+
+    def set_auto_threshold(self, enabled):
+        self.auto_threshold = enabled
+
+    def set_smoothing(self, value):
+        self.smoothing_factor = value
 
     def capture_still_frame(self):
         self._capture_still_frame_flag = True
@@ -126,25 +145,136 @@ class Worker(QObject):
                     mask.active_fx.remove(fx_name)
 
     def apply_fx(self, frame, mask):
-        if not mask.active_fx:
+        mask_id = id(mask)
+        lfo_val = 1.0
+        if mask.fx_params.get('lfo_enabled'):
+            speed = mask.fx_params.get('lfo_speed', 1.0)
+            lfo_val = (np.sin(2 * np.pi * time.time() * (self.bpm / 60.0) * speed) + 1) / 2
+
+        if not mask.active_fx and mask.design_overlay == 'none':
             return frame
+
         processed = frame.copy()
+        h, w = processed.shape[:2]
+
+        if 'mirror_h' in mask.active_fx:
+            left = processed[:, :w//2]
+            processed[:, w//2:] = cv2.flip(left, 1)
+        if 'mirror_v' in mask.active_fx:
+            top = processed[:h//2, :]
+            processed[h//2:, :] = cv2.flip(top, 0)
+        if 'kaleidoscope' in mask.active_fx:
+            # 4-way symmetry
+            quad = processed[:h//2, :w//2]
+            processed[:h//2, w//2:] = cv2.flip(quad, 1)
+            processed[h//2:, :w//2] = cv2.flip(quad, 0)
+            processed[h//2:, w//2:] = cv2.flip(quad, -1)
+
         if 'strobe' in mask.active_fx:
             period = 60.0 / self.bpm
             if (time.time() % period) < (period / 2.0):
                 processed = np.zeros_like(processed)
+
+        if 'rgb_shift' in mask.active_fx:
+            shift = int(10 * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
+            b, g, r = cv2.split(processed)
+            b = np.roll(b, shift, axis=1)
+            r = np.roll(r, -shift, axis=1)
+            processed = cv2.merge([b, g, r])
+
+        if 'glitch' in mask.active_fx:
+            for _ in range(3):
+                y = np.random.randint(0, h-10)
+                sh = np.random.randint(-20, 20)
+                processed[y:y+10, :] = np.roll(processed[y:y+10, :], sh, axis=1)
+
+        if 'trails' in mask.active_fx:
+            if mask_id in self.trail_buffers:
+                processed = cv2.addWeighted(processed, 0.4, self.trail_buffers[mask_id], 0.6, 0)
+            self.trail_buffers[mask_id] = processed.copy()
+
+        if 'feedback' in mask.active_fx:
+            if mask_id in self.trail_buffers:
+                # Zoom in slightly and rotate last frame
+                prev = self.trail_buffers[mask_id]
+                M = cv2.getRotationMatrix2D((w//2, h//2), 1, 1.02)
+                prev = cv2.warpAffine(prev, M, (w, h))
+                processed = cv2.addWeighted(processed, 0.7, prev, 0.3, 0)
+            self.trail_buffers[mask_id] = processed.copy()
+
+        if 'hue_cycle' in mask.active_fx:
+            hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV).astype(np.float32)
+            shift = (time.time() * (self.bpm / 60.0) * 30) % 180
+            if mask.fx_params.get('lfo_target') == 'hue':
+                shift *= lfo_val
+            hsv[:,:,0] = (hsv[:,:,0] + shift) % 180
+            processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
         if 'blur' in mask.active_fx:
-            processed = cv2.GaussianBlur(processed, (15, 15), 0)
+            ksize = int(15 * (lfo_val if mask.fx_params.get('lfo_target') == 'blur' else 1.0))
+            if ksize % 2 == 0: ksize += 1
+            if ksize > 0:
+                processed = cv2.GaussianBlur(processed, (max(1, ksize), max(1, ksize)), 0)
+
         if 'invert' in mask.active_fx:
             processed = cv2.bitwise_not(processed)
+
         if 'edges' in mask.active_fx:
             gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray, 100, 200)
             processed = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+
         if 'tint' in mask.active_fx:
+            alpha = 0.3 * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
             tint = np.full_like(processed, mask.tint_color)
-            processed = cv2.addWeighted(processed, 0.7, tint, 0.3, 0)
+            processed = cv2.addWeighted(processed, 1.0 - alpha, tint, alpha, 0)
+
         return processed
+
+    def get_design_mask(self, design_name, h, w):
+        mask = np.zeros((h, w), dtype=np.uint8)
+        center = (w // 2, h // 2)
+        if design_name == 'spiral':
+            for i in range(0, 360 * 5, 2):
+                r = i // 10
+                x = int(center[0] + r * np.cos(np.radians(i)))
+                y = int(center[1] + r * np.sin(np.radians(i)))
+                cv2.circle(mask, (x, y), 10 + i // 100, 255, -1)
+        elif design_name == 'moon':
+            cv2.circle(mask, center, h // 3, 255, -1)
+            offset = h // 10
+            cv2.circle(mask, (center[0] + offset, center[1] - offset), h // 3, 0, -1)
+        elif design_name == 'mushroom':
+            # Cap
+            cv2.ellipse(mask, center, (w // 3, h // 4), 0, 180, 360, 255, -1)
+            # Stem
+            cv2.rectangle(mask, (center[0] - w // 10, center[1]), (center[0] + w // 10, center[1] + h // 3), 255, -1)
+            # Spots
+            cv2.circle(mask, (center[0], center[1] - h // 8), h // 20, 0, -1)
+            cv2.circle(mask, (center[0] - w // 6, center[1] - h // 12), h // 25, 0, -1)
+            cv2.circle(mask, (center[0] + w // 6, center[1] - h // 12), h // 25, 0, -1)
+        elif design_name == 'star':
+            pts = []
+            for i in range(10):
+                r = (h // 3) if i % 2 == 0 else (h // 6)
+                theta = np.radians(i * 36)
+                pts.append([center[0] + r * np.cos(theta), center[1] + r * np.sin(theta)])
+            cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 255)
+        elif design_name == 'hexagon':
+            pts = []
+            for i in range(6):
+                theta = np.radians(i * 60)
+                pts.append([center[0] + (h // 3) * np.cos(theta), center[1] + (h // 3) * np.sin(theta)])
+            cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 255)
+        elif design_name == 'heart':
+            for i in range(0, 360):
+                t = np.radians(i)
+                x = 16 * np.sin(t)**3
+                y = -(13 * np.cos(t) - 5 * np.cos(2*t) - 2 * np.cos(3*t) - np.cos(4*t))
+                cv2.circle(mask, (int(center[0] + x * (h//50)), int(center[1] + y * (h//50))), h // 40, 255, -1)
+        else:
+            mask.fill(255)
+        return mask
 
     def get_tracked_points(self, frame):
         h, w = frame.shape[:2]
@@ -160,7 +290,12 @@ class Worker(QObject):
 
         roi_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, self.ir_threshold, 255, cv2.THRESH_BINARY)
+
+        if self.auto_threshold:
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            _, thresh = cv2.threshold(gray, self.ir_threshold, 255, cv2.THRESH_BINARY)
+
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detected_points = []
@@ -200,12 +335,26 @@ class Worker(QObject):
                                 closest = min(remaining_dst, key=lambda p: np.linalg.norm(np.array(p) - pred))
                                 ordered_points.append(closest)
                                 remaining_dst.remove(closest)
-                            self.last_tracked_points = ordered_points
-                            return ordered_points
+
+                            if self.smoothed_points is None:
+                                self.smoothed_points = np.array(ordered_points, dtype=np.float32)
+                            else:
+                                alpha = 1.0 - self.smoothing_factor
+                                self.smoothed_points = self.smoothed_points * (1.0 - alpha) + np.array(ordered_points, dtype=np.float32) * alpha
+
+                            self.confidence = min(1.0, self.confidence + self.confidence_gain)
+                            self.last_tracked_points = [tuple(p.astype(int)) for p in self.smoothed_points]
+                            return self.last_tracked_points
 
         if self.last_tracked_points is not None:
-            self.last_tracked_points = None
-            return self.get_tracked_points(frame)
+            if roi_x != 0 or roi_y != 0 or roi_w != w or roi_h != h:
+                self.last_tracked_points = None
+                return self.get_tracked_points(frame)
+
+        self.confidence = max(0.0, self.confidence - self.confidence_decay)
+        if self.confidence > 0.1 and self.last_tracked_points:
+            return self.last_tracked_points
+
         return detected_points
 
     def process_video(self):
@@ -244,16 +393,17 @@ class Worker(QObject):
             for mask in sorted_masks:
                 if not mask.visible or not mask.video_path: continue
 
-                # Ensure players are running
-                if mask.video_path not in self.video_players:
-                    player = VideoPlayer(mask.video_path)
-                    player.start()
-                    self.video_players[mask.video_path] = player
+                if mask.video_path == "generative":
+                    frame_cue = self.get_generative_frame(h, w)
+                else:
+                    if mask.video_path not in self.video_players:
+                        player = VideoPlayer(mask.video_path)
+                        player.start()
+                        self.video_players[mask.video_path] = player
 
-                player = self.video_players[mask.video_path]
-                frame_cue = player.get_frame()
+                    player = self.video_players[mask.video_path]
+                    frame_cue = player.get_frame()
 
-                # Handle Crossfade
                 if mask.tag in self.fades:
                     fade_info = self.fades[mask.tag]
                     elapsed = time.time() - fade_info['start_time']
@@ -269,6 +419,17 @@ class Worker(QObject):
 
                 if frame_cue is not None:
                     frame_cue = self.apply_fx(frame_cue, mask)
+
+                    if mask.design_overlay != 'none':
+                        design_m = self.get_design_mask(mask.design_overlay, frame_cue.shape[0], frame_cue.shape[1])
+                        design_m_3ch = cv2.merge([design_m, design_m, design_m])
+                        frame_cue = cv2.bitwise_and(frame_cue, design_m_3ch)
+
+                    effective_frame_cue = frame_cue
+                    if mask.type == 'dynamic':
+                        if self.confidence < 1.0:
+                            effective_frame_cue = (frame_cue * self.confidence).astype(np.uint8)
+
                     if mask.type == 'dynamic' and mask.linked_marker_count == len(tracked_points):
                         src_pts = np.float32(mask.source_points)
                         dst_pts_raw = np.float32(tracked_points)
@@ -280,14 +441,13 @@ class Worker(QObject):
                         else:
                             dst_pts = dst_pts_raw
                         matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-                        warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
+                        warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
                         mask_img = np.zeros_like(projector_output)
                         cv2.fillConvexPoly(mask_img, np.int32(dst_pts), (255, 255, 255))
-                        projector_output = cv2.bitwise_and(projector_output, cv2.bitwise_not(mask_img))
-                        projector_output = cv2.add(projector_output, cv2.bitwise_and(warped_cue, mask_img))
+                        projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
                     elif mask.type == 'static':
                         if not mask.source_points:
-                            projector_output = cv2.resize(frame_cue, (w, h))
+                            projector_output = self.blend_frames(projector_output, cv2.resize(frame_cue, (w, h)), np.full((h, w), 255, dtype=np.uint8), mask.blend_mode)
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
                             dst_pts = np.float32(mask.source_points)
@@ -295,8 +455,7 @@ class Worker(QObject):
                             warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
                             mask_img = np.zeros_like(projector_output)
                             cv2.fillConvexPoly(mask_img, np.int32(dst_pts), (255, 255, 255))
-                            projector_output = cv2.bitwise_and(projector_output, cv2.bitwise_not(mask_img))
-                            projector_output = cv2.add(projector_output, cv2.bitwise_and(warped_cue, mask_img))
+                            projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
 
             if self._capture_still_frame_flag:
                 rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
@@ -317,14 +476,45 @@ class Worker(QObject):
         main_cap.release()
         for player in self.video_players.values(): player.stop()
 
+    def get_generative_frame(self, h, w):
+        self.noise_offset += 0.05
+        # Create a moving cloud pattern
+        x = np.linspace(0, 5, w)
+        y = np.linspace(0, 5, h)
+        X, Y = np.meshgrid(x, y)
+        pattern = np.sin(X + self.noise_offset) * np.cos(Y + self.noise_offset * 0.5)
+        pattern = ((pattern + 1) * 127).astype(np.uint8)
+        # Add some color
+        colored = cv2.applyColorMap(pattern, cv2.COLORMAP_MAGMA)
+        return colored
+
+    def blend_frames(self, base, overlay, mask_img, mode):
+        if mode == 'normal':
+            inv_mask = cv2.bitwise_not(mask_img)
+            return cv2.add(cv2.bitwise_and(base, inv_mask), cv2.bitwise_and(overlay, mask_img))
+
+        # Blending modes
+        mask_f = mask_img.astype(float) / 255.0
+        base_f = base.astype(float)
+        over_f = overlay.astype(float)
+
+        if mode == 'add':
+            res = base_f + over_f * mask_f
+        elif mode == 'screen':
+            res = 255 - ((255 - base_f) * (255 - over_f * mask_f) / 255.0)
+        elif mode == 'multiply':
+            res = (base_f * (over_f * mask_f + (1-mask_f)*255)) / 255.0
+        else:
+            return base # Fallback
+
+        return np.clip(res, 0, 255).astype(np.uint8)
+
     def stop(self): self._running = False
     def set_warp_points(self, points): self.warp_points = points
     def set_masks(self, masks):
         self.masks = masks
-        # Modified to NOT stop players that are still needed for fades
         current_cues = {mask.video_path for mask in self.masks if mask.video_path}
         fade_cues = {f['prev_path'] for f in self.fades.values()}
-
         needed_cues = current_cues.union(fade_cues)
         for path in list(self.video_players.keys()):
             if path not in needed_cues:

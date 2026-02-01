@@ -7,6 +7,7 @@ class MIDIHandler(QObject):
     note_on = pyqtSignal(int, int) # note, velocity
     control_change = pyqtSignal(int, int) # cc, value
     beat = pyqtSignal(float) # bpm
+    learned_message = pyqtSignal(str, int) # type ('note' or 'cc'), number
 
     def __init__(self, port_name=None):
         super().__init__()
@@ -16,6 +17,7 @@ class MIDIHandler(QObject):
         self.last_clock_time = 0
         self.bpm = 120.0
         self.clock_times = []
+        self.learning_mode = False
 
     def set_port(self, port_name):
         self.port_name = port_name
@@ -32,6 +34,12 @@ class MIDIHandler(QObject):
             print(f"MIDI Error: {e}")
 
     def midi_callback(self, msg):
+        if self.learning_mode:
+            if msg.type == 'note_on':
+                self.learned_message.emit('note', msg.note)
+            elif msg.type == 'control_change':
+                self.learned_message.emit('cc', msg.control)
+
         if msg.type == 'note_on':
             if msg.velocity > 0:
                 self.note_on.emit(msg.note, msg.velocity)

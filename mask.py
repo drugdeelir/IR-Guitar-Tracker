@@ -8,8 +8,16 @@ class Mask:
         self.linked_marker_count = 0
         self.tag = tag # e.g., 'amp', 'background'
         self.visible = True
-        self.active_fx = [] # List of enabled FX names: 'strobe', 'blur', 'invert', 'edges', 'tint'
+        self.active_fx = [] # 'strobe', 'blur', 'invert', 'edges', 'tint', 'kaleidoscope', 'mirror_h', 'mirror_v', 'rgb_shift', 'glitch', 'trails', 'hue_cycle', 'feedback'
         self.tint_color = (255, 255, 255) # BGR
+        self.design_overlay = 'none' # 'none', 'spiral', 'moon', 'mushroom', 'star', 'hexagon', 'heart'
+        self.blend_mode = 'normal' # 'normal', 'add', 'screen', 'multiply'
+        self.fx_params = {
+            'kaleidoscope_segments': 6,
+            'lfo_enabled': False,
+            'lfo_target': 'none', # 'blur', 'tint', 'rgb_shift', 'hue'
+            'lfo_speed': 1.0 # multiplier of BPM
+        }
 
     def to_dict(self):
         return {
@@ -21,7 +29,10 @@ class Mask:
             'tag': self.tag,
             'visible': self.visible,
             'active_fx': self.active_fx,
-            'tint_color': list(self.tint_color)
+            'tint_color': list(self.tint_color),
+            'design_overlay': self.design_overlay,
+            'blend_mode': self.blend_mode,
+            'fx_params': self.fx_params
         }
 
     @classmethod
@@ -31,4 +42,7 @@ class Mask:
         mask.visible = d.get('visible', True)
         mask.active_fx = d.get('active_fx', [])
         mask.tint_color = tuple(d.get('tint_color', [255, 255, 255]))
+        mask.design_overlay = d.get('design_overlay', 'none')
+        mask.blend_mode = d.get('blend_mode', 'normal')
+        mask.fx_params = d.get('fx_params', {'kaleidoscope_segments': 6})
         return mask
