@@ -96,6 +96,8 @@ class MIDIMappingDialog(QDialog):
             self.actions.append((f'Switch Amp to Cue {i+1}', f'cue_amp_{i}'))
             self.actions.append((f'Switch BG to Cue {i+1}', f'cue_bg_{i}'))
 
+        self.actions.append(('Toggle Projector Splash', 'toggle_projector_splash'))
+
         for label, key in self.actions:
             btn = QPushButton(self.get_mapping_text(key))
             btn.clicked.connect(lambda checked, k=key: self.start_learning(k))
@@ -399,7 +401,11 @@ class ProjectionMappingApp(QMainWindow):
         mask_layout.addWidget(QLabel("Mask Feathering:"))
         mask_layout.addWidget(self.mask_feather_slider)
 
-        self.finish_mask_button = QPushButton("Finish Mask")
+        self.video_bpm_input = QLineEdit("120.0")
+        mask_layout.addWidget(QLabel("Video Native BPM:"))
+        mask_layout.addWidget(self.video_bpm_input)
+
+        self.finish_mask_button = QPushButton("Update / Finish Mask")
         self.finish_mask_button.clicked.connect(self.finish_mask_creation)
         self.finish_mask_button.setEnabled(False)
         self.cancel_mask_button = QPushButton("Cancel")
@@ -479,6 +485,11 @@ class ProjectionMappingApp(QMainWindow):
         self.safety_check.setChecked(True)
         self.safety_check.toggled.connect(lambda c: setattr(self.worker, 'safety_mode_enabled', c))
         perf_layout.addWidget(self.safety_check)
+
+        self.splash_check = QPushButton("Show Splash on Projector")
+        self.splash_check.setCheckable(True)
+        self.splash_check.toggled.connect(self.toggle_splash_mode)
+        perf_layout.addWidget(self.splash_check)
 
         perf_group.setLayout(perf_layout)
         self.control_layout.addWidget(perf_group)
@@ -814,6 +825,9 @@ class ProjectionMappingApp(QMainWindow):
         elif key == 'safety_toggle':
             if value > 64:
                 self.safety_check.setChecked(not self.safety_check.isChecked())
+        elif key == 'toggle_projector_splash':
+            if value > 64:
+                self.splash_check.setChecked(not self.splash_check.isChecked())
         elif key.startswith('snap_save_'):
             idx = int(key.split('_')[-1])
             if value > 64: self.save_snapshot(idx)
@@ -844,6 +858,15 @@ class ProjectionMappingApp(QMainWindow):
         # Also set master tint
         self.worker.master_tint_color = primary
         self.statusBar().showMessage(f"Applied {mood_name} mood.", 3000)
+
+    def toggle_splash_mode(self, checked):
+        self.worker.show_splash = checked
+        if checked:
+            self.splash_check.setText("Stop Splash / START SHOW")
+            self.splash_check.setStyleSheet("background-color: green; color: white; font-weight: bold;")
+        else:
+            self.splash_check.setText("Show Splash on Projector")
+            self.splash_check.setStyleSheet("")
 
     def calibrate_depth(self):
         self.worker.calibrate_depth()
@@ -878,6 +901,10 @@ class ProjectionMappingApp(QMainWindow):
                 self.masks[row].blend_mode = self.mask_blend_combo.currentText()
                 self.masks[row].bezier_enabled = self.bezier_check.isChecked()
                 self.masks[row].feather = self.mask_feather_slider.value()
+                try:
+                    self.masks[row].video_bpm = float(self.video_bpm_input.text())
+                except ValueError:
+                    self.masks[row].video_bpm = 120.0
                 self.worker.set_masks(self.masks)
                 print(f"Mask created for {self.masks[row].name} with tag {self.masks[row].tag}")
 

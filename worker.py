@@ -15,18 +15,39 @@ class VideoPlayer(QThread):
         self.latest_frame = None
         self.mutex = QMutex()
         self.cap = cv2.VideoCapture(video_path)
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.fps <= 0 or self.fps > 240: self.fps = 30.0
+        self.playback_speed = 1.0
 
     def run(self):
         while self._running:
+            if not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(self.video_path)
+                if not self.cap.isOpened():
+                    time.sleep(1.0)
+                    continue
+
             ret, frame = self.cap.read()
             if not ret:
+                # Robust looping: try to seek back to start
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
+                ret, frame = self.cap.read()
+
+                if not ret:
+                    # If seek failed, try re-opening the capture
+                    self.cap.release()
+                    self.cap = cv2.VideoCapture(self.video_path)
+                    ret, frame = self.cap.read()
+
+                if not ret:
+                    # Still no frame? Sleep and try again in next iteration
+                    time.sleep(1.0)
+                    continue
 
             with QMutexLocker(self.mutex):
                 self.latest_frame = frame
 
-            time.sleep(1/30.0)
+            time.sleep(max(0.001, 1.0 / (self.fps * self.playback_speed)))
 
     def get_frame(self):
         with QMutexLocker(self.mutex):
@@ -112,6 +133,10 @@ class Worker(QObject):
         self.safety_mode_enabled = True
         self.fallback_generator = 'radial'
 
+        # Splash Mode
+        self.show_splash = False
+        self.splash_player = None
+
         # Master FX
         self.master_active_fx = []
         self.master_tint_color = (255, 255, 255)
@@ -169,6 +194,16 @@ class Worker(QObject):
 
     def set_bpm(self, bpm):
         self.bpm = bpm
+        self.update_video_speeds()
+
+    def update_video_speeds(self):
+        for mask in self.masks:
+            if mask.video_path in self.video_players:
+                if mask.video_bpm > 0:
+                    speed = self.bpm / mask.video_bpm
+                    self.video_players[mask.video_path].playback_speed = speed
+                else:
+                    self.video_players[mask.video_path].playback_speed = 1.0
 
     def trigger_beat(self):
         self.beat_counter += 1
@@ -566,6 +601,22 @@ class Worker(QObject):
             h, w = main_frame.shape[:2]
             projector_output = np.zeros((h, w, 3), dtype=np.uint8)
 
+            if self.show_splash:
+                if self.splash_player is None:
+                    from utils import resource_path
+                    self.splash_player = VideoPlayer(resource_path('logo.mkv'))
+                    self.splash_player.start()
+
+                splash_frame = self.splash_player.get_frame()
+                if splash_frame is not None:
+                    projector_output = cv2.resize(splash_frame, (w, h))
+                else:
+                    cv2.putText(projector_output, "PRE-SHOW", (w//2-100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 3)
+            else:
+                if self.splash_player is not None:
+                    self.splash_player.stop()
+                    self.splash_player = None
+
             tracked_points = self.get_tracked_points(main_frame)
             self.trackers_detected.emit(len(tracked_points))
 
@@ -877,4 +928,5 @@ class Worker(QObject):
 
     def set_masks(self, masks):
         self.masks = masks
+        self.update_video_speeds()
         self.cleanup_resources()
