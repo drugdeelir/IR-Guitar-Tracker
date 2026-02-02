@@ -156,10 +156,9 @@ class ProjectionMappingApp(QMainWindow):
 
         self.start_osc_server()
 
-        self.layout.addWidget(self.video_display)
-        self.layout.addWidget(self.scroll_area)
+        self.layout.addWidget(self.video_display, stretch=3)
+        self.layout.addWidget(self.scroll_area, stretch=1)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
-        self.projector_window.show()
 
         self.worker = Worker()
         self.thread = QThread()
@@ -962,7 +961,12 @@ class ProjectionMappingApp(QMainWindow):
     def change_projector(self, index):
         if index < len(self.screens):
             screen = self.screens[index]
-            self.projector_window.setScreen(screen)
+            self.projector_window.hide()
+            self.projector_window.show() # Ensure window handle is created
+            handle = self.projector_window.windowHandle()
+            if handle:
+                handle.setScreen(screen)
+            self.projector_window.setGeometry(screen.geometry())
             self.projector_window.showFullScreen()
 
     def remove_cue(self):

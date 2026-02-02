@@ -125,7 +125,6 @@ class ProjectorWindow(QWidget):
                 self.warp_points.append(QPointF(x, y))
 
         self.dragging_point_index = -1
-        self.show()
 
     def set_image(self, image):
         self.label.setPixmap(QPixmap.fromImage(image))

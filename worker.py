@@ -541,12 +541,27 @@ class Worker(QObject):
                 self._camera_changed = False
 
             if main_cap is None:
-                QThread.msleep(100); continue
+                # Provide a placeholder frame when no camera is detected
+                main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(main_frame, "NO CAMERA DETECTED", (150, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                self.frame_ready.emit(QImage(rgb_main.data, 640, 480, 640 * 3, QImage.Format_RGB888).copy())
+                QThread.msleep(1000)
+                continue
 
             ret, main_frame = main_cap.read()
             if not ret:
+                # Provide a blank frame with an error message on camera failure
+                main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(main_frame, "CAMERA READ ERROR", (150, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
                 self.camera_error.emit(self.video_source)
-                QThread.msleep(500); continue
+
+                rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                self.frame_ready.emit(QImage(rgb_main.data, 640, 480, 640 * 3, QImage.Format_RGB888).copy())
+                QThread.msleep(1000)
+                continue
 
             h, w = main_frame.shape[:2]
             projector_output = np.zeros((h, w, 3), dtype=np.uint8)
@@ -702,7 +717,7 @@ class Worker(QObject):
                     cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-            self.frame_ready.emit(QImage(rgb_main.data, w, h, w * 3, QImage.Format_RGB888))
+            self.frame_ready.emit(QImage(rgb_main.data, w, h, w * 3, QImage.Format_RGB888).copy())
 
             # 9-point grid warping (2x2 perspective blocks)
             warped_output = np.zeros_like(projector_output)
@@ -748,7 +763,7 @@ class Worker(QObject):
                 projector_output = self.apply_fx(projector_output, master_proxy)
 
             rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
-            self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888))
+            self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888).copy())
             QThread.msleep(30)
 
         main_cap.release()
