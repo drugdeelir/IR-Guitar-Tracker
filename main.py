@@ -2,6 +2,7 @@
 import sys
 import time
 import cv2
+import copy
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog, QLineEdit, QSlider, QListWidget, QStatusBar
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
@@ -9,6 +10,8 @@ from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
+from midi_handler import MidiHandler
+from osc_handler import OscHandler
 
 def get_available_cameras():
     """Returns a list of available camera indices."""
@@ -30,6 +33,8 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
         self.selected_markers = []
+        self.snapshots = [None] * 8
+        self.save_mode = False
 
         self.setStatusBar(QStatusBar(self))
 
@@ -57,6 +62,13 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.camera_error.connect(self.show_camera_error)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
+
+        # MIDI and OSC Handlers
+        self.midi_handler = MidiHandler()
+        self.midi_handler.preset_requested.connect(self.handle_preset_click)
+
+        self.osc_handler = OscHandler()
+        self.osc_handler.preset_requested.connect(self.handle_preset_click)
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
@@ -92,8 +104,8 @@ class ProjectionMappingApp(QMainWindow):
             self.marker_selection_dialog.take_picture_button.setEnabled(True)
             self.worker.capture_still_frame()
 
-    def set_marker_selection_image(self, image):
-        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image))
+    def set_marker_selection_image(self, image, points):
+        self.marker_selection_dialog.set_still_data(QPixmap.fromImage(image), points)
 
     def clear_marker_selection(self):
         self.selected_markers = []
@@ -177,6 +189,29 @@ class ProjectionMappingApp(QMainWindow):
 
         ir_group.setLayout(ir_layout)
         self.control_layout.addWidget(ir_group)
+
+        # Presets / Snapshots
+        preset_group = QGroupBox("Presets (Live Snapshots)")
+        preset_v_layout = QVBoxLayout()
+        preset_layout = QHBoxLayout()
+        self.preset_buttons = []
+        for i in range(8):
+            btn = QPushButton(str(i+1))
+            btn.setFixedWidth(35)
+            btn.setCheckable(True)
+            # Use a default argument in lambda to capture the current value of i
+            btn.clicked.connect(lambda checked, idx=i: self.handle_preset_click(idx))
+            preset_layout.addWidget(btn)
+            self.preset_buttons.append(btn)
+
+        self.save_preset_btn = QPushButton("Save Next Click")
+        self.save_preset_btn.setCheckable(True)
+        self.save_preset_btn.toggled.connect(self.toggle_save_mode)
+
+        preset_v_layout.addLayout(preset_layout)
+        preset_v_layout.addWidget(self.save_preset_btn)
+        preset_group.setLayout(preset_v_layout)
+        self.control_layout.addWidget(preset_group)
 
         # Mask creation
         mask_group = QGroupBox("Mask Creation")
@@ -289,6 +324,44 @@ class ProjectionMappingApp(QMainWindow):
                 mask.linked_marker_count = len(self.selected_markers)
                 self.statusBar().showMessage(f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000)
 
+    def toggle_save_mode(self, enabled):
+        self.save_mode = enabled
+        if enabled:
+            self.save_preset_btn.setText("Click a slot to SAVE")
+        else:
+            self.save_preset_btn.setText("Save Next Click")
+
+    def handle_preset_click(self, idx):
+        if self.save_mode:
+            self.save_snapshot(idx)
+            self.save_preset_btn.setChecked(False)
+            # Uncheck the button immediately as we don't "stay" in save mode for that button
+            self.preset_buttons[idx].setChecked(False)
+        else:
+            self.load_snapshot(idx)
+            # Ensure only the clicked button is checked
+            for i, btn in enumerate(self.preset_buttons):
+                btn.setChecked(i == idx)
+
+    def save_snapshot(self, idx):
+        self.snapshots[idx] = copy.deepcopy(self.masks)
+        self.statusBar().showMessage(f"Snapshot {idx+1} saved.", 3000)
+
+    def load_snapshot(self, idx):
+        if self.snapshots[idx] is not None:
+            self.masks = copy.deepcopy(self.snapshots[idx])
+            self.worker.set_masks(self.masks)
+            self.update_cue_list()
+            self.statusBar().showMessage(f"Snapshot {idx+1} loaded.", 3000)
+        else:
+            self.statusBar().showMessage(f"Snapshot {idx+1} is empty.", 3000)
+            self.preset_buttons[idx].setChecked(False)
+
+    def update_cue_list(self):
+        self.cue_list_widget.clear()
+        for mask in self.masks:
+            self.cue_list_widget.addItem(mask.name)
+
     def update_ir_threshold(self, value):
         self.worker.set_ir_threshold(value)
 
@@ -339,6 +412,8 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()
+        self.midi_handler.close()
+        self.osc_handler.stop()
         event.accept()
 
 
