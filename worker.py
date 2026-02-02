@@ -40,7 +40,7 @@ class VideoPlayer(QThread):
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
     projector_frame_ready = pyqtSignal(QImage)
-    still_frame_ready = pyqtSignal(QImage)
+    still_frame_ready = pyqtSignal(QImage, list)
     trackers_detected = pyqtSignal(int)
     camera_error = pyqtSignal(int)
 
@@ -698,7 +698,7 @@ class Worker(QObject):
 
             if self._capture_still_frame_flag:
                 rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                self.still_frame_ready.emit(QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888))
+                self.still_frame_ready.emit(QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy(), tracked_points)
                 self._capture_still_frame_flag = False
 
             self.frame_count += 1

@@ -220,8 +220,8 @@ class ProjectionMappingApp(QMainWindow):
             self.marker_selection_dialog.take_picture_button.setEnabled(True)
             self.worker.capture_still_frame()
 
-    def set_marker_selection_image(self, image):
-        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image))
+    def set_marker_selection_image(self, image, points):
+        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points)
 
     def clear_marker_selection(self):
         self.selected_markers = []
