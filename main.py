@@ -145,13 +145,19 @@ class ProjectionMappingApp(QMainWindow):
         self.layout = QHBoxLayout(self.central_widget)
 
         self.video_display = VideoDisplay()
+        self.video_display.setMinimumWidth(640)
         self.projector_window = ProjectorWindow()
 
+        from PyQt5.QtWidgets import QScrollArea
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
         self.create_control_panel()
-        
+        self.scroll_area.setWidget(self.control_panel)
+
         self.start_osc_server()
 
         self.layout.addWidget(self.video_display)
+        self.layout.addWidget(self.scroll_area)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
 
@@ -226,7 +232,6 @@ class ProjectionMappingApp(QMainWindow):
     def create_control_panel(self):
         self.control_panel = QWidget()
         self.control_layout = QVBoxLayout(self.control_panel)
-        self.layout.addWidget(self.control_panel)
 
         # Project management
         project_group = QGroupBox("Project")
