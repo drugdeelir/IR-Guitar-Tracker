@@ -63,10 +63,6 @@ class VideoDisplay(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.label = QLabel()
-        layout = QVBoxLayout()
-        layout.addWidget(self.label)
-        self.setLayout(layout)
         self.mask_creation_mode = False
         self.mask_points = []
         self.current_pixmap = None
@@ -76,9 +72,18 @@ class VideoDisplay(QWidget):
         self.update() # Trigger paintEvent
 
     def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+
         if self.current_pixmap:
-            painter = QPainter(self)
-            painter.drawPixmap(self.rect(), self.current_pixmap)
+            # Scale to fit while maintaining aspect ratio
+            scaled_pixmap = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            # Center the pixmap
+            x = (self.width() - scaled_pixmap.width()) // 2
+            y = (self.height() - scaled_pixmap.height()) // 2
+            self.draw_rect = scaled_pixmap.rect().translated(x, y)
+            painter.drawPixmap(x, y, scaled_pixmap)
 
             if self.mask_creation_mode and self.mask_points:
                 painter.setPen(QPen(Qt.green, 2))
@@ -87,6 +92,8 @@ class VideoDisplay(QWidget):
     
     def mousePressEvent(self, event):
         if self.mask_creation_mode:
+            # Map point to pixmap coordinates if needed, but for now we map to widget
+            # Actually, mask points should probably be relative to the pixmap or normalized
             point = event.pos()
             self.mask_points.append(point)
             self.mask_point_added.emit(point)
@@ -111,11 +118,8 @@ class ProjectorWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projector Output")
-        self.layout = QVBoxLayout()
-        self.label = QLabel()
-        self.layout.addWidget(self.label)
-        self.setLayout(self.layout)
         self.setStyleSheet("background-color: black;")
+        self.current_pixmap = None
 
         self.calibration_mode = False
         # 3x3 Grid
@@ -127,7 +131,8 @@ class ProjectorWindow(QWidget):
         self.dragging_point_index = -1
 
     def set_image(self, image):
-        self.label.setPixmap(QPixmap.fromImage(image))
+        self.current_pixmap = QPixmap.fromImage(image)
+        self.update()
 
     def set_calibration_mode(self, enabled):
         self.calibration_mode = enabled
@@ -142,9 +147,13 @@ class ProjectorWindow(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+
+        if self.current_pixmap:
+            painter.drawPixmap(self.rect(), self.current_pixmap)
+
         if self.calibration_mode:
-            painter = QPainter(self)
             pen = QPen(Qt.red, 10)
             painter.setPen(pen)
             
