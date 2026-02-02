@@ -7,3 +7,4 @@ python-rtmidi
 sounddevice
 python-osc
 scipy
+pyinstaller

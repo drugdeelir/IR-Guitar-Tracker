@@ -3,6 +3,7 @@ import cv2
 from PyQt5.QtWidgets import QSplashScreen, QLabel, QVBoxLayout
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
+from utils import resource_path
 
 class SplashScreen(QSplashScreen):
     def __init__(self):
@@ -14,10 +15,10 @@ class SplashScreen(QSplashScreen):
         layout.addWidget(self.video_label)
         self.setLayout(layout)
         
-        self.cap = cv2.VideoCapture('logo.mkv')
+        self.cap = cv2.VideoCapture(resource_path('logo.mkv'))
         if not self.cap.isOpened():
             print("Warning: Could not open logo.mkv. Attempting to use logo.png fallback.")
-            pixmap = QPixmap('logo.png')
+            pixmap = QPixmap(resource_path('logo.png'))
             if not pixmap.isNull():
                 self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             return

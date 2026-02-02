@@ -7,14 +7,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
                              QDialog, QFormLayout, QInputDialog)
-from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF
+from PyQt5.QtGui import QPixmap, QDesktopServices
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
 from midi_handler import MIDIHandler, get_midi_ports
 from osc_handler import OSCHandler
+from utils import resource_path
 
 def get_available_cameras():
     """Returns a list of available camera indices."""
@@ -234,8 +235,11 @@ class ProjectionMappingApp(QMainWindow):
         self.save_button.clicked.connect(self.save_project)
         self.load_button = QPushButton("Load Project")
         self.load_button.clicked.connect(self.load_project)
+        self.help_button = QPushButton("Help: MainStage Setup")
+        self.help_button.clicked.connect(self.open_help)
         project_layout.addWidget(self.save_button)
         project_layout.addWidget(self.load_button)
+        project_layout.addWidget(self.help_button)
         project_group.setLayout(project_layout)
         self.control_layout.addWidget(project_group)
 
@@ -634,6 +638,10 @@ class ProjectionMappingApp(QMainWindow):
                 json.dump(project_data, f, indent=4)
             self.statusBar().showMessage(f"Project saved to {filename}", 3000)
 
+    def open_help(self):
+        file_path = resource_path('HELP_MAINSTAGE.md')
+        QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+
     def load_project(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
         if filename:
@@ -1004,7 +1012,7 @@ if __name__ == '__main__':
     app.processEvents()
 
     try:
-        with open('style.qss', 'r') as f:
+        with open(resource_path('style.qss'), 'r') as f:
             style = f.read()
         app.setStyleSheet(style)
     except FileNotFoundError:
