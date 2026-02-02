@@ -8,7 +8,7 @@ from itertools import combinations
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
     projector_frame_ready = pyqtSignal(QImage)
-    still_frame_ready = pyqtSignal(QImage)
+    still_frame_ready = pyqtSignal(QImage, list)
     trackers_detected = pyqtSignal(int)
     camera_error = pyqtSignal(int)
 
@@ -240,7 +240,7 @@ class Worker(QObject):
             if self._capture_still_frame_flag:
                 rgb_image_still = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
                 qt_image_still = QImage(rgb_image_still.data, w, h, w * 3, QImage.Format_RGB888)
-                self.still_frame_ready.emit(qt_image_still)
+                self.still_frame_ready.emit(qt_image_still, all_detected_points)
                 self._capture_still_frame_flag = False
 
             # Main display processing (shows the raw camera feed with trackers)

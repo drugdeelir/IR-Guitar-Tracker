@@ -2,3 +2,6 @@ opencv-python
 numpy
 PyQt5
 py2app==0.28.8
+python-osc
+mido
+python-rtmidi

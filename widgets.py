@@ -11,6 +11,7 @@ class MarkerSelectionDialog(QDialog):
         self.setWindowTitle("Select IR Markers")
         self.setMinimumSize(800, 600)
         self.selected_points = []
+        self.candidate_points = []
         self.original_pixmap = None
 
         self.layout = QVBoxLayout(self)
@@ -26,37 +27,92 @@ class MarkerSelectionDialog(QDialog):
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.confirm_button)
 
-    def set_pixmap(self, pixmap):
+    def set_still_data(self, pixmap, points):
         self.original_pixmap = pixmap
-        self.image_label.setPixmap(self.original_pixmap)
+        self.candidate_points = [QPoint(p[0], p[1]) for p in points]
+        self.selected_points = []
+        self.update_display()
+
+    def update_display(self):
+        if self.original_pixmap:
+            # Scale pixmap to fit the label while keeping aspect ratio
+            scaled_pixmap = self.original_pixmap.scaled(
+                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+
+            # Create a painter to draw markers on the scaled pixmap
+            display_pixmap = scaled_pixmap.copy()
+            painter = QPainter(display_pixmap)
+
+            # Calculate scale factor and offsets
+            scale = scaled_pixmap.width() / self.original_pixmap.width()
+            offset_x = (self.image_label.width() - scaled_pixmap.width()) / 2
+            offset_y = (self.image_label.height() - scaled_pixmap.height()) / 2
+
+            # Draw selected points
+            painter.setPen(QPen(Qt.green, 8))
+            for pt in self.selected_points:
+                painter.drawPoint(pt * scale)
+
+            painter.end()
+            self.image_label.setPixmap(display_pixmap)
 
     def image_clicked(self, event):
-        point = event.pos()
-        self.selected_points.append(point)
-        self.marker_selected.emit(point)
-        self.update() # Trigger a repaint to draw the selected points
+        if not self.original_pixmap:
+            return
+
+        # Map click to original image coordinates
+        orig_w = self.original_pixmap.width()
+        orig_h = self.original_pixmap.height()
+        label_w = self.image_label.width()
+        label_h = self.image_label.height()
+
+        # Calculate the aspect-ratio-maintained scaled size
+        aspect_ratio = orig_w / orig_h
+        if label_w / label_h > aspect_ratio:
+            actual_w = int(label_h * aspect_ratio)
+            actual_h = label_h
+        else:
+            actual_w = label_w
+            actual_h = int(label_w / aspect_ratio)
+
+        offset_x = (label_w - actual_w) / 2
+        offset_y = (label_h - actual_h) / 2
+
+        click_x = (event.pos().x() - offset_x) * (orig_w / actual_w)
+        click_y = (event.pos().y() - offset_y) * (orig_h / actual_h)
+
+        clicked_pt = QPoint(int(click_x), int(click_y))
+
+        # Snap to nearest candidate point
+        snap_threshold = 30 # Pixels in original image space
+        best_pt = clicked_pt
+        min_dist = float('inf')
+
+        for cand in self.candidate_points:
+            dist = (cand - clicked_pt).manhattanLength()
+            if dist < min_dist and dist < snap_threshold:
+                min_dist = dist
+                best_pt = cand
+
+        self.selected_points.append(best_pt)
+        self.marker_selected.emit(best_pt)
+        self.update_display()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_display()
 
     def get_selected_points(self):
         return self.selected_points
 
     def clear_selection(self):
         self.selected_points = []
-        if self.original_pixmap:
-            self.image_label.setPixmap(self.original_pixmap)
-        self.update()
+        self.update_display()
 
     def paintEvent(self, event):
+        # We handle drawing in update_display via QLabel setPixmap
         super().paintEvent(event)
-        if self.original_pixmap:
-            # Create a new pixmap to draw on
-            pixmap = self.original_pixmap.copy()
-            painter = QPainter(pixmap)
-            pen = QPen(Qt.green, 10)
-            painter.setPen(pen)
-            for point in self.selected_points:
-                painter.drawPoint(point)
-            painter.end()
-            self.image_label.setPixmap(pixmap)
 
 class VideoDisplay(QWidget):
     mask_point_added = pyqtSignal(QPoint)
