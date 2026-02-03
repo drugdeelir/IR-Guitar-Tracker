@@ -17,6 +17,7 @@ class Mask:
         self.blend_mode = 'normal' # 'normal', 'add', 'screen', 'multiply'
         self.bezier_enabled = False
         self.feather = 0 # 0 to 100
+        self.z_order = 0
         self.video_bpm = 120.0
         self.fx_params = {
             'kaleidoscope_segments': 6,
@@ -42,6 +43,7 @@ class Mask:
             'blend_mode': self.blend_mode,
             'bezier_enabled': self.bezier_enabled,
             'feather': self.feather,
+            'z_order': self.z_order,
             'video_bpm': self.video_bpm,
             'fx_params': self.fx_params
         }
@@ -59,6 +61,7 @@ class Mask:
         mask.blend_mode = d.get('blend_mode', 'normal')
         mask.bezier_enabled = d.get('bezier_enabled', False)
         mask.feather = d.get('feather', 0)
+        mask.z_order = d.get('z_order', 0)
         mask.video_bpm = d.get('video_bpm', 120.0)
         mask.fx_params = d.get('fx_params', {'kaleidoscope_segments': 6})
         return mask

@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QTableWidgetItem, QHeaderView, QAbstractItemView)
 from PyQt5.QtGui import QPixmap, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
-from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
+from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
@@ -62,6 +62,12 @@ class MIDIMappingDialog(QDialog):
                 (f'{tag_label} Kaleidoscope', f'fx_{tag}_kaleidoscope'),
                 (f'{tag_label} Mirror H', f'fx_{tag}_mirror_h'),
                 (f'{tag_label} Mirror V', f'fx_{tag}_mirror_v'),
+                (f'{tag_label} Pixelate', f'fx_{tag}_pixelate'),
+                (f'{tag_label} Chroma Ab', f'fx_{tag}_chroma_aberration'),
+                (f'{tag_label} Ooze', f'fx_{tag}_ooze'),
+                (f'{tag_label} Matrix', f'fx_{tag}_matrix'),
+                (f'{tag_label} VHS', f'fx_{tag}_vhs'),
+                (f'{tag_label} Scanline', f'fx_{tag}_scanline'),
                 (f'{tag_label} Design: Spiral', f'design_{tag}_spiral'),
                 (f'{tag_label} Design: Moon', f'design_{tag}_moon'),
                 (f'{tag_label} Design: Mushroom', f'design_{tag}_mushroom'),
@@ -122,6 +128,60 @@ class MIDIMappingDialog(QDialog):
         for label, key in self.actions:
             self.learn_buttons[key].setText(self.get_mapping_text(key))
 
+class PlaylistEditorDialog(QDialog):
+    def __init__(self, mask, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit Playlist: {mask.name}")
+        self.setMinimumSize(500, 400)
+        self.mask = mask
+        self.layout = QVBoxLayout(self)
+
+        self.list_widget = QListWidget()
+        for path in mask.playlist:
+            self.list_widget.addItem(path.split('/')[-1])
+        self.layout.addWidget(self.list_widget)
+
+        btn_layout = QHBoxLayout()
+        self.up_btn = QPushButton("Move Up")
+        self.up_btn.clicked.connect(self.move_up)
+        self.down_btn = QPushButton("Move Down")
+        self.down_btn.clicked.connect(self.move_down)
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.clicked.connect(self.remove_item)
+        btn_layout.addWidget(self.up_btn)
+        btn_layout.addWidget(self.down_btn)
+        btn_layout.addWidget(self.remove_btn)
+        self.layout.addLayout(btn_layout)
+
+        self.confirm_btn = QPushButton("Save Playlist Order")
+        self.confirm_btn.clicked.connect(self.accept)
+        self.confirm_btn.setStyleSheet("background-color: #4a148c; color: white; height: 40px;")
+        self.layout.addWidget(self.confirm_btn)
+
+    def move_up(self):
+        curr = self.list_widget.currentRow()
+        if curr > 0:
+            item = self.list_widget.takeItem(curr)
+            self.list_widget.insertItem(curr - 1, item)
+            self.list_widget.setCurrentRow(curr - 1)
+            # Update actual playlist
+            self.mask.playlist.insert(curr - 1, self.mask.playlist.pop(curr))
+
+    def move_down(self):
+        curr = self.list_widget.currentRow()
+        if curr >= 0 and curr < self.list_widget.count() - 1:
+            item = self.list_widget.takeItem(curr)
+            self.list_widget.insertItem(curr + 1, item)
+            self.list_widget.setCurrentRow(curr + 1)
+            # Update actual playlist
+            self.mask.playlist.insert(curr + 1, self.mask.playlist.pop(curr))
+
+    def remove_item(self):
+        curr = self.list_widget.currentRow()
+        if curr >= 0:
+            self.list_widget.takeItem(curr)
+            self.mask.playlist.pop(curr)
+
 class ProjectionMappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -131,6 +191,14 @@ class ProjectionMappingApp(QMainWindow):
         self.media_library = []
         self.selected_markers = []
         self.snapshots = [None] * 8
+        self.moods = {
+            "Cyberpunk": ((255, 0, 255), (0, 255, 255)), # Magenta, Cyan
+            "Ocean": ((255, 100, 0), (200, 50, 0)),     # Blue, Deep Blue
+            "Inferno": ((0, 0, 255), (0, 100, 255)),    # Red, Orange
+            "Toxic": ((0, 255, 0), (0, 255, 150)),      # Green, Lime
+            "Noir": ((50, 50, 50), (150, 150, 150)),    # Gray, White
+            "None": ((255, 255, 255), (255, 255, 255))
+        }
         self.setup_step = 0 # 0: Camera, 1: Markers, 2: BG, 3: Amp, 4: Done
         self.current_project_path = None
 
@@ -176,6 +244,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.projector_frame_ready.connect(self.projector_window.set_image)
         self.projector_window.warp_points_changed.connect(self.worker.set_warp_points)
         self.worker.trackers_detected.connect(self.update_tracker_label)
+        self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
@@ -470,6 +539,10 @@ class ProjectionMappingApp(QMainWindow):
         self.auto_save_check.setChecked(True)
         proj_layout.addWidget(self.auto_save_check)
 
+        self.show_ref_btn = QPushButton("Show Setup Reference Frame")
+        self.show_ref_btn.clicked.connect(self.show_setup_reference)
+        proj_layout.addWidget(self.show_ref_btn)
+
         proj_group.setLayout(proj_layout)
         layout.addWidget(proj_group)
 
@@ -528,6 +601,15 @@ class ProjectionMappingApp(QMainWindow):
         self.link_mask_button.clicked.connect(self.link_mask_to_markers)
         mask_layout.addWidget(self.link_mask_button)
 
+        layer_layout = QHBoxLayout()
+        self.front_btn = QPushButton("Bring to Front")
+        self.front_btn.clicked.connect(self.mask_to_front)
+        self.back_btn = QPushButton("Send to Back")
+        self.back_btn.clicked.connect(self.mask_to_back)
+        layer_layout.addWidget(self.front_btn)
+        layer_layout.addWidget(self.back_btn)
+        mask_layout.addLayout(layer_layout)
+
         mask_group.setLayout(mask_layout)
         layout.addWidget(mask_group)
 
@@ -545,8 +627,56 @@ class ProjectionMappingApp(QMainWindow):
         fx_layout.addWidget(QLabel("Global Style:"))
         fx_layout.addWidget(self.style_combo)
 
+        self.mood_combo = QComboBox()
+        self.mood_combo.addItems(list(self.moods.keys()))
+        self.mood_combo.currentIndexChanged.connect(self.apply_mood)
+        fx_layout.addWidget(QLabel("Global Mood (Color Palette):"))
+        fx_layout.addWidget(self.mood_combo)
+
+        self.blackout_btn = QPushButton("BLACKOUT (PANIC)")
+        self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
+        self.blackout_btn.clicked.connect(self.toggle_blackout)
+        fx_layout.addWidget(self.blackout_btn)
+
         fx_group.setLayout(fx_layout)
         layout.addWidget(fx_group)
+
+        # Master Visuals
+        master_group = QGroupBox("Master Visuals")
+        master_layout = QFormLayout()
+
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_slider.setValue(0)
+        self.brightness_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_brightness', v))
+        master_layout.addRow("Brightness:", self.brightness_slider)
+
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(-100, 100)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_contrast', v))
+        master_layout.addRow("Contrast:", self.contrast_slider)
+
+        self.saturation_slider = QSlider(Qt.Horizontal)
+        self.saturation_slider.setRange(0, 200)
+        self.saturation_slider.setValue(100)
+        self.saturation_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_saturation', v))
+        master_layout.addRow("Saturation:", self.saturation_slider)
+
+        self.grain_slider = QSlider(Qt.Horizontal)
+        self.grain_slider.setRange(0, 100)
+        self.grain_slider.setValue(0)
+        self.grain_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_grain', v))
+        master_layout.addRow("Visual Grain:", self.grain_slider)
+
+        self.bloom_slider = QSlider(Qt.Horizontal)
+        self.bloom_slider.setRange(0, 100)
+        self.bloom_slider.setValue(0)
+        self.bloom_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_bloom', v))
+        master_layout.addRow("Bloom Intensity:", self.bloom_slider)
+
+        master_group.setLayout(master_layout)
+        layout.addWidget(master_group)
 
         layout.addStretch()
         self.tabs.addTab(tab, "Stage")
@@ -593,6 +723,11 @@ class ProjectionMappingApp(QMainWindow):
         assign_btn.setStyleSheet("height: 40px; font-weight: bold;")
         assign_btn.clicked.connect(self.assign_media_to_mask)
         cue_layout.addWidget(assign_btn)
+
+        self.edit_playlist_btn = QPushButton("Edit Playlist Order / Manage Cue")
+        self.edit_playlist_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #311b92;")
+        self.edit_playlist_btn.clicked.connect(self.open_playlist_editor)
+        cue_layout.addWidget(self.edit_playlist_btn)
 
         cue_group.setLayout(cue_layout)
         layout.addWidget(cue_group, 2)
@@ -708,12 +843,29 @@ class ProjectionMappingApp(QMainWindow):
         midi_group.setLayout(midi_layout)
         layout.addWidget(midi_group)
 
+        # Audio
+        audio_group = QGroupBox("Audio Input")
+        audio_layout = QVBoxLayout()
+        self.audio_combo = QComboBox()
+        from audio_handler import get_audio_devices
+        devices = get_audio_devices()
+        self.audio_devices = ["None"] + [d['name'] for d in devices if d['max_input_channels'] > 0]
+        self.audio_combo.addItems(self.audio_devices)
+        self.audio_combo.currentIndexChanged.connect(self.change_audio_device)
+        audio_layout.addWidget(self.audio_combo)
+        audio_group.setLayout(audio_layout)
+        layout.addWidget(audio_group)
+
         layout.addStretch()
         self.tabs.addTab(tab, "System")
 
     def create_diagnostics_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+
+        self.audio_monitor = AudioMonitor()
+        layout.addWidget(QLabel("Audio Reactive Monitor:"))
+        layout.addWidget(self.audio_monitor)
 
         self.diag_log = QListWidget()
         layout.addWidget(QLabel("MIDI / OSC Message Log:"))
@@ -765,6 +917,11 @@ class ProjectionMappingApp(QMainWindow):
         if hasattr(self, 'audio_handler'):
             self.audio_handler.stop()
 
+        # Update Audio devices list if needed
+        from audio_handler import get_audio_devices
+        devices = get_audio_devices()
+        self.audio_devices = ["None"] + [d['name'] for d in devices if d['max_input_channels'] > 0]
+
         if index > 0:
             from audio_handler import AudioHandler, get_audio_devices
             # Subtract 1 because "None" is at index 0
@@ -779,6 +936,7 @@ class ProjectionMappingApp(QMainWindow):
 
             self.audio_handler = AudioHandler(device_index=actual_index)
             self.audio_handler.bands_updated.connect(self.worker.set_audio_bands)
+            self.audio_handler.bands_updated.connect(self.audio_monitor.set_levels)
             self.audio_handler.start()
 
     def open_midi_mapping(self):
@@ -797,7 +955,14 @@ class ProjectionMappingApp(QMainWindow):
             filename, _ = QFileDialog.getSaveFileName(self, "Save Project", self.current_project_path or "", "Project Files (*.json)")
 
         if filename:
+            import base64
             self.current_project_path = filename
+
+            ref_frame_b64 = None
+            if self.worker.latest_main_frame is not None:
+                _, buffer = cv2.imencode('.jpg', self.worker.latest_main_frame)
+                ref_frame_b64 = base64.b64encode(buffer).decode('utf-8')
+
             project_data = {
                 'masks': [mask.to_dict() for mask in self.masks],
                 'media_library': self.media_library,
@@ -809,7 +974,15 @@ class ProjectionMappingApp(QMainWindow):
                 'midi_port': self.midi_combo.currentText(),
                 'midi_mappings': self.midi_mappings,
                 'marker_config': self.worker.marker_config,
-                'baseline_distance': self.worker.baseline_distance
+                'baseline_distance': self.worker.baseline_distance,
+                'setup_reference': ref_frame_b64,
+                'master_visuals': {
+                    'brightness': self.brightness_slider.value(),
+                    'contrast': self.contrast_slider.value(),
+                    'saturation': self.saturation_slider.value(),
+                    'grain': self.grain_slider.value(),
+                    'bloom': self.bloom_slider.value()
+                }
             }
             with open(filename, 'w') as f:
                 json.dump(project_data, f, indent=4)
@@ -823,6 +996,30 @@ class ProjectionMappingApp(QMainWindow):
         file_path = resource_path('HELP_MAINSTAGE.md')
         QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
 
+    def show_setup_reference(self):
+        if hasattr(self, 'setup_reference_b64') and self.setup_reference_b64:
+            import base64
+            import numpy as np
+            img_data = base64.b64decode(self.setup_reference_b64)
+            nparr = np.frombuffer(img_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if img is not None:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                qimg = QImage(rgb.data, w, h, w * ch, QImage.Format_RGB888).copy()
+
+                # Show in a simple dialog
+                dialog = QDialog(self)
+                dialog.setWindowTitle("Setup Reference Frame")
+                l = QVBoxLayout(dialog)
+                lbl = QLabel()
+                lbl.setPixmap(QPixmap.fromImage(qimg))
+                l.addWidget(lbl)
+                dialog.exec_()
+        else:
+            self.statusBar().showMessage("No setup reference frame found in this project.", 3000)
+
     def load_project(self, filename=None):
         if not filename:
             filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
@@ -833,6 +1030,7 @@ class ProjectionMappingApp(QMainWindow):
                 with open(filename, 'r') as f:
                     data = json.load(f)
 
+                self.setup_reference_b64 = data.get('setup_reference')
                 self.masks = [Mask.from_dict(d) for d in data.get('masks', [])]
                 self.media_library = data.get('media_library', [])
                 self.media_list.clear()
@@ -868,6 +1066,13 @@ class ProjectionMappingApp(QMainWindow):
                     self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
 
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
+
+                mv = data.get('master_visuals', {})
+                self.brightness_slider.setValue(mv.get('brightness', 0))
+                self.contrast_slider.setValue(mv.get('contrast', 0))
+                self.saturation_slider.setValue(mv.get('saturation', 100))
+                self.grain_slider.setValue(mv.get('grain', 0))
+                self.bloom_slider.setValue(mv.get('bloom', 0))
 
                 self.statusBar().showMessage(f"Project loaded from {filename}", 3000)
 
@@ -936,18 +1141,34 @@ class ProjectionMappingApp(QMainWindow):
         self.audio_target_combo.setCurrentText(state.get('audio_target', 'none'))
 
         self.statusBar().showMessage(f"Snapshot {index+1} loaded.", 3000)
+        self.send_midi_feedback_for_group('snap_load_', index, 8)
+
+    def send_midi_feedback(self, key, value):
+        if hasattr(self, 'midi_handler') and self.midi_handler:
+            mapping = self.midi_mappings.get(key)
+            if mapping:
+                self.midi_handler.send_feedback(mapping[0], mapping[1], value)
+
+    def send_midi_feedback_for_group(self, prefix, active_idx, count):
+        for i in range(count):
+            val = 127 if i == active_idx else 0
+            self.send_midi_feedback(f"{prefix}{i}", val)
 
     def execute_midi_action(self, key, value):
         if key.startswith('cue_amp_'):
             idx = int(key.split('_')[-1])
             self.worker.switch_cue('amp', idx)
+            self.send_midi_feedback_for_group('cue_amp_', idx, 8)
         elif key.startswith('cue_background_'):
             idx = int(key.split('_')[-1])
             self.worker.switch_cue('background', idx)
+            self.send_midi_feedback_for_group('cue_background_', idx, 8)
         elif key == 'toggle_amp':
             self.worker.toggle_mask('amp', value > 0)
+            self.send_midi_feedback('toggle_amp', 127 if value > 0 else 0)
         elif key == 'toggle_background':
             self.worker.toggle_mask('background', value > 0)
+            self.send_midi_feedback('toggle_background', 127 if value > 0 else 0)
         elif key.startswith('fx_'):
             parts = key.split('_')
             tag = parts[1]
@@ -1037,6 +1258,14 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.master_tint_color = primary
         self.statusBar().showMessage(f"Applied {mood_name} mood.", 3000)
 
+    def toggle_blackout(self):
+        # Toggle all masks visibility as a panic blackout
+        is_visible = any(m.visible for m in self.masks)
+        for m in self.masks:
+            m.visible = not is_visible
+        self.worker.set_masks(self.masks)
+        self.statusBar().showMessage("BLACKOUT ENABLED" if is_visible else "BLACKOUT DISABLED", 3000)
+
     def toggle_splash_mode(self, checked):
         self.worker.show_splash = checked
         if checked:
@@ -1091,6 +1320,28 @@ class ProjectionMappingApp(QMainWindow):
                 self.worker.set_masks(self.masks)
                 self.statusBar().showMessage(f"Mask '{mask.name}' saved with {len(mask_points)} points.", 3000)
                 self.maybe_auto_save()
+
+    def open_playlist_editor(self):
+        selected_mask_row = self.cue_table.currentRow()
+        if selected_mask_row < 0:
+            self.statusBar().showMessage("Select a mask from the table first.", 3000)
+            return
+
+        mask = self.masks[selected_mask_row]
+        dialog = PlaylistEditorDialog(mask, self)
+        if dialog.exec_():
+            # If the current video path was removed or playlist changed
+            if mask.playlist:
+                if mask.playlist_index >= len(mask.playlist):
+                    mask.playlist_index = 0
+                mask.video_path = mask.playlist[mask.playlist_index]
+            else:
+                mask.video_path = None
+
+            self.update_cue_table()
+            self.worker.set_masks(self.masks)
+            self.maybe_auto_save()
+            self.statusBar().showMessage(f"Updated playlist for {mask.name}", 3000)
         else:
             self.statusBar().showMessage("Mask not saved: No points or no cue selected.", 5000)
 
@@ -1147,7 +1398,9 @@ class ProjectionMappingApp(QMainWindow):
             self.enable_warping_button.setText("Enable Warping")
 
     def add_vj_generator_to_lib(self):
-        pattern, ok = QInputDialog.getItem(self, "Select Generator", "Pattern:", ["grid", "scan", "radial"], 0, False)
+        pattern, ok = QInputDialog.getItem(self, "Select Generator", "Pattern:",
+                                         ["grid", "scan", "radial", "tunnel", "plasma", "vortex",
+                                          "polytunnel", "stardust", "hypergrid", "prism_move"], 0, False)
         if ok and pattern:
             path = f"generator:{pattern}"
             if path not in self.media_library:
@@ -1184,6 +1437,26 @@ class ProjectionMappingApp(QMainWindow):
             self.update_cue_table()
             self.worker.set_masks(self.masks)
             self.maybe_auto_save()
+
+    def mask_to_front(self):
+        current_item = self.cue_list_widget.currentItem()
+        if current_item:
+            row = self.cue_list_widget.row(current_item)
+            mask = self.masks[row]
+            max_z = max((m.z_order for m in self.masks), default=0)
+            mask.z_order = max_z + 1
+            self.worker.set_masks(self.masks)
+            self.statusBar().showMessage(f"'{mask.name}' brought to front", 3000)
+
+    def mask_to_back(self):
+        current_item = self.cue_list_widget.currentItem()
+        if current_item:
+            row = self.cue_list_widget.row(current_item)
+            mask = self.masks[row]
+            min_z = min((m.z_order for m in self.masks), default=0)
+            mask.z_order = min_z - 1
+            self.worker.set_masks(self.masks)
+            self.statusBar().showMessage(f"'{mask.name}' sent to back", 3000)
 
     def closeEvent(self, event):
         self.worker.stop()
