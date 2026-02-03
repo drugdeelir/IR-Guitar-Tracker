@@ -472,12 +472,17 @@ class ProjectionMappingApp(QMainWindow):
             btn = QPushButton("Start Drawing Background Mask")
             btn.clicked.connect(self.start_setup_bg_mask)
             self.setup_group_layout.addWidget(btn)
-        elif self.setup_step == 3: # Amp
-            self.setup_group.setTitle("Step 4: Amp Mask")
-            self.setup_instruction.setText("Create a mask for your amplifier.")
-            btn = QPushButton("Start Drawing Amp Mask")
+        elif self.setup_step == 3: # Guitar
+            self.setup_group.setTitle("Step 4: Guitar Mask")
+            self.setup_instruction.setText("1. Draw a mask for your guitar.\n2. Click 'Finish & Save'.\n3. Click 'Link to Tracking' to bind it.")
+            btn = QPushButton("Start Drawing Guitar Mask")
             btn.clicked.connect(self.start_setup_amp_mask)
             self.setup_group_layout.addWidget(btn)
+
+            link_btn = QPushButton("Link Mask to IR Tracking")
+            link_btn.setStyleSheet("background-color: #311b92; color: white; height: 40px; margin-top: 10px;")
+            link_btn.clicked.connect(self.link_mask_to_markers)
+            self.setup_group_layout.addWidget(link_btn)
         elif self.setup_step == 4: # Done
             self.setup_group.setTitle("Setup Complete")
             self.setup_instruction.setText("Setup finished! You can save this configuration as a preset below.")
@@ -540,9 +545,9 @@ class ProjectionMappingApp(QMainWindow):
                 break
 
         if not amp_mask:
-            amp_mask = Mask("Amp", [], None, tag="amp", mask_type="dynamic")
+            amp_mask = Mask("Guitar", [], None, tag="amp", mask_type="dynamic")
             self.masks.append(amp_mask)
-            self.cue_list_widget.addItem("Amp")
+            self.cue_list_widget.addItem("Guitar")
             self.update_cue_table()
 
         idx = self.masks.index(amp_mask)
