@@ -223,6 +223,7 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window = ProjectorWindow()
 
         self.available_cameras = get_available_cameras()
+        self.screens = QApplication.screens()
 
         self.tabs = QTabWidget()
         self.create_setup_tab() # New Guided Setup Tab
@@ -248,6 +249,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
+        self.worker.calibration_complete.connect(self.handle_calibration_complete)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
@@ -354,6 +356,20 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage(f"Assigned {len(mask.playlist)} videos to {mask.name}", 3000)
         self.maybe_auto_save()
 
+    def update_play_button_ui(self):
+        row = self.cue_table.currentRow()
+        if row >= 0 and row < len(self.masks):
+            mask = self.masks[row]
+            if mask.visible:
+                self.play_cue_btn.setText("■ STOP CUE")
+                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 10px;")
+            else:
+                self.play_cue_btn.setText("▶ START CUE")
+                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+        else:
+            self.play_cue_btn.setText("▶ START CUE")
+            self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+
     def update_cue_table(self):
         self.cue_table.setRowCount(len(self.masks))
         for i, mask in enumerate(self.masks):
@@ -370,6 +386,7 @@ class ProjectionMappingApp(QMainWindow):
             self.cue_table.setItem(i, 1, video_item)
             self.cue_table.setItem(i, 2, count_item)
         self.update_cue_list_widget()
+        self.update_play_button_ui()
 
     def update_cue_list_widget(self):
         curr_row = self.cue_list_widget.currentRow()
@@ -514,20 +531,50 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_layout.addWidget(self.setup_title)
         self.setup_layout.addWidget(self.setup_desc)
 
-        self.setup_group = QGroupBox("Step 1: Select Camera")
+        self.setup_group = QGroupBox("Step 1: Devices & Alignment")
         self.setup_group_layout = QVBoxLayout()
 
-        self.setup_instruction = QLabel("Select your IR camera to begin.")
+        self.setup_instruction = QLabel("Select your camera and projector, then run Auto-Alignment.")
+        self.setup_instruction.setWordWrap(True)
         self.setup_group_layout.addWidget(self.setup_instruction)
 
+        # Camera selection
+        cam_layout = QHBoxLayout()
+        cam_layout.addWidget(QLabel("Camera:"))
         self.setup_cam_combo = QComboBox()
         self.setup_cam_combo.addItems([f"Camera {i}" for i in self.available_cameras])
         self.setup_cam_combo.currentIndexChanged.connect(self.change_camera)
-        self.setup_group_layout.addWidget(self.setup_cam_combo)
+        cam_layout.addWidget(self.setup_cam_combo)
+        self.setup_group_layout.addLayout(cam_layout)
+
+        # Projector selection
+        proj_layout = QHBoxLayout()
+        proj_layout.addWidget(QLabel("Projector Display:"))
+        self.setup_proj_combo = QComboBox()
+        self.setup_proj_combo.addItems([screen.name() or f"Screen {i+1}" for i, screen in enumerate(self.screens)])
+        self.setup_proj_combo.currentIndexChanged.connect(self.change_projector)
+        proj_layout.addWidget(self.setup_proj_combo)
+        self.setup_group_layout.addLayout(proj_layout)
+
+        # Auto-Alignment
+        self.align_btn = QPushButton("RUN AUTO-ALIGNMENT")
+        self.align_btn.setMinimumHeight(50)
+        self.align_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; margin-top: 10px;")
+        self.align_btn.clicked.connect(self.start_auto_calibration)
+        self.setup_group_layout.addWidget(self.align_btn)
+
+        self.test_pattern_check = QCheckBox("Show Test Pattern (Manual Alignment Check)")
+        self.test_pattern_check.toggled.connect(self.toggle_test_pattern)
+        self.setup_group_layout.addWidget(self.test_pattern_check)
+
+        self.setup_status_label = QLabel("Mapping: Not Aligned")
+        self.setup_status_label.setAlignment(Qt.AlignCenter)
+        self.setup_status_label.setStyleSheet("color: #ff5252; font-weight: bold;")
+        self.setup_group_layout.addWidget(self.setup_status_label)
 
         self.load_template_btn = QPushButton("OR: Load Existing Template / Project")
         self.load_template_btn.clicked.connect(self.load_project)
-        self.load_template_btn.setStyleSheet("background-color: #311b92; color: white; margin-top: 10px;")
+        self.load_template_btn.setStyleSheet("background-color: #311b92; color: white; margin-top: 20px;")
         self.setup_group_layout.addWidget(self.load_template_btn)
 
         self.setup_next_btn = QPushButton("Next Step")
@@ -542,10 +589,35 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_layout.addStretch()
         self.tabs.insertTab(0, self.setup_tab, "Setup Wizard")
 
+    def start_auto_calibration(self):
+        self.statusBar().showMessage("Displaying calibration pattern...", 2000)
+        self.worker.show_calibration_pattern = True
+        # Wait a moment for the projector to actually show it before capturing
+        QTimer.singleShot(1000, self.worker.run_auto_calibration)
+
+    def handle_calibration_complete(self, success):
+        self.worker.show_calibration_pattern = False
+        if hasattr(self, 'test_pattern_check') and self.test_pattern_check:
+            self.test_pattern_check.blockSignals(True)
+            self.test_pattern_check.setChecked(False)
+            self.test_pattern_check.blockSignals(False)
+        if success:
+            self.statusBar().showMessage("Auto-Alignment Successful!", 5000)
+            if hasattr(self, 'setup_status_label') and self.setup_status_label:
+                self.setup_status_label.setText("Mapping: ALIGNED ✓")
+                self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
+            self.maybe_auto_save()
+        else:
+            self.statusBar().showMessage("Auto-Alignment Failed. Ensure camera sees projector.", 5000)
+            if hasattr(self, 'setup_status_label') and self.setup_status_label:
+                self.setup_status_label.setText("Mapping: Failed (Retry)")
+                self.setup_status_label.setStyleSheet("color: #ff5252; font-weight: bold;")
+
     def clear_setup_layout(self):
         # Reset specific references to avoid RuntimeErrors on deleted widgets
         self.setup_link_status_label = None
         self.setup_link_mask_combo = None
+        self.setup_status_label = None
 
         while self.setup_group_layout.count():
             item = self.setup_group_layout.takeAt(0)
@@ -980,6 +1052,7 @@ class ProjectionMappingApp(QMainWindow):
         self.cue_table.setHorizontalHeaderLabels(["Mask / Tag", "Current Video", "Playlist Count"])
         self.cue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.cue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.cue_table.itemSelectionChanged.connect(self.update_play_button_ui)
         cue_layout.addWidget(self.cue_table)
 
         assign_btn = QPushButton("Assign Selected Media to Mask Playlist")
@@ -992,9 +1065,9 @@ class ProjectionMappingApp(QMainWindow):
         self.edit_playlist_btn.clicked.connect(self.open_playlist_editor)
         cue_layout.addWidget(self.edit_playlist_btn)
 
-        self.play_cue_btn = QPushButton("▶ PLAY / RESTART CUE")
+        self.play_cue_btn = QPushButton("▶ START CUE")
         self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
-        self.play_cue_btn.clicked.connect(self.play_selected_cue)
+        self.play_cue_btn.clicked.connect(self.toggle_selected_cue)
         cue_layout.addWidget(self.play_cue_btn)
 
         cue_group.setLayout(cue_layout)
@@ -1083,7 +1156,6 @@ class ProjectionMappingApp(QMainWindow):
         disp_group = QGroupBox("Projector Display")
         disp_layout = QVBoxLayout()
         self.projector_combo = QComboBox()
-        self.screens = QApplication.screens()
         self.projector_combo.addItems([screen.name() or f"Screen {i+1}" for i, screen in enumerate(self.screens)])
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
         disp_layout.addWidget(self.projector_combo)
@@ -1218,6 +1290,30 @@ class ProjectionMappingApp(QMainWindow):
     def update_smoothing(self, value):
         self.worker.set_smoothing(value / 100.0)
 
+    def toggle_selected_cue(self):
+        row = self.cue_table.currentRow()
+        if row >= 0 and row < len(self.masks):
+            mask = self.masks[row]
+            if not mask.video_path:
+                self.statusBar().showMessage("No video assigned to this mask.", 3000)
+                return
+
+            # Toggle visibility as a way to start/stop
+            mask.visible = not mask.visible
+            self.worker.set_masks(self.masks)
+
+            if mask.visible:
+                self.worker.restart_mask_video(mask.video_path)
+                self.play_cue_btn.setText("■ STOP CUE")
+                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 10px;")
+            else:
+                self.play_cue_btn.setText("▶ START CUE")
+                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+
+            self.update_cue_table()
+        else:
+            self.statusBar().showMessage("Select a mask in the table first.", 3000)
+
     def save_project(self, filename=None):
         if not filename:
             filename, _ = QFileDialog.getSaveFileName(self, "Save Project", self.current_project_path or "", "Project Files (*.json)")
@@ -1242,6 +1338,7 @@ class ProjectionMappingApp(QMainWindow):
                 'midi_port': self.midi_combo.currentText(),
                 'midi_mappings': self.midi_mappings,
                 'marker_config': self.worker.marker_config,
+                'h_c2p': self.worker.h_c2p.tolist() if self.worker.h_c2p is not None else None,
                 'baseline_distance': self.worker.baseline_distance,
                 'setup_reference': ref_frame_b64,
                 'master_visuals': {
@@ -1334,6 +1431,13 @@ class ProjectionMappingApp(QMainWindow):
                     self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
 
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
+
+                h_c2p = data.get('h_c2p')
+                if h_c2p:
+                    self.worker.set_h_c2p(h_c2p)
+                    if hasattr(self, 'setup_status_label') and self.setup_status_label:
+                        self.setup_status_label.setText("Mapping: ALIGNED (Loaded) ✓")
+                        self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
 
                 mv = data.get('master_visuals', {})
                 self.brightness_slider.setValue(mv.get('brightness', 0))
@@ -1740,6 +1844,9 @@ class ProjectionMappingApp(QMainWindow):
 
     def update_tracker_label(self, count):
         self.ir_trackers_label.setText(f"Trackers detected: {count}")
+
+    def toggle_test_pattern(self, checked):
+        self.worker.show_calibration_pattern = checked
 
     def toggle_warping(self, checked):
         self.projector_window.set_calibration_mode(checked)

@@ -91,6 +91,7 @@ class Worker(QObject):
     trackers_detected = pyqtSignal(int)
     trackers_ready = pyqtSignal(list)
     camera_error = pyqtSignal(int)
+    calibration_complete = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -171,6 +172,9 @@ class Worker(QObject):
 
         # Calibration/Alignment Mode
         self.show_camera_on_projector = False
+        self.show_calibration_pattern = False
+        self.h_c2p = None # Camera to Projector homography
+        self._run_calibration_flag = False
 
         # Splash Mode
         self.show_splash = False
@@ -236,6 +240,12 @@ class Worker(QObject):
 
     def calibrate_depth(self):
         self._calibrate_depth_flag = True
+
+    def set_h_c2p(self, matrix_list):
+        if matrix_list is None:
+            self.h_c2p = None
+        else:
+            self.h_c2p = np.array(matrix_list, dtype=np.float32)
 
     def set_depth_sensitivity(self, value):
         self.depth_sensitivity = value
@@ -834,10 +844,64 @@ class Worker(QObject):
 
             if self.show_camera_on_projector:
                 cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
+            elif self.show_calibration_pattern:
+                self.projector_buffer.fill(0)
+                # Draw a bright green rectangle with a white border for easy detection
+                margin = 20
+                cv2.rectangle(self.projector_buffer, (margin, margin), (w - margin, h - margin), (0, 255, 0), -1)
+                cv2.rectangle(self.projector_buffer, (margin, margin), (w - margin, h - margin), (255, 255, 255), 5)
+                cv2.putText(self.projector_buffer, "CALIBRATING...", (w//2-100, h//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             else:
                 self.projector_buffer.fill(0)
 
             projector_output = self.projector_buffer
+
+            # Handle Auto-Calibration logic
+            if self._run_calibration_flag:
+                # We expect the calibration pattern to be visible in main_frame
+                hsv = cv2.cvtColor(main_frame, cv2.COLOR_BGR2HSV)
+                # Look for the bright green pattern
+                lower_green = np.array([35, 50, 50])
+                upper_green = np.array([85, 255, 255])
+                mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+                contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                success = False
+                if contours:
+                    cnt = max(contours, key=cv2.contourArea)
+                    if cv2.contourArea(cnt) > (w_cam * h_cam * 0.05): # At least 5% of frame
+                        peri = cv2.arcLength(cnt, True)
+                        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+                        if len(approx) == 4:
+                            # We found 4 corners in camera space
+                            cam_corners = approx.reshape(4, 2).astype(np.float32)
+
+                            # Sort corners: top-left, top-right, bottom-right, bottom-left
+                            # Sum (x+y) gives TL and BR, Diff (y-x) gives TR and BL
+                            s = cam_corners.sum(axis=1)
+                            tl = cam_corners[np.argmin(s)]
+                            br = cam_corners[np.argmax(s)]
+                            diff = np.diff(cam_corners, axis=1)
+                            tr = cam_corners[np.argmin(diff)]
+                            bl = cam_corners[np.argmax(diff)]
+
+                            cam_ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+
+                            # Corresponding projector corners (matching the green rect we drew)
+                            margin = 20
+                            proj_ordered = np.array([
+                                [margin, margin],
+                                [w - margin, margin],
+                                [w - margin, h - margin],
+                                [margin, h - margin]
+                            ], dtype=np.float32)
+
+                            self.h_c2p, _ = cv2.findHomography(cam_ordered, proj_ordered)
+                            success = True
+
+                self._run_calibration_flag = False
+                self.calibration_complete.emit(success)
 
             if self.show_splash:
                 if self.splash_player is None:
@@ -945,19 +1009,21 @@ class Worker(QObject):
 
                         if is_safe:
                             # Transform reference mask points to current tracking space
-                            # mask.source_points are assumed to be drawn on the reference frame
                             dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), self.last_homography).reshape(-1, 2)
 
                             # Audio Scaling
                             if self.audio_reactive_target == 'scale':
                                 center = np.mean(dst_pts_raw, axis=0)
                                 scale_factor = 1.0 + self.audio_bands[0] * 0.5
-                                dst_pts = (dst_pts_raw - center) * scale_factor + center
+                                dst_pts_cam = (dst_pts_raw - center) * scale_factor + center
                             else:
-                                dst_pts = dst_pts_raw
+                                dst_pts_cam = dst_pts_raw
                         else:
                             # Tracking lost or not linked: stay at source points or fallback
-                            dst_pts = src_pts
+                            dst_pts_cam = src_pts
+
+                        # Transform camera coordinates to projector coordinates
+                        dst_pts = self.transform_to_projector(dst_pts_cam)
 
                         # Warp video to the dynamic polygon
                         # We need a homography from video full frame to current mask polygon
@@ -1016,7 +1082,8 @@ class Worker(QObject):
                             projector_output = self.blend_frames(projector_output, cv2.resize(effective_frame_cue, (w, h)), full_mask, mask.blend_mode)
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
-                            dst_pts = np.float32(mask.source_points)
+                            # Transform camera source points to projector space
+                            dst_pts = self.transform_to_projector(mask.source_points)
 
                             if len(dst_pts) == 4:
                                 matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -1043,9 +1110,11 @@ class Worker(QObject):
                     # Determine current points for outline
                     if mask.type == 'dynamic' and mask.is_linked and self.last_homography is not None:
                         src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
-                        draw_pts = cv2.perspectiveTransform(src_pts, self.last_homography).reshape(-1, 2).astype(np.int32)
+                        draw_pts_cam = cv2.perspectiveTransform(src_pts, self.last_homography).reshape(-1, 2)
                     else:
-                        draw_pts = np.array(mask.source_points).astype(np.int32)
+                        draw_pts_cam = np.array(mask.source_points)
+
+                    draw_pts = self.transform_to_projector(draw_pts_cam).astype(np.int32)
 
                     if len(draw_pts) >= 3:
                         cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
@@ -1418,6 +1487,20 @@ class Worker(QObject):
         return points
 
     def stop(self): self._running = False
+
+    def run_auto_calibration(self):
+        self._run_calibration_flag = True
+
+    def transform_to_projector(self, pts):
+        if self.h_c2p is None:
+            return pts
+        try:
+            pts_reshaped = np.float32(pts).reshape(-1, 1, 2)
+            transformed = cv2.perspectiveTransform(pts_reshaped, self.h_c2p)
+            return transformed.reshape(-1, 2)
+        except:
+            return pts
+
     def set_warp_points(self, points):
         self.warp_points = points
         self._warp_map_dirty = True
