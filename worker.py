@@ -99,6 +99,7 @@ class Worker(QObject):
         self.video_source = 0
         self.projector_width = 1280
         self.projector_height = 720
+        self.warp_grid_res = 3
         self.warp_points = []
         for y in [0.0, 0.5, 1.0]:
             for x in [0.0, 0.5, 1.0]:
@@ -763,52 +764,62 @@ class Worker(QObject):
         self.map_x = np.zeros((h, w), dtype=np.float32)
         self.map_y = np.zeros((h, w), dtype=np.float32)
 
-        # Identity maps
-        grid_y, grid_x = np.mgrid[0:h, 0:w]
-
         wp = np.array(self.warp_points)
         wp[:, 0] *= w
         wp[:, 1] *= h
 
-        quads = [(0, 1, 4, 3), (1, 2, 5, 4), (3, 4, 7, 6), (4, 5, 8, 7)]
+        res = self.warp_grid_res
 
-        for i, (p1, p2, p3, p4) in enumerate(quads):
-            # Destination (where we want the pixels to go)
-            dst_q = np.float32([wp[p1], wp[p2], wp[p3], wp[p4]])
-            # Source (linear grid)
-            src_x = (i % 2) * (w // 2)
-            src_y = (i // 2) * (h // 2)
-            src_q = np.float32([
-                [src_x, src_y], [src_x + w // 2, src_y],
-                [src_x + w // 2, src_y + h // 2], [src_x, src_y + h // 2]
-            ])
+        for r in range(res - 1):
+            for c in range(res - 1):
+                # Quad corners in the point list
+                p1 = r * res + c
+                p2 = r * res + (c + 1)
+                p3 = (r + 1) * res + (c + 1)
+                p4 = (r + 1) * res + c
 
-            # For remap, we need mapping from output pixel back to input pixel
-            M = cv2.getPerspectiveTransform(dst_q, src_q)
+                dst_q = np.float32([wp[p1], wp[p2], wp[p3], wp[p4]])
 
-            # Find destination quad bounding box
-            min_x = int(np.min(dst_q[:, 0]))
-            max_x = int(np.max(dst_q[:, 0]))
-            min_y = int(np.min(dst_q[:, 1]))
-            max_y = int(np.max(dst_q[:, 1]))
+                # Source quad in linear grid
+                src_x_start = c * (w // (res - 1))
+                src_y_start = r * (h // (res - 1))
+                src_x_end = (c + 1) * (w // (res - 1))
+                src_y_end = (r + 1) * (h // (res - 1))
 
-            # Clip to image boundaries
-            min_x, max_x = max(0, min_x), min(w, max_x)
-            min_y, max_y = max(0, min_y), min(h, max_y)
+                if c == res - 2: src_x_end = w
+                if r == res - 2: src_y_end = h
 
-            # Create a localized coordinate grid
-            yy, xx = np.mgrid[min_y:max_y, min_x:max_x].astype(np.float32)
-            points = np.stack([xx.ravel(), yy.ravel()], axis=1).reshape(-1, 1, 2)
+                src_q = np.float32([
+                    [src_x_start, src_y_start], [src_x_end, src_y_start],
+                    [src_x_end, src_y_end], [src_x_start, src_y_end]
+                ])
 
-            if points.size > 0:
-                transformed = cv2.perspectiveTransform(points, M).reshape(-1, 2)
-                # Map only the pixels inside the warped quad
-                mask = np.zeros((max_y-min_y, max_x-min_x), dtype=np.uint8)
-                cv2.fillConvexPoly(mask, np.int32(dst_q - [min_x, min_y]), 255)
+                # For remap, we need mapping from output pixel back to input pixel
+                M = cv2.getPerspectiveTransform(dst_q, src_q)
 
-                # Apply transformation
-                self.map_x[min_y:max_y, min_x:max_x][mask > 0] = transformed[:, 0].reshape(max_y-min_y, max_x-min_x)[mask > 0]
-                self.map_y[min_y:max_y, min_x:max_x][mask > 0] = transformed[:, 1].reshape(max_y-min_y, max_x-min_x)[mask > 0]
+                # Find destination quad bounding box
+                min_x = int(np.min(dst_q[:, 0]))
+                max_x = int(np.max(dst_q[:, 0]))
+                min_y = int(np.min(dst_q[:, 1]))
+                max_y = int(np.max(dst_q[:, 1]))
+
+                # Clip to image boundaries
+                min_x, max_x = max(0, min_x), min(w, max_x)
+                min_y, max_y = max(0, min_y), min(h, max_y)
+
+                # Create a localized coordinate grid
+                yy, xx = np.mgrid[min_y:max_y, min_x:max_x].astype(np.float32)
+                points = np.stack([xx.ravel(), yy.ravel()], axis=1).reshape(-1, 1, 2)
+
+                if points.size > 0:
+                    transformed = cv2.perspectiveTransform(points, M).reshape(-1, 2)
+                    # Map only the pixels inside the warped quad
+                    mask = np.zeros((max_y-min_y, max_x-min_x), dtype=np.uint8)
+                    cv2.fillConvexPoly(mask, np.int32(dst_q - [min_x, min_y]), 255)
+
+                    # Apply transformation
+                    self.map_x[min_y:max_y, min_x:max_x][mask > 0] = transformed[:, 0].reshape(max_y-min_y, max_x-min_x)[mask > 0]
+                    self.map_y[min_y:max_y, min_x:max_x][mask > 0] = transformed[:, 1].reshape(max_y-min_y, max_x-min_x)[mask > 0]
 
         self._warp_map_dirty = False
 
@@ -1665,14 +1676,18 @@ class Worker(QObject):
         pts_arr_c[:, 1] *= scale_y
         return pts_arr_c
 
-    def set_warp_points(self, points):
+    def set_warp_points(self, points, res=None):
         self.warp_points = points
+        if res: self.warp_grid_res = res
         self._warp_map_dirty = True
 
         # Check if identity
         self._warp_is_identity = True
+        res = self.warp_grid_res
         for i, p in enumerate(self.warp_points):
-            if abs(p[0] - (i % 3) * 0.5) > 0.005 or abs(p[1] - (i // 3) * 0.5) > 0.005:
+            expected_x = (i % res) / (res - 1)
+            expected_y = (i // res) / (res - 1)
+            if abs(p[0] - expected_x) > 0.005 or abs(p[1] - expected_y) > 0.005:
                 self._warp_is_identity = False
                 break
     def cleanup_resources(self):

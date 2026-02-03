@@ -246,7 +246,7 @@ class AudioMonitor(QWidget):
             painter.drawText(x, h - 5, labels[i])
 
 class ProjectorWindow(QWidget):
-    warp_points_changed = pyqtSignal(list)
+    warp_points_changed = pyqtSignal(list, int) # points, resolution
 
     def __init__(self):
         super().__init__()
@@ -255,11 +255,9 @@ class ProjectorWindow(QWidget):
         self.current_pixmap = None
 
         self.calibration_mode = False
-        # 3x3 Grid
+        self.grid_res = 3
         self.warp_points = []
-        for y in [0.0, 0.5, 1.0]:
-            for x in [0.0, 0.5, 1.0]:
-                self.warp_points.append(QPointF(x, y))
+        self.reset_warp_points()
 
         self.dragging_point_index = -1
 
@@ -271,12 +269,15 @@ class ProjectorWindow(QWidget):
         self.calibration_mode = enabled
         self.update() # Trigger a repaint
 
-    def reset_warp_points(self):
+    def reset_warp_points(self, res=None):
+        if res: self.grid_res = res
         self.warp_points = []
-        for y in [0.0, 0.5, 1.0]:
-            for x in [0.0, 0.5, 1.0]:
+        for i in range(self.grid_res):
+            y = i / (self.grid_res - 1)
+            for j in range(self.grid_res):
+                x = j / (self.grid_res - 1)
                 self.warp_points.append(QPointF(x, y))
-        self.warp_points_changed.emit(self.get_warp_points_normalized())
+        self.warp_points_changed.emit(self.get_warp_points_normalized(), self.grid_res)
         self.update()
 
     def paintEvent(self, event):
@@ -306,7 +307,7 @@ class ProjectorWindow(QWidget):
     def mouseMoveEvent(self, event):
         if self.calibration_mode and self.dragging_point_index != -1:
             self.warp_points[self.dragging_point_index] = self.normalize_point(event.pos())
-            self.warp_points_changed.emit(self.get_warp_points_normalized())
+            self.warp_points_changed.emit(self.get_warp_points_normalized(), self.grid_res)
             self.update()
 
     def mouseReleaseEvent(self, event):

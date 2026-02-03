@@ -245,7 +245,7 @@ class ProjectionMappingApp(QMainWindow):
 
         self.worker.frame_ready.connect(self.video_display.set_image)
         self.worker.projector_frame_ready.connect(self.projector_window.set_image)
-        self.projector_window.warp_points_changed.connect(self.worker.set_warp_points)
+        self.projector_window.warp_points_changed.connect(lambda pts, res: self.worker.set_warp_points(pts, res))
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
@@ -1124,8 +1124,17 @@ class ProjectionMappingApp(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        warp_group = QGroupBox("Projector Warping (3x3 Grid)")
+        self.warp_group = QGroupBox("Projector Warping (3x3 Grid)")
         warp_layout = QVBoxLayout()
+
+        res_layout = QHBoxLayout()
+        res_layout.addWidget(QLabel("Grid Resolution:"))
+        self.warp_res_combo = QComboBox()
+        self.warp_res_combo.addItems(["3x3", "4x4", "5x5", "6x6", "8x8"])
+        self.warp_res_combo.currentIndexChanged.connect(self.change_warp_res)
+        res_layout.addWidget(self.warp_res_combo)
+        warp_layout.addLayout(res_layout)
+
         self.enable_warping_button = QPushButton("ENABLE ALIGNMENT MODE")
         self.enable_warping_button.setCheckable(True)
         self.enable_warping_button.toggled.connect(self.toggle_warping)
@@ -1133,8 +1142,8 @@ class ProjectionMappingApp(QMainWindow):
         self.reset_warping_button.clicked.connect(self.projector_window.reset_warp_points)
         warp_layout.addWidget(self.enable_warping_button)
         warp_layout.addWidget(self.reset_warping_button)
-        warp_group.setLayout(warp_layout)
-        layout.addWidget(warp_group)
+        self.warp_group.setLayout(warp_layout)
+        layout.addWidget(self.warp_group)
         
         ir_group = QGroupBox("IR Tracking")
         ir_layout = QVBoxLayout()
@@ -1359,6 +1368,12 @@ class ProjectionMappingApp(QMainWindow):
         else:
             self.statusBar().showMessage("Select a mask in the table first.", 3000)
 
+    def change_warp_res(self, index):
+        res_str = self.warp_res_combo.currentText()
+        res = int(res_str.split('x')[0])
+        self.projector_window.reset_warp_points(res)
+        self.warp_group.setTitle(f"Projector Warping ({res_str} Grid)")
+
     def save_project(self, filename=None):
         if not filename:
             filename, _ = QFileDialog.getSaveFileName(self, "Save Project", self.current_project_path or "", "Project Files (*.json)")
@@ -1376,6 +1391,7 @@ class ProjectionMappingApp(QMainWindow):
                 'masks': [mask.to_dict() for mask in self.masks],
                 'media_library': self.media_library,
                 'warp_points': self.projector_window.get_warp_points_normalized(),
+                'warp_grid_res': self.projector_window.grid_res,
                 'ir_threshold': self.ir_threshold_slider.value(),
                 'auto_ir': self.auto_ir_check.isChecked(),
                 'depth_sensitivity': self.depth_sensitivity_slider.value() if hasattr(self, 'depth_sensitivity_slider') else 100,
@@ -1454,9 +1470,13 @@ class ProjectionMappingApp(QMainWindow):
                 self.worker.set_masks(self.masks)
 
                 warp_points = data.get('warp_points')
+                warp_grid_res = data.get('warp_grid_res', 3)
                 if warp_points:
+                    self.warp_res_combo.setCurrentText(f"{warp_grid_res}x{warp_grid_res}")
+                    self.projector_window.grid_res = warp_grid_res
                     self.projector_window.warp_points = [QPointF(p[0], p[1]) for p in warp_points]
-                    self.worker.set_warp_points(warp_points)
+                    self.worker.set_warp_points(warp_points, warp_grid_res)
+                    self.warp_group.setTitle(f"Projector Warping ({warp_grid_res}x{warp_grid_res} Grid)")
 
                 self.auto_ir_check.setChecked(data.get('auto_ir', False))
                 self.ir_threshold_slider.setValue(data.get('ir_threshold', 200))
