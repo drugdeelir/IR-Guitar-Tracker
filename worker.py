@@ -633,7 +633,7 @@ class Worker(QObject):
             for indices in combinations(range(len(points_to_check)), num_markers):
                 # Quick bounding box check
                 pts_arr = np.array([points_to_check[i] for i in indices])
-                if self.confidence > 0.5:
+                if self.confidence > 0.5 and self.last_tracked_points is not None:
                     # If tracking, current combo shouldn't be too far from last known size
                     prev_pts = np.array(self.last_tracked_points)
                     prev_size = np.max(prev_pts, axis=0) - np.min(prev_pts, axis=0)
