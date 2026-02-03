@@ -14,12 +14,27 @@ class VideoPlayer(QThread):
         self._running = True
         self.latest_frame = None
         self.mutex = QMutex()
-        self.cap = cv2.VideoCapture(video_path)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        if self.fps <= 0 or self.fps > 240: self.fps = 30.0
+        self.is_image = video_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))
+
+        if self.is_image:
+            self.cap = None
+            self.fps = 1.0
+            img = cv2.imread(video_path)
+            if img is not None:
+                self.latest_frame = img
+        else:
+            self.cap = cv2.VideoCapture(video_path)
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+            if self.fps <= 0 or self.fps > 240: self.fps = 30.0
+
         self.playback_speed = 1.0
 
     def run(self):
+        if self.is_image:
+            while self._running:
+                time.sleep(1.0) # Just keep the thread alive
+            return
+
         while self._running:
             if not self.cap.isOpened():
                 self.cap = cv2.VideoCapture(self.video_path)
@@ -56,7 +71,8 @@ class VideoPlayer(QThread):
     def stop(self):
         self._running = False
         self.wait()
-        self.cap.release()
+        if self.cap:
+            self.cap.release()
 
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
@@ -69,10 +85,15 @@ class Worker(QObject):
         super().__init__(parent)
         self._running = True
         self.video_source = 0
+        self.projector_width = 1280
+        self.projector_height = 720
         self.warp_points = []
         for y in [0.0, 0.5, 1.0]:
             for x in [0.0, 0.5, 1.0]:
                 self.warp_points.append([x, y])
+        self.map_x = None
+        self.map_y = None
+        self._warp_map_dirty = True
         self.masks = []
         self.video_players = {}
         self.ir_threshold = 200
@@ -85,6 +106,7 @@ class Worker(QObject):
         self.marker_config = None
         self.bpm = 120.0
         self.last_tracked_points = None
+        self.last_homography = None
         self.roi_padding = 50
 
         # Smoothing and Confidence
@@ -132,6 +154,9 @@ class Worker(QObject):
         # Safety Mode
         self.safety_mode_enabled = True
         self.fallback_generator = 'radial'
+
+        # Calibration/Alignment Mode
+        self.show_camera_on_projector = False
 
         # Splash Mode
         self.show_splash = False
@@ -258,6 +283,15 @@ class Worker(QObject):
                         'start_time': time.time()
                     }
                 mask.video_path = video_path
+        self.update_video_speeds()
+        self.cleanup_resources()
+
+    def switch_cue(self, tag, index):
+        for mask in self.masks:
+            if mask.tag == tag:
+                if hasattr(mask, 'playlist') and 0 <= index < len(mask.playlist):
+                    mask.playlist_index = index
+                    self.switch_video(tag, mask.playlist[index])
 
     def toggle_mask(self, tag, visible):
         for mask in self.masks:
@@ -500,9 +534,27 @@ class Worker(QObject):
                     detected_points.append((cX, cY))
 
         if self.marker_config and len(self.marker_config) > 1 and len(detected_points) >= len(self.marker_config):
-            points_to_check = detected_points[:20]
+            # If we were tracking, prioritize points near last known location
+            if self.confidence > 0.5 and self.last_tracked_points:
+                center = np.mean(self.last_tracked_points, axis=0)
+                detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
+
+            # Limit points to check to avoid O(N^K) explosion (N=12, K=4 -> 495 combos)
+            limit = 12 if len(self.marker_config) >= 4 else 15
+            points_to_check = detected_points[:limit]
+
             num_markers = len(self.marker_config)
             for point_combo in combinations(points_to_check, num_markers):
+                # Quick bounding box check
+                pts_arr = np.array(point_combo)
+                if self.confidence > 0.5:
+                    # If tracking, current combo shouldn't be too far from last known size
+                    prev_pts = np.array(self.last_tracked_points)
+                    prev_size = np.max(prev_pts, axis=0) - np.min(prev_pts, axis=0)
+                    curr_size = np.max(pts_arr, axis=0) - np.min(pts_arr, axis=0)
+                    if any(curr_size > prev_size * 2.0) or any(curr_size < prev_size * 0.5):
+                        continue
+
                 current_distances = []
                 for p1, p2 in combinations(point_combo, 2):
                     current_distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
@@ -519,6 +571,7 @@ class Worker(QObject):
                         dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
                         matrix, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
                         if matrix is not None:
+                            self.last_homography = matrix
                             transformed_src = cv2.perspectiveTransform(src_pts, matrix)
                             ordered_points = []
                             remaining_dst = list(point_combo)
@@ -564,13 +617,70 @@ class Worker(QObject):
 
         return detected_points
 
+    def _update_warp_maps(self, w, h):
+        if w <= 0 or h <= 0: return
+        self.map_x = np.zeros((h, w), dtype=np.float32)
+        self.map_y = np.zeros((h, w), dtype=np.float32)
+
+        # Identity maps
+        grid_y, grid_x = np.mgrid[0:h, 0:w]
+
+        wp = np.array(self.warp_points)
+        wp[:, 0] *= w
+        wp[:, 1] *= h
+
+        quads = [(0, 1, 4, 3), (1, 2, 5, 4), (3, 4, 7, 6), (4, 5, 8, 7)]
+
+        for i, (p1, p2, p3, p4) in enumerate(quads):
+            # Destination (where we want the pixels to go)
+            dst_q = np.float32([wp[p1], wp[p2], wp[p3], wp[p4]])
+            # Source (linear grid)
+            src_x = (i % 2) * (w // 2)
+            src_y = (i // 2) * (h // 2)
+            src_q = np.float32([
+                [src_x, src_y], [src_x + w // 2, src_y],
+                [src_x + w // 2, src_y + h // 2], [src_x, src_y + h // 2]
+            ])
+
+            # For remap, we need mapping from output pixel back to input pixel
+            M = cv2.getPerspectiveTransform(dst_q, src_q)
+
+            # Find destination quad bounding box
+            min_x = int(np.min(dst_q[:, 0]))
+            max_x = int(np.max(dst_q[:, 0]))
+            min_y = int(np.min(dst_q[:, 1]))
+            max_y = int(np.max(dst_q[:, 1]))
+
+            # Clip to image boundaries
+            min_x, max_x = max(0, min_x), min(w, max_x)
+            min_y, max_y = max(0, min_y), min(h, max_y)
+
+            # Create a localized coordinate grid
+            yy, xx = np.mgrid[min_y:max_y, min_x:max_x].astype(np.float32)
+            points = np.stack([xx.ravel(), yy.ravel()], axis=1).reshape(-1, 1, 2)
+
+            if points.size > 0:
+                transformed = cv2.perspectiveTransform(points, M).reshape(-1, 2)
+                # Map only the pixels inside the warped quad
+                mask = np.zeros((max_y-min_y, max_x-min_x), dtype=np.uint8)
+                cv2.fillConvexPoly(mask, np.int32(dst_q - [min_x, min_y]), 255)
+
+                # Apply transformation
+                self.map_x[min_y:max_y, min_x:max_x][mask > 0] = transformed[:, 0].reshape(max_y-min_y, max_x-min_x)[mask > 0]
+                self.map_y[min_y:max_y, min_x:max_x][mask > 0] = transformed[:, 1].reshape(max_y-min_y, max_x-min_x)[mask > 0]
+
+        self._warp_map_dirty = False
+
     def process_video(self):
         main_cap = None
         while self._running:
             if self._camera_changed:
                 if main_cap: main_cap.release()
                 main_cap = cv2.VideoCapture(self.video_source)
-                if not main_cap.isOpened():
+                if main_cap.isOpened():
+                    main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                else:
                     self.camera_error.emit(self.video_source)
                     main_cap = None
                 self._camera_changed = False
@@ -598,8 +708,13 @@ class Worker(QObject):
                 QThread.msleep(1000)
                 continue
 
-            h, w = main_frame.shape[:2]
-            projector_output = np.zeros((h, w, 3), dtype=np.uint8)
+            h_cam, w_cam = main_frame.shape[:2]
+            h, w = self.projector_height, self.projector_width
+
+            if self.show_camera_on_projector:
+                projector_output = cv2.resize(main_frame, (w, h))
+            else:
+                projector_output = np.zeros((h, w, 3), dtype=np.uint8)
 
             if self.show_splash:
                 if self.splash_player is None:
@@ -686,31 +801,33 @@ class Worker(QObject):
                         # Override frame with fallback generator
                         frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
 
-                    if mask.type == 'dynamic' and (mask.linked_marker_count == len(tracked_points) or not is_safe):
+                    if mask.type == 'dynamic' and ((mask.is_linked and self.last_homography is not None) or not is_safe):
                         src_pts = np.float32(mask.source_points)
-                        dst_pts_raw = np.float32(tracked_points)
-                        if is_safe and self.baseline_distance > 0 and len(tracked_points) >= 2:
-                            current_distance = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
-                            scale_factor = (current_distance / self.baseline_distance - 1.0) * self.depth_sensitivity + 1.0
-                            center = np.mean(dst_pts_raw, axis=0)
-                            if self.audio_reactive_target == 'scale':
-                                scale_factor *= (1.0 + self.audio_bands[0] * 0.5)
-                            dst_pts = (dst_pts_raw - center) * scale_factor + center
-                        elif is_safe:
-                            dst_pts = dst_pts_raw
+
+                        if is_safe:
+                            # Transform reference mask points to current tracking space
+                            # mask.source_points are assumed to be drawn on the reference frame
+                            dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), self.last_homography).reshape(-1, 2)
+
+                            # Audio Scaling
                             if self.audio_reactive_target == 'scale':
                                 center = np.mean(dst_pts_raw, axis=0)
                                 scale_factor = 1.0 + self.audio_bands[0] * 0.5
                                 dst_pts = (dst_pts_raw - center) * scale_factor + center
+                            else:
+                                dst_pts = dst_pts_raw
                         else:
-                            # Tracking lost: stay static at mask source points but full screen scale?
-                            # Or just map to full screen
-                            dst_pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+                            # Tracking lost or not linked: stay at source points or fallback
+                            dst_pts = src_pts
 
-                        if len(src_pts) == 4 and len(dst_pts) == 4:
-                            matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                        # Warp video to the dynamic polygon
+                        # We need a homography from video full frame to current mask polygon
+                        video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
+                        # If mask points are 4, use perspective transform, else homography
+                        if len(dst_pts) == 4:
+                            matrix = cv2.getPerspectiveTransform(video_corners, dst_pts)
                         else:
-                            matrix, _ = cv2.findHomography(src_pts, dst_pts)
+                            matrix, _ = cv2.findHomography(video_corners, dst_pts)
 
                         warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
                         mask_img = np.zeros_like(projector_output)
@@ -732,9 +849,10 @@ class Worker(QObject):
                             k = int(mask.feather) | 1
                             mask_img = cv2.GaussianBlur(mask_img, (k, k), 0)
                         projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
-                    elif mask.type == 'static':
+                    elif mask.type == 'static' or (mask.type == 'dynamic' and not mask.is_linked):
                         if not mask.source_points:
-                            projector_output = self.blend_frames(projector_output, cv2.resize(frame_cue, (w, h)), np.full((h, w), 255, dtype=np.uint8), mask.blend_mode)
+                            full_mask = np.full((h, w, 3), 255, dtype=np.uint8)
+                            projector_output = self.blend_frames(projector_output, cv2.resize(frame_cue, (w, h)), full_mask, mask.blend_mode)
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
                             dst_pts = np.float32(mask.source_points)
@@ -746,6 +864,20 @@ class Worker(QObject):
                                 k = int(mask.feather) | 1
                                 mask_img = cv2.GaussianBlur(mask_img, (k, k), 0)
                             projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
+
+                # Draw outlines on projector during calibration/alignment
+                if self.show_camera_on_projector:
+                    # Determine current points for outline
+                    if mask.type == 'dynamic' and mask.is_linked and self.last_homography is not None:
+                        src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
+                        draw_pts = cv2.perspectiveTransform(src_pts, self.last_homography).reshape(-1, 2).astype(np.int32)
+                    else:
+                        draw_pts = np.array(mask.source_points).astype(np.int32)
+
+                    if len(draw_pts) >= 3:
+                        cv2.polylines(projector_output, [draw_pts], True, (0, 255, 255), 2)
+                        cv2.putText(projector_output, f"{mask.tag or mask.name}", (draw_pts[0][0], draw_pts[0][1] - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             if self._capture_still_frame_flag:
                 rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
@@ -768,50 +900,30 @@ class Worker(QObject):
                     cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-            self.frame_ready.emit(QImage(rgb_main.data, w, h, w * 3, QImage.Format_RGB888).copy())
-
-            # 9-point grid warping (2x2 perspective blocks)
-            warped_output = np.zeros_like(projector_output)
-            wp = np.array(self.warp_points)
-            wp[:, 0] *= w
-            wp[:, 1] *= h
-
-            # Sub-grids: 0-1-4-3, 1-2-5-4, 3-4-7-6, 4-5-8-7
-            quads = [
-                (0, 1, 4, 3), (1, 2, 5, 4),
-                (3, 4, 7, 6), (4, 5, 8, 7)
-            ]
-
-            for i, (p1, p2, p3, p4) in enumerate(quads):
-                # Source sub-quad (linear grid)
-                src_x = (i % 2) * (w // 2)
-                src_y = (i // 2) * (h // 2)
-                src_q = np.float32([
-                    [src_x, src_y], [src_x + w // 2, src_y],
-                    [src_x + w // 2, src_y + h // 2], [src_x, src_y + h // 2]
-                ])
-
-                # Destination sub-quad
-                dst_q = np.float32([wp[p1], wp[p2], wp[p3], wp[p4]])
-
-                M = cv2.getPerspectiveTransform(src_q, dst_q)
-                quad_warp = cv2.warpPerspective(projector_output, M, (w, h))
-
-                # Mask for the quad
-                mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.fillConvexPoly(mask, np.int32(dst_q), 255)
-
-                warped_output = cv2.bitwise_and(warped_output, cv2.bitwise_not(cv2.merge([mask, mask, mask])))
-                warped_output = cv2.add(warped_output, cv2.bitwise_and(quad_warp, cv2.merge([mask, mask, mask])))
+            self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
 
             # Apply Master FX to the composition before warping
             if self.master_active_fx:
-                # Mock mask for apply_fx (uses tint and fx params)
                 from mask import Mask
                 master_proxy = Mask("Master", [], None)
                 master_proxy.active_fx = self.master_active_fx
                 master_proxy.tint_color = self.master_tint_color
                 projector_output = self.apply_fx(projector_output, master_proxy)
+
+            # 9-point grid warping (piecewise perspective optimization)
+            is_identity = True
+            for i, p in enumerate(self.warp_points):
+                if abs(p[0] - (i % 3) * 0.5) > 0.005 or abs(p[1] - (i // 3) * 0.5) > 0.005:
+                    is_identity = False
+                    break
+
+            if is_identity:
+                warped_output = projector_output
+            else:
+                if self.map_x is None or self.map_x.shape[:2] != (h, w) or self._warp_map_dirty:
+                    self._update_warp_maps(w, h)
+
+                warped_output = cv2.remap(projector_output, self.map_x, self.map_y, cv2.INTER_LINEAR)
 
             rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
             self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888).copy())
@@ -892,28 +1004,47 @@ class Worker(QObject):
         return colored
 
     def blend_frames(self, base, overlay, mask_img, mode):
+        # Ensure mask_img has the same number of channels as base
+        if len(mask_img.shape) == 2:
+            mask_img = cv2.merge([mask_img, mask_img, mask_img])
+
         if mode == 'normal':
             inv_mask = cv2.bitwise_not(mask_img)
             return cv2.add(cv2.bitwise_and(base, inv_mask), cv2.bitwise_and(overlay, mask_img))
+        elif mode == 'add':
+            overlay_masked = cv2.bitwise_and(overlay, mask_img)
+            return cv2.add(base, overlay_masked)
 
-        # Blending modes
-        mask_f = mask_img.astype(float) / 255.0
-        base_f = base.astype(float)
-        over_f = overlay.astype(float)
+        # Other modes still use float for now, but these are less common
+        mask_f = mask_img.astype(np.float32) / 255.0
+        base_f = base.astype(np.float32)
+        over_f = overlay.astype(np.float32)
 
-        if mode == 'add':
-            res = base_f + over_f * mask_f
-        elif mode == 'screen':
+        if mode == 'screen':
             res = 255 - ((255 - base_f) * (255 - over_f * mask_f) / 255.0)
         elif mode == 'multiply':
-            res = (base_f * (over_f * mask_f + (1-mask_f)*255)) / 255.0
+            res = (base_f * (over_f * mask_f + (1.0 - mask_f) * 255.0)) / 255.0
         else:
             return base # Fallback
 
         return np.clip(res, 0, 255).astype(np.uint8)
 
+    def normalize_points_to_reference(self, points):
+        """Converts points from current frame space to marker-config reference space."""
+        if self.last_homography is not None and len(points) > 0:
+            try:
+                inv_h = np.linalg.inv(self.last_homography)
+                pts = np.float32(points).reshape(-1, 1, 2)
+                ref_pts = cv2.perspectiveTransform(pts, inv_h).reshape(-1, 2)
+                return [ (float(p[0]), float(p[1])) for p in ref_pts]
+            except Exception as e:
+                print(f"Normalization error: {e}")
+        return points
+
     def stop(self): self._running = False
-    def set_warp_points(self, points): self.warp_points = points
+    def set_warp_points(self, points):
+        self.warp_points = points
+        self._warp_map_dirty = True
     def cleanup_resources(self):
         # Aggressively stop unused players
         current_cues = {mask.video_path for mask in self.masks if mask.video_path}

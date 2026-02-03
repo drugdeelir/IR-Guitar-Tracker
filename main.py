@@ -6,7 +6,8 @@ import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                              QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
-                             QDialog, QFormLayout, QInputDialog)
+                             QDialog, QFormLayout, QInputDialog, QTabWidget, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QAbstractItemView)
 from PyQt5.QtGui import QPixmap, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
@@ -43,7 +44,7 @@ class MIDIMappingDialog(QDialog):
 
         # Define actions
         self.actions = []
-        for tag_label, tag in [('Amp', 'amp'), ('BG', 'bg'), ('Master', 'master')]:
+        for tag_label, tag in [('Amp', 'amp'), ('BG', 'background'), ('Master', 'master')]:
             self.actions += [
                 (f'Toggle {tag_label} Visibility', f'toggle_{tag}'),
                 (f'{tag_label} Strobe', f'fx_{tag}_strobe'),
@@ -94,7 +95,7 @@ class MIDIMappingDialog(QDialog):
 
         for i in range(8):
             self.actions.append((f'Switch Amp to Cue {i+1}', f'cue_amp_{i}'))
-            self.actions.append((f'Switch BG to Cue {i+1}', f'cue_bg_{i}'))
+            self.actions.append((f'Switch BG to Cue {i+1}', f'cue_background_{i}'))
 
         self.actions.append(('Toggle Projector Splash', 'toggle_projector_splash'))
 
@@ -125,18 +126,20 @@ class ProjectionMappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projection Mapping Tool")
-        self.setGeometry(100, 100, 1200, 900)
+        self.setGeometry(100, 100, 1400, 950)
         self.masks = []
+        self.media_library = []
         self.selected_markers = []
         self.snapshots = [None] * 8
+        self.setup_step = 0 # 0: Camera, 1: Markers, 2: BG, 3: Amp, 4: Done
 
         # Default MIDI Mappings
         self.midi_mappings = {
             'cue_amp_0': ('note', 60), 'cue_amp_1': ('note', 61), 'cue_amp_2': ('note', 62), 'cue_amp_3': ('note', 63),
-            'cue_bg_0': ('note', 72), 'cue_bg_1': ('note', 73), 'cue_bg_2': ('note', 74), 'cue_bg_3': ('note', 75),
-            'toggle_amp': ('note', 48), 'toggle_bg': ('note', 50),
+            'cue_background_0': ('note', 72), 'cue_background_1': ('note', 73), 'cue_background_2': ('note', 74), 'cue_background_3': ('note', 75),
+            'toggle_amp': ('note', 48), 'toggle_background': ('note', 50),
             'fx_amp_strobe': ('cc', 20), 'fx_amp_blur': ('cc', 21), 'fx_amp_invert': ('cc', 22), 'fx_amp_edges': ('cc', 23), 'fx_amp_tint': ('cc', 24),
-            'fx_bg_strobe': ('cc', 30), 'fx_bg_blur': ('cc', 31), 'fx_bg_invert': ('cc', 32), 'fx_bg_edges': ('cc', 33), 'fx_bg_tint': ('cc', 34),
+            'fx_background_strobe': ('cc', 30), 'fx_background_blur': ('cc', 31), 'fx_background_invert': ('cc', 32), 'fx_background_edges': ('cc', 33), 'fx_background_tint': ('cc', 34),
         }
         self.learning_key = None
 
@@ -147,19 +150,21 @@ class ProjectionMappingApp(QMainWindow):
         self.layout = QHBoxLayout(self.central_widget)
 
         self.video_display = VideoDisplay()
-        self.video_display.setMinimumWidth(640)
+        self.video_display.setMinimumWidth(800)
         self.projector_window = ProjectorWindow()
 
-        from PyQt5.QtWidgets import QScrollArea
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.create_control_panel()
-        self.scroll_area.setWidget(self.control_panel)
+        self.tabs = QTabWidget()
+        self.create_setup_tab() # New Guided Setup Tab
+        self.create_workspace_tab()
+        self.create_media_tab()
+        self.create_calibration_tab()
+        self.create_system_tab()
+        self.create_diagnostics_tab()
 
         self.start_osc_server()
 
-        self.layout.addWidget(self.video_display, stretch=3)
-        self.layout.addWidget(self.scroll_area, stretch=1)
+        self.layout.addWidget(self.video_display, stretch=2)
+        self.layout.addWidget(self.tabs, stretch=1)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
 
         self.worker = Worker()
@@ -191,6 +196,66 @@ class ProjectionMappingApp(QMainWindow):
             if hasattr(self, 'mapping_dialog') and self.mapping_dialog.isVisible():
                 self.mapping_dialog.update_mappings()
             self.statusBar().showMessage(f"Mapped {msg_type} {number}", 3000)
+
+    def add_media_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Media Files", "", "All Supported (*.mp4 *.mkv *.avi *.mov *.jpg *.png *.jpeg *.bmp *.webp);;Videos (*.mp4 *.mkv *.avi *.mov);;Images (*.jpg *.png *.jpeg *.bmp *.webp)")
+        for f in files:
+            if f not in self.media_library:
+                self.media_library.append(f)
+                self.media_list.addItem(f.split('/')[-1])
+
+    def add_media_folder(self):
+        import os
+        path = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if path:
+            for f in os.listdir(path):
+                if f.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.jpg', '.png', '.jpeg', '.bmp', '.webp')):
+                    full_path = os.path.join(path, f).replace('\\', '/')
+                    if full_path not in self.media_library:
+                        self.media_library.append(full_path)
+                        self.media_list.addItem(f)
+
+    def assign_media_to_mask(self):
+        selected_media_indices = [idx.row() for idx in self.media_list.selectedIndexes()]
+        selected_mask_row = self.cue_table.currentRow()
+
+        if not selected_media_indices:
+            self.statusBar().showMessage("Select media from library first.", 3000)
+            return
+        if selected_mask_row < 0:
+            self.statusBar().showMessage("Select a mask from the table first.", 3000)
+            return
+
+        mask = self.masks[selected_mask_row]
+        mask.playlist = [self.media_library[i] for i in selected_media_indices]
+        mask.playlist_index = 0
+        if mask.playlist:
+            mask.video_path = mask.playlist[0]
+
+        self.update_cue_table()
+        self.worker.set_masks(self.masks)
+        self.statusBar().showMessage(f"Assigned {len(mask.playlist)} videos to {mask.name}", 3000)
+
+    def update_cue_table(self):
+        self.cue_table.setRowCount(len(self.masks))
+        for i, mask in enumerate(self.masks):
+            name_item = QTableWidgetItem(f"{mask.name} ({mask.tag})")
+            curr_video = mask.video_path.split('/')[-1] if mask.video_path else "None"
+            video_item = QTableWidgetItem(curr_video)
+            count_item = QTableWidgetItem(str(len(mask.playlist)))
+
+            self.cue_table.setItem(i, 0, name_item)
+            self.cue_table.setItem(i, 1, video_item)
+            self.cue_table.setItem(i, 2, count_item)
+
+    def on_mask_selected(self, row):
+        if 0 <= row < len(self.masks):
+            mask = self.masks[row]
+            self.mask_tag_combo.setCurrentText(mask.tag or "none")
+            self.mask_type_combo.setCurrentText(mask.type)
+            self.mask_blend_combo.setCurrentText(mask.blend_mode)
+            self.bezier_check.setChecked(mask.bezier_enabled)
+            self.mask_feather_slider.setValue(mask.feather)
 
     def open_marker_selection_dialog(self):
         self.marker_selection_dialog.clear_selection()
@@ -230,107 +295,286 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.clear_marker_config()
         self.statusBar().showMessage("Marker selection cleared.", 3000)
 
-    def create_control_panel(self):
-        self.control_panel = QWidget()
-        self.control_layout = QVBoxLayout(self.control_panel)
+    def create_setup_tab(self):
+        self.setup_tab = QWidget()
+        self.setup_layout = QVBoxLayout(self.setup_tab)
 
-        # Project management
-        project_group = QGroupBox("Project")
-        project_layout = QHBoxLayout()
-        self.save_button = QPushButton("Save Project")
+        self.setup_title = QLabel("<h2>Guided Setup</h2>")
+        self.setup_desc = QLabel("Welcome! Let's get your projection mapped. Follow the steps below.")
+        self.setup_desc.setWordWrap(True)
+
+        self.setup_layout.addWidget(self.setup_title)
+        self.setup_layout.addWidget(self.setup_desc)
+
+        self.setup_group = QGroupBox("Step 1: Select Camera")
+        self.setup_group_layout = QVBoxLayout()
+
+        self.setup_instruction = QLabel("Select your IR camera to begin.")
+        self.setup_group_layout.addWidget(self.setup_instruction)
+
+        self.setup_cam_combo = QComboBox()
+        self.setup_cam_combo.addItems([f"Camera {i}" for i in self.available_cameras])
+        self.setup_cam_combo.currentIndexChanged.connect(self.change_camera)
+        self.setup_group_layout.addWidget(self.setup_cam_combo)
+
+        self.setup_next_btn = QPushButton("Next Step")
+        self.setup_next_btn.setMinimumHeight(50)
+        self.setup_next_btn.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold;")
+        self.setup_next_btn.clicked.connect(self.next_setup_step)
+
+        self.setup_group.setLayout(self.setup_group_layout)
+        self.setup_layout.addWidget(self.setup_group)
+        self.setup_layout.addWidget(self.setup_next_btn)
+
+        self.setup_layout.addStretch()
+        self.tabs.insertTab(0, self.setup_tab, "Setup Wizard")
+
+    def next_setup_step(self):
+        self.setup_step += 1
+        if self.setup_step == 1: # Markers
+            self.setup_group.setTitle("Step 2: Calibrate Guitar Markers")
+            self.setup_instruction.setText("1. Point camera at your guitar.\n2. Click the button below to start calibration.\n3. Snap to 4 points on your guitar.")
+            btn = QPushButton("Open Marker Calibration")
+            btn.clicked.connect(self.open_marker_selection_dialog)
+            self.setup_group_layout.addWidget(btn)
+        elif self.setup_step == 2: # Background
+            self.setup_group.setTitle("Step 3: Background Mask")
+            self.setup_instruction.setText("Create a mask for your background projection area.")
+            btn = QPushButton("Start Drawing Background Mask")
+            btn.clicked.connect(self.start_setup_bg_mask)
+            self.setup_group_layout.addWidget(btn)
+        elif self.setup_step == 3: # Amp
+            self.setup_group.setTitle("Step 4: Amp Mask")
+            self.setup_instruction.setText("Create a mask for your amplifier.")
+            btn = QPushButton("Start Drawing Amp Mask")
+            btn.clicked.connect(self.start_setup_amp_mask)
+            self.setup_group_layout.addWidget(btn)
+        elif self.setup_step == 4: # Done
+            self.setup_group.setTitle("Setup Complete")
+            self.setup_instruction.setText("Setup finished! Switching to Performance Mode.")
+            self.setup_next_btn.setText("Enter Performance Mode")
+            self.setup_next_btn.clicked.disconnect()
+            self.setup_next_btn.clicked.connect(self.enter_performance_mode)
+
+    def start_setup_bg_mask(self):
+        # Ensure a background cue exists
+        bg_mask = None
+        for m in self.masks:
+            if m.tag == 'background':
+                bg_mask = m
+                break
+
+        if not bg_mask:
+            bg_mask = Mask("Background", [], None, tag="background", mask_type="static")
+            self.masks.append(bg_mask)
+            self.cue_list_widget.addItem("Background")
+            self.update_cue_table()
+
+        idx = self.masks.index(bg_mask)
+        self.cue_list_widget.setCurrentRow(idx)
+        self.enter_mask_creation_mode()
+
+    def start_setup_amp_mask(self):
+        amp_mask = None
+        for m in self.masks:
+            if m.tag == 'amp':
+                amp_mask = m
+                break
+
+        if not amp_mask:
+            amp_mask = Mask("Amp", [], None, tag="amp", mask_type="dynamic")
+            self.masks.append(amp_mask)
+            self.cue_list_widget.addItem("Amp")
+            self.update_cue_table()
+
+        idx = self.masks.index(amp_mask)
+        self.cue_list_widget.setCurrentRow(idx)
+        self.enter_mask_creation_mode()
+
+    def enter_performance_mode(self):
+        # Switch to the Stage tab (which has basic performance controls)
+        # or we could hide the tabs entirely and just show the video.
+        # Let's try hiding the sidebar (tabs)
+        self.tabs.hide()
+        self.video_display.setMinimumWidth(1200) # Take more space
+
+        # Add a floating button or status bar button to exit
+        self.exit_perf_btn = QPushButton("EXIT PERFORMANCE MODE")
+        self.exit_perf_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; height: 40px;")
+        self.exit_perf_btn.clicked.connect(self.exit_performance_mode)
+        self.layout.addWidget(self.exit_perf_btn)
+
+        self.statusBar().showMessage("PERFORMANCE MODE ACTIVE - Listening for MIDI/OSC", 0)
+
+    def exit_performance_mode(self):
+        self.tabs.show()
+        if hasattr(self, 'exit_perf_btn'):
+            self.layout.removeWidget(self.exit_perf_btn)
+            self.exit_perf_btn.deleteLater()
+            del self.exit_perf_btn
+        self.video_display.setMinimumWidth(800)
+        self.statusBar().showMessage("Configuration Mode", 3000)
+
+    def create_workspace_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Project controls
+        proj_group = QGroupBox("Project")
+        proj_layout = QHBoxLayout()
+        self.save_button = QPushButton("Save")
         self.save_button.clicked.connect(self.save_project)
-        self.load_button = QPushButton("Load Project")
+        self.load_button = QPushButton("Load")
         self.load_button.clicked.connect(self.load_project)
-        self.help_button = QPushButton("Help: MainStage Setup")
-        self.help_button.clicked.connect(self.open_help)
-        project_layout.addWidget(self.save_button)
-        project_layout.addWidget(self.load_button)
-        project_layout.addWidget(self.help_button)
-        project_group.setLayout(project_layout)
-        self.control_layout.addWidget(project_group)
+        proj_layout.addWidget(self.save_button)
+        proj_layout.addWidget(self.load_button)
+        proj_group.setLayout(proj_layout)
+        layout.addWidget(proj_group)
 
-        # Camera selection
-        camera_group = QGroupBox("Camera")
-        camera_layout = QVBoxLayout()
-        self.camera_combo = QComboBox()
-        self.available_cameras = get_available_cameras()
-        self.camera_combo.addItems([f"Camera {i}" for i in self.available_cameras])
-        self.camera_combo.currentIndexChanged.connect(self.change_camera)
-        camera_layout.addWidget(self.camera_combo)
-        camera_group.setLayout(camera_layout)
-        self.control_layout.addWidget(camera_group)
+        # Mask Creation
+        mask_group = QGroupBox("Mask Editor")
+        mask_layout = QVBoxLayout()
 
-        # MIDI Settings
-        midi_group = QGroupBox("MIDI Settings")
-        midi_layout = QVBoxLayout()
-        self.midi_combo = QComboBox()
-        self.midi_ports = get_midi_ports()
-        self.midi_combo.addItems(["None"] + self.midi_ports)
-        self.midi_combo.currentIndexChanged.connect(self.change_midi_port)
-        midi_layout.addWidget(QLabel("MIDI Input Port:"))
-        midi_layout.addWidget(self.midi_combo)
-
-        self.midi_map_btn = QPushButton("Configure MIDI Mappings")
-        self.midi_map_btn.clicked.connect(self.open_midi_mapping)
-        midi_layout.addWidget(self.midi_map_btn)
-
-        self.bpm_label = QLabel("BPM: 120.0")
-        midi_layout.addWidget(self.bpm_label)
-        midi_group.setLayout(midi_layout)
-        self.control_layout.addWidget(midi_group)
-
-        # Projector selection
-        projector_group = QGroupBox("Projector Display")
-        projector_layout = QVBoxLayout()
-        self.projector_combo = QComboBox()
-        self.screens = QApplication.screens()
-        self.projector_combo.addItems([screen.name() or f"Screen {i+1}" for i, screen in enumerate(self.screens)])
-        self.projector_combo.currentIndexChanged.connect(self.change_projector)
-        projector_layout.addWidget(self.projector_combo)
-        projector_group.setLayout(projector_layout)
-        self.control_layout.addWidget(projector_group)
-
-        # Cue system
-        cue_group = QGroupBox("Cues")
-        cue_layout = QVBoxLayout()
         self.cue_list_widget = QListWidget()
-        self.add_cue_button = QPushButton("Add Video Cue")
-        self.add_gen_button = QPushButton("Add VJ Generator")
-        self.add_gen_button.clicked.connect(self.add_vj_generator)
-        self.add_cue_button.clicked.connect(self.add_cue)
-        self.remove_cue_button = QPushButton("Remove Cue")
+        self.cue_list_widget.currentRowChanged.connect(self.on_mask_selected)
+        mask_layout.addWidget(self.cue_list_widget)
+
+        btn_layout = QHBoxLayout()
+        self.create_mask_button = QPushButton("New Mask")
+        self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
+        self.remove_cue_button = QPushButton("Delete")
         self.remove_cue_button.clicked.connect(self.remove_cue)
-        self.move_up_button = QPushButton("Move Layer Up")
-        self.move_up_button.clicked.connect(self.move_cue_up)
-        self.move_down_button = QPushButton("Move Layer Down")
-        self.move_down_button.clicked.connect(self.move_cue_down)
+        btn_layout.addWidget(self.create_mask_button)
+        btn_layout.addWidget(self.remove_cue_button)
+        mask_layout.addLayout(btn_layout)
 
-        cue_layout.addWidget(self.cue_list_widget)
-        cue_layout.addWidget(self.add_cue_button)
-        cue_layout.addWidget(self.add_gen_button)
-        cue_layout.addWidget(self.remove_cue_button)
-        cue_layout.addWidget(self.move_up_button)
-        cue_layout.addWidget(self.move_down_button)
+        form = QFormLayout()
+        self.mask_tag_combo = QComboBox()
+        self.mask_tag_combo.addItems(["none", "amp", "background", "instrument"])
+        form.addRow("Tag:", self.mask_tag_combo)
+
+        self.mask_type_combo = QComboBox()
+        self.mask_type_combo.addItems(["dynamic", "static"])
+        form.addRow("Type:", self.mask_type_combo)
+
+        self.mask_blend_combo = QComboBox()
+        self.mask_blend_combo.addItems(["normal", "add", "screen", "multiply"])
+        form.addRow("Blend:", self.mask_blend_combo)
+
+        self.bezier_check = QCheckBox("Bezier Curves")
+        form.addRow(self.bezier_check)
+
+        self.mask_feather_slider = QSlider(Qt.Horizontal)
+        self.mask_feather_slider.setRange(0, 100)
+        form.addRow("Feather:", self.mask_feather_slider)
+
+        mask_layout.addLayout(form)
+
+        edit_btns = QHBoxLayout()
+        self.finish_mask_button = QPushButton("SAVE POINTS")
+        self.finish_mask_button.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
+        self.finish_mask_button.clicked.connect(self.finish_mask_creation)
+        self.finish_mask_button.setEnabled(False)
+        self.cancel_mask_button = QPushButton("Cancel")
+        self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
+        self.cancel_mask_button.setEnabled(False)
+        edit_btns.addWidget(self.finish_mask_button)
+        edit_btns.addWidget(self.cancel_mask_button)
+        mask_layout.addLayout(edit_btns)
+
+        self.link_mask_button = QPushButton("Link to IR Tracking")
+        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
+        mask_layout.addWidget(self.link_mask_button)
+
+        mask_group.setLayout(mask_layout)
+        layout.addWidget(mask_group)
+
+        # FX Controls
+        fx_group = QGroupBox("Performance")
+        fx_layout = QVBoxLayout()
+        self.splash_check = QPushButton("START SHOW (Disable Splash)")
+        self.splash_check.setCheckable(True)
+        self.splash_check.toggled.connect(self.toggle_splash_mode)
+        fx_layout.addWidget(self.splash_check)
+
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(["none", "acid", "noir", "retro"])
+        self.style_combo.currentIndexChanged.connect(lambda i: self.worker.set_style(self.style_combo.currentText()))
+        fx_layout.addWidget(QLabel("Global Style:"))
+        fx_layout.addWidget(self.style_combo)
+
+        fx_group.setLayout(fx_layout)
+        layout.addWidget(fx_group)
+
+        layout.addStretch()
+        self.tabs.addTab(tab, "Stage")
+
+    def create_media_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+
+        # Left: Media Library
+        lib_group = QGroupBox("Media Library")
+        lib_layout = QVBoxLayout()
+        self.media_list = QListWidget()
+        self.media_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lib_layout.addWidget(self.media_list)
+
+        lib_btns = QHBoxLayout()
+        add_btn = QPushButton("Add Files")
+        add_btn.clicked.connect(self.add_media_files)
+        add_dir_btn = QPushButton("Add Folder")
+        add_dir_btn.clicked.connect(self.add_media_folder)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.media_list.clear)
+        gen_btn = QPushButton("Add Generator")
+        gen_btn.clicked.connect(self.add_vj_generator_to_lib)
+        lib_btns.addWidget(add_btn)
+        lib_btns.addWidget(add_dir_btn)
+        lib_btns.addWidget(gen_btn)
+        lib_btns.addWidget(clear_btn)
+        lib_layout.addLayout(lib_btns)
+        lib_group.setLayout(lib_layout)
+        layout.addWidget(lib_group, 1)
+
+        # Right: Cue Playlists
+        cue_group = QGroupBox("Cue Management")
+        cue_layout = QVBoxLayout()
+
+        self.cue_table = QTableWidget(0, 3)
+        self.cue_table.setHorizontalHeaderLabels(["Mask / Tag", "Current Video", "Playlist Count"])
+        self.cue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.cue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        cue_layout.addWidget(self.cue_table)
+
+        assign_btn = QPushButton("Assign Selected Media to Mask Playlist")
+        assign_btn.setStyleSheet("height: 40px; font-weight: bold;")
+        assign_btn.clicked.connect(self.assign_media_to_mask)
+        cue_layout.addWidget(assign_btn)
+
         cue_group.setLayout(cue_layout)
-        self.control_layout.addWidget(cue_group)
+        layout.addWidget(cue_group, 2)
 
-        # Warping controls
-        warping_group = QGroupBox("Projector Warping")
-        warping_layout = QVBoxLayout()
-        self.enable_warping_button = QPushButton("Enable Warping")
+        self.tabs.addTab(tab, "Media & Cues")
+
+    def create_calibration_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        warp_group = QGroupBox("Projector Warping (3x3 Grid)")
+        warp_layout = QVBoxLayout()
+        self.enable_warping_button = QPushButton("ENABLE ALIGNMENT MODE")
         self.enable_warping_button.setCheckable(True)
         self.enable_warping_button.toggled.connect(self.toggle_warping)
-        self.reset_warping_button = QPushButton("Reset Warping")
+        self.reset_warping_button = QPushButton("Reset Grid")
         self.reset_warping_button.clicked.connect(self.projector_window.reset_warp_points)
-        warping_layout.addWidget(self.enable_warping_button)
-        warping_layout.addWidget(self.reset_warping_button)
-        warping_group.setLayout(warping_layout)
-        self.control_layout.addWidget(warping_group)
+        warp_layout.addWidget(self.enable_warping_button)
+        warp_layout.addWidget(self.reset_warping_button)
+        warp_group.setLayout(warp_layout)
+        layout.addWidget(warp_group)
         
-        # IR Tracking controls
         ir_group = QGroupBox("IR Tracking")
         ir_layout = QVBoxLayout()
-
         self.auto_ir_check = QCheckBox("Auto Threshold")
         self.auto_ir_check.toggled.connect(self.toggle_auto_ir)
         ir_layout.addWidget(self.auto_ir_check)
@@ -339,241 +583,105 @@ class ProjectionMappingApp(QMainWindow):
         self.ir_threshold_slider.setRange(0, 255)
         self.ir_threshold_slider.setValue(200)
         self.ir_threshold_slider.valueChanged.connect(self.update_ir_threshold)
-        self.ir_trackers_label = QLabel("Trackers detected: 0")
         ir_layout.addWidget(QLabel("IR Threshold:"))
         ir_layout.addWidget(self.ir_threshold_slider)
+
+        self.ir_trackers_label = QLabel("Trackers detected: 0")
         ir_layout.addWidget(self.ir_trackers_label)
 
-        self.select_markers_button = QPushButton("Select Guitar Markers")
+        self.select_markers_button = QPushButton("Calibrate Guitar Markers")
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
-
-        self.clear_markers_button = QPushButton("Clear Marker Selection")
-        self.clear_markers_button.clicked.connect(self.clear_marker_selection)
-
         ir_layout.addWidget(self.select_markers_button)
-        ir_layout.addWidget(self.clear_markers_button)
 
         ir_group.setLayout(ir_layout)
-        self.control_layout.addWidget(ir_group)
+        layout.addWidget(ir_group)
 
-        # Mask creation
-        mask_group = QGroupBox("Mask Creation")
-        mask_layout = QVBoxLayout()
-        self.create_mask_button = QPushButton("Create Mask")
-        self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
-
-        self.mask_tag_combo = QComboBox()
-        self.mask_tag_combo.addItems(["none", "amp", "background"])
-        mask_layout.addWidget(QLabel("Mask Tag:"))
-        mask_layout.addWidget(self.mask_tag_combo)
-
-        self.mask_type_combo = QComboBox()
-        self.mask_type_combo.addItems(["dynamic", "static"])
-        mask_layout.addWidget(QLabel("Mask Type:"))
-        mask_layout.addWidget(self.mask_type_combo)
-
-        self.mask_design_combo = QComboBox()
-        self.mask_design_combo.addItems(["none", "spiral", "moon", "mushroom", "star", "hexagon", "heart"])
-        mask_layout.addWidget(QLabel("Design Overlay:"))
-        mask_layout.addWidget(self.mask_design_combo)
-
-        self.lfo_target_combo = QComboBox()
-        self.lfo_target_combo.addItems(["none", "blur", "tint", "rgb_shift", "hue"])
-        mask_layout.addWidget(QLabel("LFO Target:"))
-        mask_layout.addWidget(self.lfo_target_combo)
-
-        self.mask_blend_combo = QComboBox()
-        self.mask_blend_combo.addItems(["normal", "add", "screen", "multiply"])
-        mask_layout.addWidget(QLabel("Blend Mode:"))
-        mask_layout.addWidget(self.mask_blend_combo)
-
-        self.bezier_check = QCheckBox("Bezier (Curved) Mask")
-        mask_layout.addWidget(self.bezier_check)
-
-        self.lfo_shape_combo = QComboBox()
-        self.lfo_shape_combo.addItems(["sine", "square", "triangle", "sawtooth"])
-        mask_layout.addWidget(QLabel("LFO Shape:"))
-        mask_layout.addWidget(self.lfo_shape_combo)
-
-        self.mask_feather_slider = QSlider(Qt.Horizontal)
-        self.mask_feather_slider.setRange(0, 100)
-        self.mask_feather_slider.setValue(0)
-        mask_layout.addWidget(QLabel("Mask Feathering:"))
-        mask_layout.addWidget(self.mask_feather_slider)
-
-        self.video_bpm_input = QLineEdit("120.0")
-        mask_layout.addWidget(QLabel("Video Native BPM:"))
-        mask_layout.addWidget(self.video_bpm_input)
-
-        self.finish_mask_button = QPushButton("Update / Finish Mask")
-        self.finish_mask_button.clicked.connect(self.finish_mask_creation)
-        self.finish_mask_button.setEnabled(False)
-        self.cancel_mask_button = QPushButton("Cancel")
-        self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
-        self.cancel_mask_button.setEnabled(False)
-        self.mask_points_list = QListWidget()
-
-        mask_layout.addWidget(self.create_mask_button)
-        mask_layout.addWidget(self.finish_mask_button)
-        mask_layout.addWidget(self.cancel_mask_button)
-        mask_layout.addWidget(self.mask_points_list)
-
-        self.link_mask_button = QPushButton("Link Mask to Markers")
-        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
-        mask_layout.addWidget(self.link_mask_button)
-
-        mask_group.setLayout(mask_layout)
-        self.control_layout.addWidget(mask_group)
-
-        # Depth Estimation
-        depth_group = QGroupBox("Depth Estimation")
-        depth_layout = QVBoxLayout()
+        depth_group = QGroupBox("Depth & Smoothing")
+        depth_layout = QFormLayout()
         self.calibrate_depth_button = QPushButton("Calibrate Depth")
         self.calibrate_depth_button.clicked.connect(self.calibrate_depth)
+        depth_layout.addRow(self.calibrate_depth_button)
 
         self.smoothing_slider = QSlider(Qt.Horizontal)
         self.smoothing_slider.setRange(0, 100)
         self.smoothing_slider.setValue(50)
         self.smoothing_slider.valueChanged.connect(self.update_smoothing)
-        depth_layout.addWidget(QLabel("Smoothing:"))
-        depth_layout.addWidget(self.smoothing_slider)
-
-        self.depth_sensitivity_slider = QSlider(Qt.Horizontal)
-        self.depth_sensitivity_slider.setRange(0, 200)
-        self.depth_sensitivity_slider.setValue(100)
-        self.depth_sensitivity_slider.valueChanged.connect(self.update_depth_sensitivity)
-        self.depth_calibration_label = QLabel("Not calibrated")
-        depth_layout.addWidget(self.calibrate_depth_button)
-        depth_layout.addWidget(QLabel("Sensitivity:"))
-        depth_layout.addWidget(self.depth_sensitivity_slider)
-        depth_layout.addWidget(self.depth_calibration_label)
+        depth_layout.addRow("Smoothing:", self.smoothing_slider)
         depth_group.setLayout(depth_layout)
-        self.control_layout.addWidget(depth_group)
+        layout.addWidget(depth_group)
 
-        # Performance FX
-        perf_group = QGroupBox("Performance FX")
-        perf_layout = QVBoxLayout()
+        layout.addStretch()
+        self.tabs.addTab(tab, "Calibration")
 
-        self.particle_combo = QComboBox()
-        self.particle_combo.addItems(["none", "dust", "rain"])
-        self.particle_combo.currentIndexChanged.connect(lambda i: self.worker.set_particle_preset(self.particle_combo.currentText()))
-        perf_layout.addWidget(QLabel("Particles:"))
-        perf_layout.addWidget(self.particle_combo)
+    def create_system_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
 
-        self.proximity_combo = QComboBox()
-        self.proximity_combo.addItems(["none", "kaleidoscope", "glitch", "rgb_shift"])
-        self.proximity_combo.currentIndexChanged.connect(lambda i: self.worker.set_proximity_mode(self.proximity_combo.currentText()))
-        perf_layout.addWidget(QLabel("Proximity Mod:"))
-        perf_layout.addWidget(self.proximity_combo)
+        # Camera
+        cam_group = QGroupBox("Camera")
+        cam_layout = QVBoxLayout()
+        self.camera_combo = QComboBox()
+        self.available_cameras = get_available_cameras()
+        self.camera_combo.addItems([f"Camera {i}" for i in self.available_cameras])
+        self.camera_combo.currentIndexChanged.connect(self.change_camera)
+        cam_layout.addWidget(self.camera_combo)
+        cam_group.setLayout(cam_layout)
+        layout.addWidget(cam_group)
 
-        self.style_combo = QComboBox()
-        self.style_combo.addItems(["none", "acid", "noir", "retro"])
-        self.style_combo.currentIndexChanged.connect(lambda i: self.worker.set_style(self.style_combo.currentText()))
-        perf_layout.addWidget(QLabel("Visual Style:"))
-        perf_layout.addWidget(self.style_combo)
+        # Display
+        disp_group = QGroupBox("Projector Display")
+        disp_layout = QVBoxLayout()
+        self.projector_combo = QComboBox()
+        self.screens = QApplication.screens()
+        self.projector_combo.addItems([screen.name() or f"Screen {i+1}" for i, screen in enumerate(self.screens)])
+        self.projector_combo.currentIndexChanged.connect(self.change_projector)
+        disp_layout.addWidget(self.projector_combo)
+        disp_group.setLayout(disp_layout)
+        layout.addWidget(disp_group)
 
-        self.auto_pilot_check = QCheckBox("Auto-Pilot Mode")
-        self.auto_pilot_check.toggled.connect(lambda c: setattr(self.worker, 'auto_pilot', c))
-        perf_layout.addWidget(self.auto_pilot_check)
+        # MIDI
+        midi_group = QGroupBox("MIDI")
+        midi_layout = QVBoxLayout()
+        self.midi_combo = QComboBox()
+        self.midi_ports = get_midi_ports()
+        self.midi_combo.addItems(["None"] + self.midi_ports)
+        self.midi_combo.currentIndexChanged.connect(self.change_midi_port)
+        midi_layout.addWidget(self.midi_combo)
+        self.midi_map_btn = QPushButton("Edit MIDI Mappings")
+        self.midi_map_btn.clicked.connect(self.open_midi_mapping)
+        midi_layout.addWidget(self.midi_map_btn)
+        self.bpm_label = QLabel("BPM: 120.0")
+        midi_layout.addWidget(self.bpm_label)
 
-        self.hud_check = QCheckBox("Show Debug HUD")
-        self.hud_check.setChecked(True)
-        self.hud_check.toggled.connect(lambda c: setattr(self.worker, 'show_hud', c))
-        perf_layout.addWidget(self.hud_check)
+        self.help_button = QPushButton("Open MainStage Ethernet Setup Guide")
+        self.help_button.clicked.connect(self.open_help)
+        midi_layout.addWidget(self.help_button)
 
-        self.safety_check = QCheckBox("Safety Fallback Mode")
-        self.safety_check.setChecked(True)
-        self.safety_check.toggled.connect(lambda c: setattr(self.worker, 'safety_mode_enabled', c))
-        perf_layout.addWidget(self.safety_check)
+        midi_group.setLayout(midi_layout)
+        layout.addWidget(midi_group)
 
-        self.splash_check = QPushButton("Show Splash on Projector")
-        self.splash_check.setCheckable(True)
-        self.splash_check.toggled.connect(self.toggle_splash_mode)
-        perf_layout.addWidget(self.splash_check)
+        layout.addStretch()
+        self.tabs.addTab(tab, "System")
 
-        perf_group.setLayout(perf_layout)
-        self.control_layout.addWidget(perf_group)
+    def create_diagnostics_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
 
-        # Master Output FX & Color Moods
-        master_group = QGroupBox("Master & Global Looks")
-        master_layout = QVBoxLayout()
+        self.diag_log = QListWidget()
+        layout.addWidget(QLabel("MIDI / OSC Message Log:"))
+        layout.addWidget(self.diag_log)
 
-        self.mood_combo = QComboBox()
-        self.moods = {
-            "Default": None,
-            "Cyberpunk": ((255, 0, 255), (255, 255, 0)), # Magenta, Cyan
-            "Ocean": ((255, 0, 0), (255, 255, 0)), # Blue, Cyan
-            "Inferno": ((0, 0, 255), (0, 127, 255)), # Red, Orange
-            "Toxic": ((0, 255, 0), (0, 255, 127)), # Green, Lime
-        }
-        self.mood_combo.addItems(self.moods.keys())
-        self.mood_combo.currentIndexChanged.connect(self.apply_mood)
-        master_layout.addWidget(QLabel("Global Color Mood:"))
-        master_layout.addWidget(self.mood_combo)
+        clear_btn = QPushButton("Clear Log")
+        clear_btn.clicked.connect(self.diag_log.clear)
+        layout.addWidget(clear_btn)
 
-        master_layout.addWidget(QLabel("Master FX:"))
-        self.master_fx_list = ["strobe", "blur", "invert", "edges", "rgb_shift", "glitch", "trails", "hue_cycle"]
-        for fx in self.master_fx_list:
-            cb = QCheckBox(fx.title())
-            cb.toggled.connect(lambda checked, f=fx: self.worker.set_fx('master', f, checked))
-            master_layout.addWidget(cb)
-        master_group.setLayout(master_layout)
-        self.control_layout.addWidget(master_group)
+        self.tabs.addTab(tab, "Connectivity")
 
-        # Audio Settings
-        audio_group = QGroupBox("Audio Reactivity")
-        audio_layout = QVBoxLayout()
-
-        self.audio_combo = QComboBox()
-        self.audio_devices = ["None"]
-        try:
-            from audio_handler import get_audio_devices
-            devices = get_audio_devices()
-            self.audio_devices += [d['name'] for d in devices if d['max_input_channels'] > 0]
-        except Exception: pass
-        self.audio_combo.addItems(self.audio_devices)
-        self.audio_combo.currentIndexChanged.connect(self.change_audio_device)
-        audio_layout.addWidget(QLabel("Input Device:"))
-        audio_layout.addWidget(self.audio_combo)
-
-        self.audio_target_combo = QComboBox()
-        self.audio_target_combo.addItems(["none", "strobe", "glitch", "scale"])
-        self.audio_target_combo.currentIndexChanged.connect(lambda i: self.worker.set_audio_target(self.audio_target_combo.currentText()))
-        audio_layout.addWidget(QLabel("Reactive Target:"))
-        audio_layout.addWidget(self.audio_target_combo)
-
-        self.audio_gain_slider = QSlider(Qt.Horizontal)
-        self.audio_gain_slider.setRange(0, 400)
-        self.audio_gain_slider.setValue(100)
-        self.audio_gain_slider.valueChanged.connect(lambda v: self.worker.set_audio_gain(v / 100.0))
-        audio_layout.addWidget(QLabel("Audio Gain:"))
-        audio_layout.addWidget(self.audio_gain_slider)
-
-        self.audio_mappings_layout = QFormLayout()
-        self.audio_target_fx = ["blur", "glitch", "rgb_shift", "tint", "hue_cycle"]
-        self.audio_combos = {}
-        for fx in self.audio_target_fx:
-            cb = QComboBox()
-            cb.addItems(["None", "Bass", "Mid", "High"])
-            cb.currentIndexChanged.connect(lambda i, f=fx: self.worker.set_audio_param_mapping(f, i-1))
-            self.audio_mappings_layout.addRow(f"{fx.title()} Mod:", cb)
-            self.audio_combos[fx] = cb
-        audio_layout.addLayout(self.audio_mappings_layout)
-
-        audio_group.setLayout(audio_layout)
-        self.control_layout.addWidget(audio_group)
-
-        # Snapshots
-        snap_group = QGroupBox("Snapshots")
-        snap_layout = QHBoxLayout()
-        for i in range(4): # 4 buttons for quick recall
-            btn = QPushButton(f"S{i+1}")
-            btn.clicked.connect(lambda checked, idx=i: self.load_snapshot(idx))
-            snap_layout.addWidget(btn)
-        snap_group.setLayout(snap_layout)
-        self.control_layout.addWidget(snap_group)
-
-        self.control_layout.addStretch()
+    def log_message(self, msg):
+        item = QTableWidgetItem(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        self.diag_log.insertItem(0, f"[{time.strftime('%H:%M:%S')}] {msg}")
+        if self.diag_log.count() > 100:
+            self.diag_log.takeItem(self.diag_log.count() - 1)
 
     def start_osc_server(self):
         self.osc_handler = OSCHandler()
@@ -581,13 +689,13 @@ class ProjectionMappingApp(QMainWindow):
         self.osc_handler.start()
 
     def handle_osc_message(self, address, args):
-        # Example: /mask/amp/visible 1
-        # Example: /mask/amp/fx/blur 0.5
+        self.log_message(f"OSC: {address} {args}")
         parts = address.strip('/').split('/')
         if not parts: return
 
         if parts[0] == 'mask' and len(parts) >= 3:
             tag = parts[1]
+            if tag == 'bg': tag = 'background' # Standardize
             action = parts[2]
             val = args[0] if args else 0
 
@@ -598,6 +706,8 @@ class ProjectionMappingApp(QMainWindow):
                 self.worker.set_fx(tag, fx_name, val > 0.5)
             elif action == 'video' and args:
                 self.worker.switch_video(tag, str(args[0]))
+            elif action == 'cue' and args:
+                self.worker.switch_cue(tag, int(args[0]))
         elif parts[0] == 'style' and args:
             self.worker.set_style(str(args[0]))
         elif parts[0] == 'snapshot' and args:
@@ -639,6 +749,7 @@ class ProjectionMappingApp(QMainWindow):
         if filename:
             project_data = {
                 'masks': [mask.to_dict() for mask in self.masks],
+                'media_library': self.media_library,
                 'warp_points': self.projector_window.get_warp_points_normalized(),
                 'ir_threshold': self.ir_threshold_slider.value(),
                 'auto_ir': self.auto_ir_check.isChecked(),
@@ -665,8 +776,14 @@ class ProjectionMappingApp(QMainWindow):
                     data = json.load(f)
 
                 self.masks = [Mask.from_dict(d) for d in data.get('masks', [])]
+                self.media_library = data.get('media_library', [])
+                self.media_list.clear()
+                for f in self.media_library:
+                    self.media_list.addItem(f.split('/')[-1])
+
                 self.cue_list_widget.clear()
                 self.cue_list_widget.addItems([mask.name for mask in self.masks])
+                self.update_cue_table()
                 self.worker.set_masks(self.masks)
 
                 warp_points = data.get('warp_points')
@@ -718,6 +835,7 @@ class ProjectionMappingApp(QMainWindow):
             self.midi_handler.beat.connect(self.handle_bpm)
             self.midi_handler.beat_pulse.connect(self.handle_beat_pulse)
             self.midi_handler.learned_message.connect(self.handle_learned_message)
+            self.midi_handler.message_received.connect(self.log_message)
             self.midi_thread.started.connect(self.midi_handler.start_listening)
             self.midi_thread.start()
 
@@ -760,15 +878,13 @@ class ProjectionMappingApp(QMainWindow):
     def execute_midi_action(self, key, value):
         if key.startswith('cue_amp_'):
             idx = int(key.split('_')[-1])
-            if idx < len(self.masks):
-                self.worker.switch_video('amp', self.masks[idx].video_path)
-        elif key.startswith('cue_bg_'):
+            self.worker.switch_cue('amp', idx)
+        elif key.startswith('cue_background_'):
             idx = int(key.split('_')[-1])
-            if idx < len(self.masks):
-                self.worker.switch_video('background', self.masks[idx].video_path)
+            self.worker.switch_cue('background', idx)
         elif key == 'toggle_amp':
             self.worker.toggle_mask('amp', value > 0)
-        elif key == 'toggle_bg':
+        elif key == 'toggle_background':
             self.worker.toggle_mask('background', value > 0)
         elif key.startswith('fx_'):
             parts = key.split('_')
@@ -879,51 +995,54 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
 
     def enter_mask_creation_mode(self):
+        if self.cue_list_widget.currentRow() < 0:
+            mask_name, ok = QInputDialog.getText(self, "New Mask", "Enter Name for new mask:")
+            if not ok or not mask_name: return
+            new_mask = Mask(mask_name, [], None)
+            self.masks.append(new_mask)
+            self.cue_list_widget.addItem(mask_name)
+            self.cue_list_widget.setCurrentRow(len(self.masks)-1)
+            self.update_cue_table()
+
         self.video_display.set_mask_creation_mode(True)
         self.create_mask_button.setEnabled(False)
         self.finish_mask_button.setEnabled(True)
         self.cancel_mask_button.setEnabled(True)
 
     def finish_mask_creation(self):
+        mask_points = list(self.video_display.get_mask_points())
         self.video_display.set_mask_creation_mode(False)
-        mask_points = self.video_display.get_mask_points()
         
         current_item = self.cue_list_widget.currentItem()
         if current_item and mask_points:
             row = self.cue_list_widget.row(current_item)
             if 0 <= row < len(self.masks):
-                self.masks[row].source_points = [ (p.x(), p.y()) for p in mask_points]
-                self.masks[row].tag = self.mask_tag_combo.currentText()
-                self.masks[row].type = self.mask_type_combo.currentText()
-                self.masks[row].design_overlay = self.mask_design_combo.currentText()
-                self.masks[row].fx_params['lfo_target'] = self.lfo_target_combo.currentText()
-                self.masks[row].fx_params['lfo_shape'] = self.lfo_shape_combo.currentText()
-                self.masks[row].blend_mode = self.mask_blend_combo.currentText()
-                self.masks[row].bezier_enabled = self.bezier_check.isChecked()
-                self.masks[row].feather = self.mask_feather_slider.value()
-                try:
-                    self.masks[row].video_bpm = float(self.video_bpm_input.text())
-                except ValueError:
-                    self.masks[row].video_bpm = 120.0
+                mask = self.masks[row]
+                mask.source_points = [ (p.x(), p.y()) for p in mask_points]
+                mask.tag = self.mask_tag_combo.currentText()
+                mask.type = self.mask_type_combo.currentText()
+                mask.blend_mode = self.mask_blend_combo.currentText()
+                mask.bezier_enabled = self.bezier_check.isChecked()
+                mask.feather = self.mask_feather_slider.value()
+
+                self.update_cue_table()
                 self.worker.set_masks(self.masks)
-                print(f"Mask created for {self.masks[row].name} with tag {self.masks[row].tag}")
+                self.statusBar().showMessage(f"Mask '{mask.name}' saved with {len(mask_points)} points.", 3000)
+        else:
+            self.statusBar().showMessage("Mask not saved: No points or no cue selected.", 5000)
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
         self.cancel_mask_button.setEnabled(False)
-        self.video_display.clear_mask_points()
-        self.mask_points_list.clear()
 
     def cancel_mask_creation(self):
         self.video_display.set_mask_creation_mode(False)
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
         self.cancel_mask_button.setEnabled(False)
-        self.video_display.clear_mask_points()
-        self.mask_points_list.clear()
 
     def add_mask_point_to_list(self, point):
-        self.mask_points_list.addItem(f"({point.x()}, {point.y()})")
+        pass # Removed log list to save space
 
     def link_mask_to_markers(self):
         current_item = self.cue_list_widget.currentItem()
@@ -938,11 +1057,16 @@ class ProjectionMappingApp(QMainWindow):
         row = self.cue_list_widget.row(current_item)
         if 0 <= row < len(self.masks):
             mask = self.masks[row]
-            if len(mask.source_points) != len(self.selected_markers):
-                self.statusBar().showMessage(f"Error: Mask has {len(mask.source_points)} points, but {len(self.selected_markers)} markers are selected.", 5000)
-            else:
-                mask.linked_marker_count = len(self.selected_markers)
-                self.statusBar().showMessage(f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000)
+            if not mask.source_points:
+                self.statusBar().showMessage("Please draw the mask points first.", 3000)
+                return
+
+            # Normalize points to reference frame so they stay locked to the guitar
+            # regardless of where it was when "Link" was clicked.
+            mask.source_points = self.worker.normalize_points_to_reference(mask.source_points)
+
+            mask.is_linked = True
+            self.statusBar().showMessage(f"Mask '{mask.name}' linked to guitar tracking.", 3000)
 
     def update_ir_threshold(self, value):
         self.worker.set_ir_threshold(value)
@@ -952,33 +1076,19 @@ class ProjectionMappingApp(QMainWindow):
 
     def toggle_warping(self, checked):
         self.projector_window.set_calibration_mode(checked)
+        self.worker.show_camera_on_projector = checked
         if checked:
             self.enable_warping_button.setText("Disable Warping")
         else:
             self.enable_warping_button.setText("Enable Warping")
 
-    def add_vj_generator(self):
+    def add_vj_generator_to_lib(self):
         pattern, ok = QInputDialog.getItem(self, "Select Generator", "Pattern:", ["grid", "scan", "radial"], 0, False)
         if ok and pattern:
-            video_path = f"generator:{pattern}"
-            mask_name = f"Gen: {pattern}"
-            new_mask = Mask(mask_name, [], video_path)
-            self.masks.append(new_mask)
-            self.cue_list_widget.addItem(mask_name)
-            self.worker.set_masks(self.masks)
-
-    def add_cue(self):
-        video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
-        if not video_path:
-            # Allow creating a generative cue
-            video_path = "generative"
-
-        if video_path:
-            mask_name = f"Cue {len(self.masks) + 1}: {video_path.split('/')[-1]}"
-            new_mask = Mask(mask_name, [], video_path)
-            self.masks.append(new_mask)
-            self.cue_list_widget.addItem(mask_name)
-            self.worker.set_masks(self.masks)
+            path = f"generator:{pattern}"
+            if path not in self.media_library:
+                self.media_library.append(path)
+                self.media_list.addItem(f"GEN: {pattern}")
 
     def change_camera(self, index):
         if self.available_cameras:
@@ -988,12 +1098,17 @@ class ProjectionMappingApp(QMainWindow):
     def change_projector(self, index):
         if index < len(self.screens):
             screen = self.screens[index]
+            geom = screen.geometry()
+            self.worker.projector_width = geom.width()
+            self.worker.projector_height = geom.height()
+            self.worker._warp_map_dirty = True
+
             self.projector_window.hide()
             self.projector_window.show() # Ensure window handle is created
             handle = self.projector_window.windowHandle()
             if handle:
                 handle.setScreen(screen)
-            self.projector_window.setGeometry(screen.geometry())
+            self.projector_window.setGeometry(geom)
             self.projector_window.showFullScreen()
 
     def remove_cue(self):
@@ -1002,26 +1117,7 @@ class ProjectionMappingApp(QMainWindow):
             row = self.cue_list_widget.row(current_item)
             self.cue_list_widget.takeItem(row)
             del self.masks[row]
-            self.worker.set_masks(self.masks)
-
-    def move_cue_up(self):
-        row = self.cue_list_widget.currentRow()
-        if row > 0:
-            item = self.cue_list_widget.takeItem(row)
-            self.cue_list_widget.insertItem(row - 1, item)
-            self.cue_list_widget.setCurrentRow(row - 1)
-            mask = self.masks.pop(row)
-            self.masks.insert(row - 1, mask)
-            self.worker.set_masks(self.masks)
-
-    def move_cue_down(self):
-        row = self.cue_list_widget.currentRow()
-        if row < len(self.masks) - 1:
-            item = self.cue_list_widget.takeItem(row)
-            self.cue_list_widget.insertItem(row + 1, item)
-            self.cue_list_widget.setCurrentRow(row + 1)
-            mask = self.masks.pop(row)
-            self.masks.insert(row + 1, mask)
+            self.update_cue_table()
             self.worker.set_masks(self.masks)
 
     def closeEvent(self, event):

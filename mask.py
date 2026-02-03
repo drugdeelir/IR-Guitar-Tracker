@@ -4,10 +4,13 @@ class Mask:
         self.name = name
         self.source_points = points
         self.video_path = video_path
+        self.playlist = [video_path] if video_path else []
+        self.playlist_index = 0
         self.type = mask_type # 'dynamic' (tracked) or 'static' (background)
         self.linked_marker_count = 0
         self.tag = tag # e.g., 'amp', 'background'
         self.visible = True
+        self.is_linked = False
         self.active_fx = [] # 'strobe', 'blur', 'invert', 'edges', 'tint', 'kaleidoscope', 'mirror_h', 'mirror_v', 'rgb_shift', 'glitch', 'trails', 'hue_cycle', 'feedback'
         self.tint_color = (255, 255, 255) # BGR
         self.design_overlay = 'none' # 'none', 'spiral', 'moon', 'mushroom', 'star', 'hexagon', 'heart'
@@ -27,8 +30,10 @@ class Mask:
             'name': self.name,
             'source_points': self.source_points,
             'video_path': self.video_path,
+            'playlist': self.playlist,
+            'playlist_index': self.playlist_index,
             'type': self.type,
-            'linked_marker_count': self.linked_marker_count,
+            'is_linked': self.is_linked,
             'tag': self.tag,
             'visible': self.visible,
             'active_fx': self.active_fx,
@@ -44,7 +49,9 @@ class Mask:
     @classmethod
     def from_dict(cls, d):
         mask = cls(d['name'], d['source_points'], d['video_path'], d['type'], d['tag'])
-        mask.linked_marker_count = d.get('linked_marker_count', 0)
+        mask.playlist = d.get('playlist', [mask.video_path] if mask.video_path else [])
+        mask.playlist_index = d.get('playlist_index', 0)
+        mask.is_linked = d.get('is_linked', False)
         mask.visible = d.get('visible', True)
         mask.active_fx = d.get('active_fx', [])
         mask.tint_color = tuple(d.get('tint_color', [255, 255, 255]))

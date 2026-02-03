@@ -9,6 +9,7 @@ class MIDIHandler(QObject):
     beat = pyqtSignal(float) # bpm
     beat_pulse = pyqtSignal() # emitted once per quarter note
     learned_message = pyqtSignal(str, int) # type ('note' or 'cc'), number
+    message_received = pyqtSignal(str) # For diagnostic logging
 
     def __init__(self, port_name=None):
         super().__init__()
@@ -35,6 +36,9 @@ class MIDIHandler(QObject):
             print(f"MIDI Error: {e}")
 
     def midi_callback(self, msg):
+        if msg.type in ['note_on', 'note_off', 'control_change']:
+            self.message_received.emit(str(msg))
+
         if self.learning_mode:
             if msg.type == 'note_on':
                 self.learned_message.emit('note', msg.note)

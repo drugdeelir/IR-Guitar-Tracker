@@ -17,8 +17,10 @@ To ensure a stable connection, set static IP addresses for both machines.
     - IP Address: `192.168.1.10`
     - Subnet Mask: `255.255.255.0`
 2.  **On Windows:** Go to Control Panel > Network and Sharing Center > Change adapter settings. Right-click Ethernet > Properties > IPv4 > Properties.
-    - IP Address: `192.168.1.11`
+    - IP Address: `192.168.1.100`
     - Subnet Mask: `255.255.255.0`
+    - Gateway: `192.168.1.1`
+    - DNS: `8.8.8.8` / `8.8.4.4`
 
 ---
 
@@ -69,7 +71,7 @@ To ensure a stable connection, set static IP addresses for both machines.
 ## Alternative: OSC Control
 
 If you prefer OSC, the application listens on all network interfaces on port `8000`.
-In your OSC-compatible software on the Mac, send messages to `192.168.1.11:8000`.
+In your OSC-compatible software on the Mac, send messages to `192.168.1.100:8000`.
 
 **Example OSC Paths:**
 - `/mask/amp/visible [0 or 1]`

@@ -122,24 +122,53 @@ class VideoDisplay(QWidget):
             scaled_pixmap = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
             # Center the pixmap
-            x = (self.width() - scaled_pixmap.width()) // 2
-            y = (self.height() - scaled_pixmap.height()) // 2
+            sw, sh = scaled_pixmap.width(), scaled_pixmap.height()
+            x = (self.width() - sw) // 2
+            y = (self.height() - sh) // 2
             self.draw_rect = scaled_pixmap.rect().translated(x, y)
             painter.drawPixmap(x, y, scaled_pixmap)
 
             if self.mask_creation_mode and self.mask_points:
                 painter.setPen(QPen(Qt.green, 2))
-                poly = QPolygon(self.mask_points)
-                painter.drawPolyline(poly)
+                painter.setBrush(QBrush(Qt.green, Qt.Dense6Pattern))
+
+                # Denormalize mask points for drawing
+                pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
+                draw_pts = []
+                for p in self.mask_points:
+                    dx = x + (p.x() * sw / pix_w)
+                    dy = y + (p.y() * sh / pix_h)
+                    draw_pts.append(QPoint(int(dx), int(dy)))
+
+                poly = QPolygon(draw_pts)
+                painter.drawPolygon(poly)
     
     def mousePressEvent(self, event):
         if self.mask_creation_mode:
-            # Map point to pixmap coordinates if needed, but for now we map to widget
-            # Actually, mask points should probably be relative to the pixmap or normalized
-            point = event.pos()
-            self.mask_points.append(point)
-            self.mask_point_added.emit(point)
-            self.update()
+            # Map point to pixmap coordinates
+            if not self.current_pixmap: return
+
+            lbl_w, lbl_h = self.width(), self.height()
+            pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
+
+            # Re-calculate scaling used in paintEvent
+            scaled_size = self.current_pixmap.size()
+            scaled_size.scale(self.size(), Qt.KeepAspectRatio)
+
+            sw = scaled_size.width()
+            sh = scaled_size.height()
+
+            offset_x = (lbl_w - sw) // 2
+            offset_y = (lbl_h - sh) // 2
+
+            px = (event.pos().x() - offset_x) * pix_w / sw
+            py = (event.pos().y() - offset_y) * pix_h / sh
+
+            if 0 <= px < pix_w and 0 <= py < pix_h:
+                point = QPoint(int(px), int(py))
+                self.mask_points.append(point)
+                self.mask_point_added.emit(point)
+                self.update()
 
     def set_mask_creation_mode(self, enabled):
         self.mask_creation_mode = enabled
