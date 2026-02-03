@@ -491,7 +491,25 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_next_btn.clicked.disconnect()
             self.setup_next_btn.clicked.connect(self.enter_performance_mode)
 
+    def add_wizard_finish_button(self):
+        # Check if button already exists in the layout
+        for i in range(self.setup_group_layout.count()):
+            widget = self.setup_group_layout.itemAt(i).widget()
+            if widget and isinstance(widget, QPushButton) and widget.text() in ["Finish & Save Mask", "Mask Saved!"]:
+                widget.setEnabled(True)
+                widget.setText("Finish & Save Mask")
+                return
+
+        finish_btn = QPushButton("Finish & Save Mask")
+        finish_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; height: 40px; margin-top: 10px;")
+        finish_btn.clicked.connect(self.finish_mask_creation)
+        # Also disable the button once clicked to avoid confusion
+        finish_btn.clicked.connect(lambda: finish_btn.setEnabled(False))
+        finish_btn.clicked.connect(lambda: finish_btn.setText("Mask Saved!"))
+        self.setup_group_layout.addWidget(finish_btn)
+
     def start_setup_bg_mask(self):
+        self.video_display.clear_mask_points()
         # Ensure a background cue exists
         bg_mask = None
         for m in self.masks:
@@ -507,9 +525,14 @@ class ProjectionMappingApp(QMainWindow):
 
         idx = self.masks.index(bg_mask)
         self.cue_list_widget.setCurrentRow(idx)
+        # Sync workspace UI so saving works correctly
+        self.mask_tag_combo.setCurrentText("background")
+        self.mask_type_combo.setCurrentText("static")
+        self.add_wizard_finish_button()
         self.enter_mask_creation_mode()
 
     def start_setup_amp_mask(self):
+        self.video_display.clear_mask_points()
         amp_mask = None
         for m in self.masks:
             if m.tag == 'amp':
@@ -524,6 +547,10 @@ class ProjectionMappingApp(QMainWindow):
 
         idx = self.masks.index(amp_mask)
         self.cue_list_widget.setCurrentRow(idx)
+        # Sync workspace UI so saving works correctly
+        self.mask_tag_combo.setCurrentText("amp")
+        self.mask_type_combo.setCurrentText("dynamic")
+        self.add_wizard_finish_button()
         self.enter_mask_creation_mode()
 
     def enter_performance_mode(self):
