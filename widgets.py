@@ -113,6 +113,7 @@ class VideoDisplay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mask_creation_mode = False
+        self.snap_to_markers = True
         self.mask_points = []
         self.detected_markers = []
         self.current_pixmap = None
@@ -180,13 +181,14 @@ class VideoDisplay(QWidget):
 
                 # Auto-Snapping to detected IR markers
                 snapped_pt = click_pt
-                min_dist = 30 # Snapping radius in pixels
-                for marker in self.detected_markers:
-                    m_pt = QPoint(int(marker[0]), int(marker[1]))
-                    dist = (click_pt - m_pt).manhattanLength()
-                    if dist < min_dist:
-                        min_dist = dist
-                        snapped_pt = m_pt
+                if self.snap_to_markers:
+                    min_dist = 30 # Snapping radius in pixels
+                    for marker in self.detected_markers:
+                        m_pt = QPoint(int(marker[0]), int(marker[1]))
+                        dist = (click_pt - m_pt).manhattanLength()
+                        if dist < min_dist:
+                            min_dist = dist
+                            snapped_pt = m_pt
 
                 self.mask_points.append(snapped_pt)
                 self.mask_point_added.emit(snapped_pt)
@@ -196,7 +198,11 @@ class VideoDisplay(QWidget):
         self.mask_creation_mode = enabled
         if not enabled:
             self.clear_mask_points()
+            self.snap_to_markers = True # Reset to default
         self.update()
+
+    def set_snap_to_markers(self, enabled):
+        self.snap_to_markers = enabled
 
     def get_mask_points(self):
         return self.mask_points

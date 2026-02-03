@@ -462,9 +462,24 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_step += 1
         if self.setup_step == 1: # Markers
             self.setup_group.setTitle("Step 2: Calibrate Guitar Markers")
-            self.setup_instruction.setText("1. Point camera at your guitar.\n2. Click the button below to start calibration.\n3. Snap to 4 points on your guitar.")
+            self.setup_instruction.setText("1. Point camera at your guitar.\n2. Adjust IR Threshold if needed.\n3. Click to start calibration.\n4. Snap to 4 points on your guitar.")
+
+            # Add IR Threshold Slider to Wizard
+            ir_label = QLabel("IR Threshold:")
+            self.setup_group_layout.addWidget(ir_label)
+
+            wizard_ir_slider = QSlider(Qt.Horizontal)
+            wizard_ir_slider.setRange(0, 255)
+            wizard_ir_slider.setValue(self.ir_threshold_slider.value())
+            wizard_ir_slider.valueChanged.connect(self.update_ir_threshold)
+            # Sync with main slider
+            wizard_ir_slider.valueChanged.connect(self.ir_threshold_slider.setValue)
+            self.ir_threshold_slider.valueChanged.connect(wizard_ir_slider.setValue)
+            self.setup_group_layout.addWidget(wizard_ir_slider)
+
             btn = QPushButton("Open Marker Calibration")
             btn.clicked.connect(self.open_marker_selection_dialog)
+            btn.setMinimumHeight(40)
             self.setup_group_layout.addWidget(btn)
         elif self.setup_step == 2: # Background
             self.setup_group.setTitle("Step 3: Background Mask")
@@ -515,6 +530,7 @@ class ProjectionMappingApp(QMainWindow):
 
     def start_setup_bg_mask(self):
         self.video_display.clear_mask_points()
+        self.video_display.set_snap_to_markers(False)
         # Ensure a background cue exists
         bg_mask = None
         for m in self.masks:
@@ -538,6 +554,7 @@ class ProjectionMappingApp(QMainWindow):
 
     def start_setup_amp_mask(self):
         self.video_display.clear_mask_points()
+        self.video_display.set_snap_to_markers(False)
         amp_mask = None
         for m in self.masks:
             if m.tag == 'amp':
