@@ -336,7 +336,9 @@ class Worker(QObject):
         if not mask.active_fx and mask.design_overlay == 'none':
             return frame
 
-        processed = frame.copy()
+        # Since frame_cue is already a copy from VideoPlayer or a generator,
+        # we can modify it in-place to save performance.
+        processed = frame
         h, w = processed.shape[:2]
 
         if 'mirror_h' in mask.active_fx:
@@ -544,9 +546,17 @@ class Worker(QObject):
             points_to_check = detected_points[:limit]
 
             num_markers = len(self.marker_config)
-            for point_combo in combinations(points_to_check, num_markers):
+
+            # Optimization: Pre-calculate pairwise distances between detected points
+            # to avoid redundant norm calculations in the combinations loop.
+            dist_matrix = {}
+            for i, j in combinations(range(len(points_to_check)), 2):
+                d = np.linalg.norm(np.array(points_to_check[i]) - np.array(points_to_check[j]))
+                dist_matrix[(i, j)] = d
+
+            for indices in combinations(range(len(points_to_check)), num_markers):
                 # Quick bounding box check
-                pts_arr = np.array(point_combo)
+                pts_arr = np.array([points_to_check[i] for i in indices])
                 if self.confidence > 0.5:
                     # If tracking, current combo shouldn't be too far from last known size
                     prev_pts = np.array(self.last_tracked_points)
@@ -556,11 +566,15 @@ class Worker(QObject):
                         continue
 
                 current_distances = []
-                for p1, p2 in combinations(point_combo, 2):
-                    current_distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+                for i, j in combinations(range(num_markers), 2):
+                    # Map local combo indices back to dist_matrix keys
+                    idx1, idx2 = sorted((indices[i], indices[j]))
+                    current_distances.append(dist_matrix[(idx1, idx2)])
+
                 current_fingerprint = sorted(current_distances)
 
                 if len(current_fingerprint) == len(self.marker_fingerprint):
+                    point_combo = [points_to_check[i] for i in indices]
                     is_match = True
                     for i in range(len(current_fingerprint)):
                         if not np.isclose(current_fingerprint[i], self.marker_fingerprint[i], rtol=0.15):
@@ -673,7 +687,11 @@ class Worker(QObject):
 
     def process_video(self):
         main_cap = None
+        target_fps = 30
+        frame_time = 1.0 / target_fps
+
         while self._running:
+            start_time = time.time()
             if self._camera_changed:
                 if main_cap: main_cap.release()
                 main_cap = cv2.VideoCapture(self.video_source)
@@ -782,6 +800,12 @@ class Worker(QObject):
                         del self.fades[mask.tag]
 
                 if frame_cue is not None:
+                    # Performance Optimization: Downscale video frame if it's larger than the projector resolution
+                    # This significantly speeds up all subsequent FX processing and warping.
+                    fh, fw = frame_cue.shape[:2]
+                    if fw > w or fh > h:
+                        frame_cue = cv2.resize(frame_cue, (w, h), interpolation=cv2.INTER_LINEAR)
+
                     frame_cue = self.apply_fx(frame_cue, mask)
 
                     if mask.design_overlay != 'none':
@@ -927,7 +951,10 @@ class Worker(QObject):
 
             rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
             self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888).copy())
-            QThread.msleep(30)
+
+            elapsed = time.time() - start_time
+            sleep_time = max(1, int((frame_time - elapsed) * 1000))
+            QThread.msleep(sleep_time)
 
         main_cap.release()
         for player in self.video_players.values(): player.stop()
@@ -1008,26 +1035,30 @@ class Worker(QObject):
         if len(mask_img.shape) == 2:
             mask_img = cv2.merge([mask_img, mask_img, mask_img])
 
+        # Optimized integer-based blending to avoid slow float conversions
         if mode == 'normal':
-            inv_mask = cv2.bitwise_not(mask_img)
-            return cv2.add(cv2.bitwise_and(base, inv_mask), cv2.bitwise_and(overlay, mask_img))
+            # Full alpha blending: res = overlay * (mask/255) + base * (1 - mask/255)
+            over_part = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
+            base_part = cv2.multiply(base, cv2.bitwise_not(mask_img), scale=1.0/255.0)
+            return cv2.add(over_part, base_part)
         elif mode == 'add':
-            overlay_masked = cv2.bitwise_and(overlay, mask_img)
+            overlay_masked = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
             return cv2.add(base, overlay_masked)
-
-        # Other modes still use float for now, but these are less common
-        mask_f = mask_img.astype(np.float32) / 255.0
-        base_f = base.astype(np.float32)
-        over_f = overlay.astype(np.float32)
-
-        if mode == 'screen':
-            res = 255 - ((255 - base_f) * (255 - over_f * mask_f) / 255.0)
+        elif mode == 'screen':
+            # res = 1 - (1 - base) * (1 - overlay*mask)
+            over_part = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
+            base_inv = cv2.bitwise_not(base)
+            over_inv = cv2.bitwise_not(over_part)
+            res_inv = cv2.multiply(base_inv, over_inv, scale=1.0/255.0)
+            return cv2.bitwise_not(res_inv)
         elif mode == 'multiply':
-            res = (base_f * (over_f * mask_f + (1.0 - mask_f) * 255.0)) / 255.0
-        else:
-            return base # Fallback
+            # res = base * (overlay*mask + (255-mask)) / 255
+            over_part = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
+            mask_inv = cv2.bitwise_not(mask_img)
+            over_effective = cv2.add(over_part, mask_inv)
+            return cv2.multiply(base, over_effective, scale=1.0/255.0)
 
-        return np.clip(res, 0, 255).astype(np.uint8)
+        return base
 
     def normalize_points_to_reference(self, points):
         """Converts points from current frame space to marker-config reference space."""
