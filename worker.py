@@ -689,7 +689,7 @@ class Worker(QObject):
                 # Provide a placeholder frame when no camera is detected
                 main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(main_frame, "NO CAMERA DETECTED", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
                 rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
                 self.frame_ready.emit(QImage(rgb_main.data, 640, 480, 640 * 3, QImage.Format_RGB888).copy())
                 QThread.msleep(1000)
@@ -700,7 +700,7 @@ class Worker(QObject):
                 # Provide a blank frame with an error message on camera failure
                 main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(main_frame, "CAMERA READ ERROR", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
                 self.camera_error.emit(self.video_source)
 
                 rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
@@ -892,7 +892,7 @@ class Worker(QObject):
                 self.last_stats_time = now
 
             if self.show_hud:
-                hud_color = (0, 255, 255)
+                hud_color = (255, 0, 255) # Purple
                 cv2.putText(main_frame, f"FPS: {self.fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
                 cv2.putText(main_frame, f"Conf: {self.confidence:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
                 cv2.putText(main_frame, f"BPM: {self.bpm:.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)

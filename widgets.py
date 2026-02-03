@@ -73,8 +73,8 @@ class MarkerImageLabel(QLabel):
         for gp in self.guide_points:
             painter.drawEllipse(QPoint(int(gp[0]), int(gp[1])), 15, 15)
 
-        # Draw selected points as solid green targets
-        painter.setPen(QPen(Qt.green, 3))
+        # Draw selected points as solid neon purple targets
+        painter.setPen(QPen(Qt.magenta, 3))
         for sp in self.selected_points:
             painter.drawLine(sp.x()-15, sp.y(), sp.x()+15, sp.y())
             painter.drawLine(sp.x(), sp.y()-15, sp.x(), sp.y()+15)
@@ -136,8 +136,8 @@ class VideoDisplay(QWidget):
             painter.drawPixmap(x, y, scaled_pixmap)
 
             if self.mask_creation_mode and self.mask_points:
-                painter.setPen(QPen(Qt.green, 2))
-                painter.setBrush(QBrush(Qt.green, Qt.Dense6Pattern))
+                painter.setPen(QPen(Qt.magenta, 2))
+                painter.setBrush(QBrush(Qt.magenta, Qt.Dense6Pattern))
 
                 # Denormalize mask points for drawing
                 pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()

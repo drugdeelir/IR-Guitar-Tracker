@@ -342,12 +342,12 @@ class ProjectionMappingApp(QMainWindow):
 
         self.load_template_btn = QPushButton("OR: Load Existing Template / Project")
         self.load_template_btn.clicked.connect(self.load_project)
-        self.load_template_btn.setStyleSheet("background-color: #455a64; color: white; margin-top: 10px;")
+        self.load_template_btn.setStyleSheet("background-color: #311b92; color: white; margin-top: 10px;")
         self.setup_group_layout.addWidget(self.load_template_btn)
 
         self.setup_next_btn = QPushButton("Next Step")
         self.setup_next_btn.setMinimumHeight(50)
-        self.setup_next_btn.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold;")
+        self.setup_next_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
         self.setup_next_btn.clicked.connect(self.next_setup_step)
 
         self.setup_group.setLayout(self.setup_group_layout)
@@ -383,7 +383,7 @@ class ProjectionMappingApp(QMainWindow):
 
             save_preset_btn = QPushButton("Save Project / Preset")
             save_preset_btn.clicked.connect(lambda: self.save_project())
-            save_preset_btn.setStyleSheet("background-color: #2e7d32; color: white; height: 40px; margin-bottom: 10px;")
+            save_preset_btn.setStyleSheet("background-color: #4a148c; color: white; height: 40px; margin-bottom: 10px;")
             self.setup_group_layout.addWidget(save_preset_btn)
 
             self.setup_next_btn.setText("Enter Performance Mode")
@@ -434,7 +434,7 @@ class ProjectionMappingApp(QMainWindow):
 
         # Add a floating button or status bar button to exit
         self.exit_perf_btn = QPushButton("EXIT PERFORMANCE MODE")
-        self.exit_perf_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; height: 40px;")
+        self.exit_perf_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
         self.exit_perf_btn.clicked.connect(self.exit_performance_mode)
         self.layout.addWidget(self.exit_perf_btn)
 
@@ -514,7 +514,7 @@ class ProjectionMappingApp(QMainWindow):
 
         edit_btns = QHBoxLayout()
         self.finish_mask_button = QPushButton("SAVE POINTS")
-        self.finish_mask_button.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
+        self.finish_mask_button.setStyleSheet("background-color: #4a148c; color: white; font-weight: bold;")
         self.finish_mask_button.clicked.connect(self.finish_mask_creation)
         self.finish_mask_button.setEnabled(False)
         self.cancel_mask_button = QPushButton("Cancel")
@@ -1041,7 +1041,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.show_splash = checked
         if checked:
             self.splash_check.setText("Stop Splash / START SHOW")
-            self.splash_check.setStyleSheet("background-color: green; color: white; font-weight: bold;")
+            self.splash_check.setStyleSheet("background-color: #d500f9; color: black; font-weight: bold;")
         else:
             self.splash_check.setText("Show Splash on Projector")
             self.splash_check.setStyleSheet("")
