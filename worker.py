@@ -98,6 +98,7 @@ class Worker(QObject):
         self.map_x = None
         self.map_y = None
         self._warp_map_dirty = True
+        self._warp_is_identity = True
         self.masks = []
         self.mask_mutex = QMutex()
         self.video_players = {}
@@ -176,11 +177,17 @@ class Worker(QObject):
         self.master_saturation = 100 # 0 to 200
         self.master_grain = 0 # 0 to 100
         self.master_bloom = 0 # 0 to 100
+        self.master_fader = 1.0 # 0.0 to 1.0
 
         # Reusable Buffers
         self.projector_buffer = None
         self.mask_buffer = None
         self.latest_main_frame = None
+        self.cached_plasma_grid = None
+        self.cached_nebula_grid = None
+        self.generator_buffer = None
+        self.blend_temp1 = None
+        self.blend_temp2 = None
 
     def init_kalman(self, count):
         self.kalman_filters = []
@@ -855,9 +862,7 @@ class Worker(QObject):
             self.draw_particles(projector_output)
 
             with QMutexLocker(self.mask_mutex):
-                # Z-Order Sorting: Static backgrounds (Z=0) first, then higher Z
-                sorted_masks = sorted(self.masks, key=lambda m: m.z_order)
-                iterable_masks = [m for m in sorted_masks] # Snapshot for this frame
+                iterable_masks = [m for m in self.masks] # Snapshot for this frame
 
             for mask in iterable_masks:
                 if not mask.visible or not mask.video_path: continue
@@ -908,6 +913,13 @@ class Worker(QObject):
                     if mask.type == 'dynamic':
                         if self.confidence < 1.0:
                             effective_frame_cue = (frame_cue * self.confidence).astype(np.uint8)
+
+                    effective_opacity = mask.opacity
+                    if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
+                        effective_opacity *= lfo_val
+
+                    if effective_opacity < 1.0:
+                        effective_frame_cue = (effective_frame_cue * effective_opacity).astype(np.uint8)
 
                     # Safety Fallback
                     is_safe = True
@@ -966,14 +978,24 @@ class Worker(QObject):
                             cv2.boxFilter(mask_img, -1, (k, k), dst=mask_img)
                         projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
                     elif mask.type == 'static' or (mask.type == 'dynamic' and not mask.is_linked):
+                        effective_frame_cue = frame_cue
+
+                        effective_opacity = mask.opacity
+                        if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
+                            lfo_val = self.get_lfo_value(mask)
+                            effective_opacity *= lfo_val
+
+                        if effective_opacity < 1.0:
+                            effective_frame_cue = (frame_cue * effective_opacity).astype(np.uint8)
+
                         if not mask.source_points:
                             full_mask = np.full((h, w, 3), 255, dtype=np.uint8)
-                            projector_output = self.blend_frames(projector_output, cv2.resize(frame_cue, (w, h)), full_mask, mask.blend_mode)
+                            projector_output = self.blend_frames(projector_output, cv2.resize(effective_frame_cue, (w, h)), full_mask, mask.blend_mode)
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
                             dst_pts = np.float32(mask.source_points)
                             matrix, _ = cv2.findHomography(src_pts, dst_pts)
-                            warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
+                            warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
 
                             self.mask_buffer.fill(0)
                             mask_img = self.mask_buffer
@@ -1059,14 +1081,12 @@ class Worker(QObject):
                     bloom = cv2.GaussianBlur(highlights, (k, k), 0)
                     projector_output = cv2.addWeighted(projector_output, 1.0, bloom, 0.5, 0)
 
-            # 9-point grid warping (piecewise perspective optimization)
-            is_identity = True
-            for i, p in enumerate(self.warp_points):
-                if abs(p[0] - (i % 3) * 0.5) > 0.005 or abs(p[1] - (i // 3) * 0.5) > 0.005:
-                    is_identity = False
-                    break
+            # Apply Master Fader
+            if self.master_fader < 1.0:
+                projector_output = (projector_output * self.master_fader).astype(np.uint8)
 
-            if is_identity:
+            # 9-point grid warping (piecewise perspective optimization)
+            if self._warp_is_identity:
                 warped_output = projector_output
             else:
                 if self.map_x is None or self.map_x.shape[:2] != (h, w) or self._warp_map_dirty:
@@ -1125,7 +1145,12 @@ class Worker(QObject):
             cv2.circle(frame, (int(p['x']), int(p['y'])), 2, color, -1, cv2.LINE_AA)
 
     def get_vj_generator(self, pattern, h, w):
-        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        if self.generator_buffer is None or self.generator_buffer.shape[:2] != (h, w):
+            self.generator_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+
+        self.generator_buffer.fill(0)
+        frame = self.generator_buffer
+
         t = time.time() * (self.bpm / 60.0)
 
         if pattern == 'grid':
@@ -1149,9 +1174,12 @@ class Worker(QObject):
                 cv2.rectangle(frame, (center[0]-r, center[1]-r), (center[0]+r, center[1]+r), (255, 255, 255), 2)
         elif pattern == 'plasma':
             # Fast plasma-like effect using sine waves
-            x = np.linspace(0, 10, w)
-            y = np.linspace(0, 10, h)
-            X, Y = np.meshgrid(x, y)
+            if self.cached_plasma_grid is None or self.cached_plasma_grid[0].shape != (h, w):
+                x = np.linspace(0, 10, w, dtype=np.float32)
+                y = np.linspace(0, 10, h, dtype=np.float32)
+                self.cached_plasma_grid = np.meshgrid(x, y)
+
+            X, Y = self.cached_plasma_grid
             res = np.sin(X + t) + np.sin(Y + t*0.5) + np.sin((X + Y + t)*0.5)
             res = ((res + 3) / 6 * 255).astype(np.uint8)
             frame = cv2.applyColorMap(res, cv2.COLORMAP_JET)
@@ -1237,6 +1265,44 @@ class Worker(QObject):
                 cv2.polylines(frame, [np.array(pts_bot, np.int32)], True, color, 1, cv2.LINE_AA)
                 for s in range(num_sides):
                     cv2.line(frame, tuple(np.int32(pts_top[s])), tuple(np.int32(pts_bot[s])), color, 1, cv2.LINE_AA)
+        elif pattern == 'nebula':
+            # Multi-layered noise nebula
+            if self.cached_nebula_grid is None or self.cached_nebula_grid[0].shape != (h, w):
+                x = np.linspace(0, 4, w, dtype=np.float32)
+                y = np.linspace(0, 4, h, dtype=np.float32)
+                self.cached_nebula_grid = np.meshgrid(x, y)
+
+            X, Y = self.cached_nebula_grid
+
+            # Layer 1
+            n1 = np.sin(X + t * 0.2) * np.cos(Y - t * 0.3)
+            # Layer 2 (Faster, smaller)
+            n2 = np.sin(X * 2 - t * 0.5) * np.sin(Y * 2 + t * 0.4)
+
+            res = ((n1 + n2 + 2) / 4 * 255).astype(np.uint8)
+            frame = cv2.applyColorMap(res, cv2.COLORMAP_MAGMA)
+            # Darken for space feel
+            frame = (frame * 0.6).astype(np.uint8)
+        elif pattern == 'blackhole':
+            center = (w // 2, h // 2)
+            # Central event horizon
+            cv2.circle(frame, center, int(30 + 5 * np.sin(t*5)), (0, 0, 0), -1)
+            # Accretion disk particles
+            for i in range(40):
+                angle = (t * 2 + i * (2 * np.pi / 40))
+                dist = (1.5 - ((t * 0.5 + i * 0.05) % 1.0)) * max(w, h) * 0.3 + 40
+                if dist < 40: continue
+
+                # Whirlpool effect
+                x = int(center[0] + dist * np.cos(angle + 100/dist))
+                y = int(center[1] + dist * np.sin(angle + 100/dist))
+
+                color = (200, 100, 255)
+                cv2.circle(frame, (x, y), 2, color, -1, cv2.LINE_AA)
+                # Connecting lines for flow
+                nx = int(center[0] + (dist-10) * np.cos(angle + 100/(dist-10)))
+                ny = int(center[1] + (dist-10) * np.sin(angle + 100/(dist-10)))
+                cv2.line(frame, (x, y), (nx, ny), (100, 50, 150), 1, cv2.LINE_AA)
 
         return frame
 
@@ -1257,28 +1323,33 @@ class Worker(QObject):
         if len(mask_img.shape) == 2:
             mask_img = cv2.merge([mask_img, mask_img, mask_img])
 
+        if self.blend_temp1 is None or self.blend_temp1.shape != base.shape:
+            self.blend_temp1 = np.zeros_like(base)
+            self.blend_temp2 = np.zeros_like(base)
+
         # Optimized integer-based blending to avoid slow float conversions
         if mode == 'normal':
             # Full alpha blending: res = overlay * (mask/255) + base * (1 - mask/255)
-            over_part = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
-            base_part = cv2.multiply(base, cv2.bitwise_not(mask_img), scale=1.0/255.0)
-            return cv2.add(over_part, base_part)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            cv2.bitwise_not(mask_img, dst=self.blend_temp2)
+            cv2.multiply(base, self.blend_temp2, dst=self.blend_temp2, scale=1.0/255.0)
+            return cv2.add(self.blend_temp1, self.blend_temp2, dst=base)
         elif mode == 'add':
-            overlay_masked = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
-            return cv2.add(base, overlay_masked)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            return cv2.add(base, self.blend_temp1, dst=base)
         elif mode == 'screen':
             # res = 1 - (1 - base) * (1 - overlay*mask)
-            over_part = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
-            base_inv = cv2.bitwise_not(base)
-            over_inv = cv2.bitwise_not(over_part)
-            res_inv = cv2.multiply(base_inv, over_inv, scale=1.0/255.0)
-            return cv2.bitwise_not(res_inv)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            cv2.bitwise_not(base, dst=self.blend_temp2)
+            cv2.bitwise_not(self.blend_temp1, dst=self.blend_temp1)
+            cv2.multiply(self.blend_temp2, self.blend_temp1, dst=self.blend_temp1, scale=1.0/255.0)
+            return cv2.bitwise_not(self.blend_temp1, dst=base)
         elif mode == 'multiply':
             # res = base * (overlay*mask + (255-mask)) / 255
-            over_part = cv2.multiply(overlay, mask_img, scale=1.0/255.0)
-            mask_inv = cv2.bitwise_not(mask_img)
-            over_effective = cv2.add(over_part, mask_inv)
-            return cv2.multiply(base, over_effective, scale=1.0/255.0)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            cv2.bitwise_not(mask_img, dst=self.blend_temp2)
+            cv2.add(self.blend_temp1, self.blend_temp2, dst=self.blend_temp1)
+            return cv2.multiply(base, self.blend_temp1, dst=base, scale=1.0/255.0)
 
         return base
 
@@ -1298,6 +1369,13 @@ class Worker(QObject):
     def set_warp_points(self, points):
         self.warp_points = points
         self._warp_map_dirty = True
+
+        # Check if identity
+        self._warp_is_identity = True
+        for i, p in enumerate(self.warp_points):
+            if abs(p[0] - (i % 3) * 0.5) > 0.005 or abs(p[1] - (i // 3) * 0.5) > 0.005:
+                self._warp_is_identity = False
+                break
     def cleanup_resources(self):
         # Aggressively stop unused players
         current_cues = {mask.video_path for mask in self.masks if mask.video_path}
@@ -1319,6 +1397,7 @@ class Worker(QObject):
 
     def set_masks(self, masks):
         with QMutexLocker(self.mask_mutex):
-            self.masks = masks
+            # Sort masks by Z-order once when they are updated
+            self.masks = sorted(masks, key=lambda m: m.z_order)
         self.update_video_speeds()
         self.cleanup_resources()

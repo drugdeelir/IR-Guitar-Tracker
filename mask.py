@@ -10,6 +10,7 @@ class Mask:
         self.linked_marker_count = 0
         self.tag = tag # e.g., 'amp', 'background'
         self.visible = True
+        self.opacity = 1.0 # 0.0 to 1.0
         self.is_linked = False
         self.active_fx = [] # 'strobe', 'blur', 'invert', 'edges', 'tint', 'kaleidoscope', 'mirror_h', 'mirror_v', 'rgb_shift', 'glitch', 'trails', 'hue_cycle', 'feedback'
         self.tint_color = (255, 255, 255) # BGR
@@ -37,6 +38,7 @@ class Mask:
             'is_linked': self.is_linked,
             'tag': self.tag,
             'visible': self.visible,
+            'opacity': self.opacity,
             'active_fx': self.active_fx,
             'tint_color': list(self.tint_color),
             'design_overlay': self.design_overlay,
@@ -55,6 +57,7 @@ class Mask:
         mask.playlist_index = d.get('playlist_index', 0)
         mask.is_linked = d.get('is_linked', False)
         mask.visible = d.get('visible', True)
+        mask.opacity = d.get('opacity', 1.0)
         mask.active_fx = d.get('active_fx', [])
         mask.tint_color = tuple(d.get('tint_color', [255, 255, 255]))
         mask.design_overlay = d.get('design_overlay', 'none')

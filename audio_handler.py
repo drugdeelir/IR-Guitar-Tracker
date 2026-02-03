@@ -1,5 +1,8 @@
 
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -18,6 +21,7 @@ class AudioHandler(QObject):
         self.buffer = np.zeros(self.window_size)
 
     def start(self):
+        if sd is None: return
         try:
             self.stream = sd.InputStream(
                 device=self.device_index,
@@ -58,6 +62,7 @@ class AudioHandler(QObject):
             self.is_running = False
 
 def get_audio_devices():
+    if sd is None: return []
     try:
         return sd.query_devices()
     except Exception:

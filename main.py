@@ -222,6 +222,8 @@ class ProjectionMappingApp(QMainWindow):
         self.video_display.setMinimumWidth(800)
         self.projector_window = ProjectorWindow()
 
+        self.available_cameras = get_available_cameras()
+
         self.tabs = QTabWidget()
         self.create_setup_tab() # New Guided Setup Tab
         self.create_workspace_tab()
@@ -327,6 +329,35 @@ class ProjectionMappingApp(QMainWindow):
             self.mask_blend_combo.setCurrentText(mask.blend_mode)
             self.bezier_check.setChecked(mask.bezier_enabled)
             self.mask_feather_slider.setValue(mask.feather)
+            self.mask_opacity_slider.setValue(int(mask.opacity * 100))
+
+            # Update LFO UI
+            self.lfo_enable_check.setChecked(mask.fx_params.get('lfo_enabled', False))
+            self.lfo_target_combo.setCurrentText(mask.fx_params.get('lfo_target', 'none'))
+            self.lfo_shape_combo.setCurrentText(mask.fx_params.get('lfo_shape', 'sine'))
+            self.lfo_speed_slider.setValue(int(mask.fx_params.get('lfo_speed', 1.0) * 10))
+
+    def update_mask_mod(self):
+        current_item = self.cue_list_widget.currentItem()
+        if current_item:
+            row = self.cue_list_widget.row(current_item)
+            if 0 <= row < len(self.masks):
+                mask = self.masks[row]
+                mask.fx_params['lfo_enabled'] = self.lfo_enable_check.isChecked()
+                mask.fx_params['lfo_target'] = self.lfo_target_combo.currentText()
+                mask.fx_params['lfo_shape'] = self.lfo_shape_combo.currentText()
+                mask.fx_params['lfo_speed'] = self.lfo_speed_slider.value() / 10.0
+                self.worker.set_masks(self.masks)
+                self.maybe_auto_save()
+
+    def update_mask_opacity(self, value):
+        current_item = self.cue_list_widget.currentItem()
+        if current_item:
+            row = self.cue_list_widget.row(current_item)
+            if 0 <= row < len(self.masks):
+                self.masks[row].opacity = value / 100.0
+                self.worker.set_masks(self.masks)
+                self.maybe_auto_save()
 
     def open_marker_selection_dialog(self):
         self.marker_selection_dialog.clear_selection()
@@ -583,6 +614,12 @@ class ProjectionMappingApp(QMainWindow):
         self.mask_feather_slider.setRange(0, 100)
         form.addRow("Feather:", self.mask_feather_slider)
 
+        self.mask_opacity_slider = QSlider(Qt.Horizontal)
+        self.mask_opacity_slider.setRange(0, 100)
+        self.mask_opacity_slider.setValue(100)
+        self.mask_opacity_slider.valueChanged.connect(self.update_mask_opacity)
+        form.addRow("Opacity:", self.mask_opacity_slider)
+
         mask_layout.addLayout(form)
 
         edit_btns = QHBoxLayout()
@@ -609,6 +646,33 @@ class ProjectionMappingApp(QMainWindow):
         layer_layout.addWidget(self.front_btn)
         layer_layout.addWidget(self.back_btn)
         mask_layout.addLayout(layer_layout)
+
+        # Modulation (LFO) Group
+        mod_group = QGroupBox("Modulation (LFO)")
+        mod_layout = QFormLayout()
+
+        self.lfo_enable_check = QCheckBox("Enable LFO")
+        self.lfo_enable_check.toggled.connect(self.update_mask_mod)
+        mod_layout.addRow(self.lfo_enable_check)
+
+        self.lfo_target_combo = QComboBox()
+        self.lfo_target_combo.addItems(["none", "blur", "tint", "rgb_shift", "hue", "opacity"])
+        self.lfo_target_combo.currentIndexChanged.connect(self.update_mask_mod)
+        mod_layout.addRow("Target:", self.lfo_target_combo)
+
+        self.lfo_shape_combo = QComboBox()
+        self.lfo_shape_combo.addItems(["sine", "square", "triangle", "sawtooth"])
+        self.lfo_shape_combo.currentIndexChanged.connect(self.update_mask_mod)
+        mod_layout.addRow("Shape:", self.lfo_shape_combo)
+
+        self.lfo_speed_slider = QSlider(Qt.Horizontal)
+        self.lfo_speed_slider.setRange(1, 100) # 0.1x to 10x
+        self.lfo_speed_slider.setValue(10)
+        self.lfo_speed_slider.valueChanged.connect(self.update_mask_mod)
+        mod_layout.addRow("Speed Multiplier:", self.lfo_speed_slider)
+
+        mod_group.setLayout(mod_layout)
+        mask_layout.addWidget(mod_group)
 
         mask_group.setLayout(mask_layout)
         layout.addWidget(mask_group)
@@ -674,6 +738,12 @@ class ProjectionMappingApp(QMainWindow):
         self.bloom_slider.setValue(0)
         self.bloom_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_bloom', v))
         master_layout.addRow("Bloom Intensity:", self.bloom_slider)
+
+        self.master_fader_slider = QSlider(Qt.Horizontal)
+        self.master_fader_slider.setRange(0, 100)
+        self.master_fader_slider.setValue(100)
+        self.master_fader_slider.valueChanged.connect(lambda v: setattr(self.worker, 'master_fader', v / 100.0))
+        master_layout.addRow("GRAND MASTER FADER:", self.master_fader_slider)
 
         master_group.setLayout(master_layout)
         layout.addWidget(master_group)
@@ -804,7 +874,6 @@ class ProjectionMappingApp(QMainWindow):
         cam_group = QGroupBox("Camera")
         cam_layout = QVBoxLayout()
         self.camera_combo = QComboBox()
-        self.available_cameras = get_available_cameras()
         self.camera_combo.addItems([f"Camera {i}" for i in self.available_cameras])
         self.camera_combo.currentIndexChanged.connect(self.change_camera)
         cam_layout.addWidget(self.camera_combo)
@@ -981,7 +1050,8 @@ class ProjectionMappingApp(QMainWindow):
                     'contrast': self.contrast_slider.value(),
                     'saturation': self.saturation_slider.value(),
                     'grain': self.grain_slider.value(),
-                    'bloom': self.bloom_slider.value()
+                    'bloom': self.bloom_slider.value(),
+                    'fader': self.master_fader_slider.value()
                 }
             }
             with open(filename, 'w') as f:
@@ -1073,6 +1143,7 @@ class ProjectionMappingApp(QMainWindow):
                 self.saturation_slider.setValue(mv.get('saturation', 100))
                 self.grain_slider.setValue(mv.get('grain', 0))
                 self.bloom_slider.setValue(mv.get('bloom', 0))
+                self.master_fader_slider.setValue(mv.get('fader', 100))
 
                 self.statusBar().showMessage(f"Project loaded from {filename}", 3000)
 
@@ -1400,7 +1471,8 @@ class ProjectionMappingApp(QMainWindow):
     def add_vj_generator_to_lib(self):
         pattern, ok = QInputDialog.getItem(self, "Select Generator", "Pattern:",
                                          ["grid", "scan", "radial", "tunnel", "plasma", "vortex",
-                                          "polytunnel", "stardust", "hypergrid", "prism_move"], 0, False)
+                                          "polytunnel", "stardust", "hypergrid", "prism_move",
+                                          "nebula", "blackhole"], 0, False)
         if ok and pattern:
             path = f"generator:{pattern}"
             if path not in self.media_library:
