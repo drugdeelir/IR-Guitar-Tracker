@@ -6,6 +6,8 @@ from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
 from itertools import combinations
 from scipy.interpolate import interp1d
+from utils import resource_path
+from mask import Mask
 
 class VideoPlayer(QThread):
     def __init__(self, video_path):
@@ -70,6 +72,11 @@ class VideoPlayer(QThread):
     def get_frame(self):
         with QMutexLocker(self.mutex):
             return self.latest_frame.copy() if self.latest_frame is not None else None
+
+    def restart(self):
+        if not self.is_image and self.cap is not None:
+            with QMutexLocker(self.mutex):
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def stop(self):
         self._running = False
@@ -243,6 +250,12 @@ class Worker(QObject):
     def set_bpm(self, bpm):
         self.bpm = bpm
         self.update_video_speeds()
+
+    def restart_mask_video(self, video_path):
+        if not video_path: return
+        with QMutexLocker(self.player_mutex):
+            if video_path in self.video_players:
+                self.video_players[video_path].restart()
 
     def update_video_speeds(self):
         with QMutexLocker(self.player_mutex):
@@ -531,7 +544,7 @@ class Worker(QObject):
             y_pos = int((t * 100) % h)
             cv2.line(processed, (0, y_pos), (w, y_pos), (255, 255, 255), 1)
             # Darken every other line for CRT look
-            processed[::2, :] = (processed[::2, :] * 0.7).astype(np.uint8)
+            processed[::2, :] = cv2.convertScaleAbs(processed[::2, :], alpha=0.7)
 
         return processed
 
@@ -828,7 +841,6 @@ class Worker(QObject):
 
             if self.show_splash:
                 if self.splash_player is None:
-                    from utils import resource_path
                     self.splash_player = VideoPlayer(resource_path('logo.mkv'))
                     self.splash_player.start()
 
@@ -912,14 +924,14 @@ class Worker(QObject):
                     effective_frame_cue = frame_cue
                     if mask.type == 'dynamic':
                         if self.confidence < 1.0:
-                            effective_frame_cue = (frame_cue * self.confidence).astype(np.uint8)
+                            effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=self.confidence)
 
                     effective_opacity = mask.opacity
                     if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
                         effective_opacity *= lfo_val
 
                     if effective_opacity < 1.0:
-                        effective_frame_cue = (effective_frame_cue * effective_opacity).astype(np.uint8)
+                        effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
 
                     # Safety Fallback
                     is_safe = True
@@ -992,7 +1004,7 @@ class Worker(QObject):
                             effective_opacity *= lfo_val
 
                         if effective_opacity < 1.0:
-                            effective_frame_cue = (frame_cue * effective_opacity).astype(np.uint8)
+                            effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=effective_opacity)
 
                         if not mask.source_points:
                             full_mask = np.full((h, w, 3), 255, dtype=np.uint8)
@@ -1015,7 +1027,7 @@ class Worker(QObject):
                             self.mask_buffer.fill(0)
                             mask_img = self.mask_buffer
 
-                            cv2.fillConvexPoly(mask_img, np.int32(dst_pts), (255, 255, 255))
+                            cv2.fillPoly(mask_img, [np.int32(dst_pts)], (255, 255, 255))
                             if mask.feather > 0:
                                 k = int(mask.feather) | 1
                                 cv2.boxFilter(mask_img, -1, (k, k), dst=mask_img)
@@ -1055,13 +1067,33 @@ class Worker(QObject):
                 if self.auto_pilot:
                     cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # Draw outlines on main_frame for UI feedback
+            with QMutexLocker(self.mask_mutex):
+                for mask in self.masks:
+                    if mask.visible:
+                        # Determine current points for outline
+                        if mask.is_linked and self.last_homography is not None:
+                            src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
+                            try:
+                                draw_pts = cv2.perspectiveTransform(src_pts, self.last_homography).reshape(-1, 2).astype(np.int32)
+                            except:
+                                draw_pts = np.int32(mask.source_points)
+                        else:
+                            draw_pts = np.int32(mask.source_points)
+
+                        if len(draw_pts) >= 2:
+                            color = (0, 255, 0) if mask.is_linked else (0, 255, 255)
+                            cv2.polylines(main_frame, [draw_pts], True, color, 2, cv2.LINE_AA)
+                            if mask.is_linked:
+                                cv2.putText(main_frame, f"LINKED: {mask.name}", tuple(draw_pts[0]),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
             self.latest_main_frame = main_frame.copy()
             rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
             self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
 
             # Apply Master FX to the composition before warping
             if self.master_active_fx or self.master_brightness != 0 or self.master_contrast != 0 or self.master_saturation != 100:
-                from mask import Mask
                 master_proxy = Mask("Master", [], None)
                 master_proxy.active_fx = self.master_active_fx
                 master_proxy.tint_color = self.master_tint_color
@@ -1098,7 +1130,7 @@ class Worker(QObject):
 
             # Apply Master Fader
             if self.master_fader < 1.0:
-                projector_output = (projector_output * self.master_fader).astype(np.uint8)
+                projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
 
             # 9-point grid warping (piecewise perspective optimization)
             if self._warp_is_identity:

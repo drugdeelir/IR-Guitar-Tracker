@@ -199,7 +199,7 @@ class ProjectionMappingApp(QMainWindow):
             "Noir": ((50, 50, 50), (150, 150, 150)),    # Gray, White
             "None": ((255, 255, 255), (255, 255, 255))
         }
-        self.setup_step = 0 # 0: Camera, 1: Markers, 2: BG, 3: Amp, 4: Done
+        self.setup_step = 0 # 0: Camera, 1: BG, 2: Guitar, 3: Done
         self.current_project_path = None
 
         # Default MIDI Mappings
@@ -291,38 +291,46 @@ class ProjectionMappingApp(QMainWindow):
         mask_names = [mask.name for mask in self.masks]
 
         for combo_name in ['setup_link_mask_combo', 'workspace_link_mask_combo']:
-            if hasattr(self, combo_name):
-                combo = getattr(self, combo_name)
-                curr = combo.currentText()
-                combo.blockSignals(True)
-                combo.clear()
-                combo.addItems(mask_names)
-                if curr in mask_names:
-                    combo.setCurrentText(curr)
-                combo.blockSignals(False)
+            combo = getattr(self, combo_name, None)
+            if combo:
+                try:
+                    curr = combo.currentText()
+                    combo.blockSignals(True)
+                    combo.clear()
+                    combo.addItems(mask_names)
+                    if curr in mask_names:
+                        combo.setCurrentText(curr)
+                    combo.blockSignals(False)
+                except RuntimeError: pass
 
         self.refresh_link_status_labels()
 
     def refresh_link_status_labels(self):
-        if hasattr(self, 'setup_link_status_label') and hasattr(self, 'setup_link_mask_combo'):
-            selected = self.setup_link_mask_combo.currentText()
-            linked = any(m.name == selected and m.is_linked for m in self.masks)
-            if linked:
-                self.setup_link_status_label.setText("Status: LINKED")
-                self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
-            else:
-                self.setup_link_status_label.setText("Status: Not Linked")
-                self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        try:
+            if hasattr(self, 'setup_link_status_label') and self.setup_link_status_label and hasattr(self, 'setup_link_mask_combo'):
+                selected = self.setup_link_mask_combo.currentText()
+                linked = any(m.name == selected and m.is_linked for m in self.masks)
+                if linked:
+                    self.setup_link_status_label.setText("Status: LINKED")
+                    self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
+                else:
+                    self.setup_link_status_label.setText("Status: Not Linked")
+                    self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        except RuntimeError:
+            pass
 
-        if hasattr(self, 'workspace_link_status_label') and hasattr(self, 'workspace_link_mask_combo'):
-            selected = self.workspace_link_mask_combo.currentText()
-            linked = any(m.name == selected and m.is_linked for m in self.masks)
-            if linked:
-                self.workspace_link_status_label.setText("Status: LINKED")
-                self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
-            else:
-                self.workspace_link_status_label.setText("Status: Not Linked")
-                self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        try:
+            if hasattr(self, 'workspace_link_status_label') and self.workspace_link_status_label and hasattr(self, 'workspace_link_mask_combo'):
+                selected = self.workspace_link_mask_combo.currentText()
+                linked = any(m.name == selected and m.is_linked for m in self.masks)
+                if linked:
+                    self.workspace_link_status_label.setText("Status: LINKED")
+                    self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
+                else:
+                    self.workspace_link_status_label.setText("Status: Not Linked")
+                    self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        except RuntimeError:
+            pass
 
     def assign_media_to_mask(self):
         selected_media_indices = [idx.row() for idx in self.media_list.selectedIndexes()]
@@ -388,15 +396,19 @@ class ProjectionMappingApp(QMainWindow):
             status_text = "Status: LINKED" if mask.is_linked else "Status: Not Linked"
             status_color = "#00c853" if mask.is_linked else "#ff5252"
 
-            if hasattr(self, 'setup_link_status_label'):
-                self.setup_link_status_label.setText(status_text)
-                self.setup_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
-            if hasattr(self, 'workspace_link_status_label'):
-                self.workspace_link_status_label.setText(status_text)
-                self.workspace_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
+            if getattr(self, 'setup_link_status_label', None):
+                try:
+                    self.setup_link_status_label.setText(status_text)
+                    self.setup_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
+                except RuntimeError: pass
+            if getattr(self, 'workspace_link_status_label', None):
+                try:
+                    self.workspace_link_status_label.setText(status_text)
+                    self.workspace_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
+                except RuntimeError: pass
 
             # Update combo selection to match
-            if hasattr(self, 'setup_link_mask_combo'):
+            if getattr(self, 'setup_link_mask_combo', None):
                 self.setup_link_mask_combo.setCurrentText(mask.name)
             if hasattr(self, 'workspace_link_mask_combo'):
                 self.workspace_link_mask_combo.setCurrentText(mask.name)
@@ -437,7 +449,8 @@ class ProjectionMappingApp(QMainWindow):
             pass
         self.marker_selection_dialog.take_picture_button.clicked.connect(self.start_marker_capture_countdown)
 
-        if self.marker_selection_dialog.exec_():
+        res = self.marker_selection_dialog.exec_()
+        if res:
             import numpy as np
             new_markers = self.marker_selection_dialog.get_selected_points()
 
@@ -461,6 +474,7 @@ class ProjectionMappingApp(QMainWindow):
             print(f"Selected {len(self.selected_markers)} markers.")
             self.worker.set_marker_points(self.selected_markers)
             self.maybe_auto_save()
+        return res
 
     def start_marker_capture_countdown(self):
         self.marker_selection_dialog.take_picture_button.setEnabled(False)
@@ -529,6 +543,10 @@ class ProjectionMappingApp(QMainWindow):
         self.tabs.insertTab(0, self.setup_tab, "Setup Wizard")
 
     def clear_setup_layout(self):
+        # Reset specific references to avoid RuntimeErrors on deleted widgets
+        self.setup_link_status_label = None
+        self.setup_link_mask_combo = None
+
         while self.setup_group_layout.count():
             item = self.setup_group_layout.takeAt(0)
             widget = item.widget()
@@ -545,37 +563,40 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_instruction.setWordWrap(True)
         self.setup_group_layout.addWidget(self.setup_instruction)
 
-        if self.setup_step == 1: # Markers
-            self.setup_group.setTitle("Step 2: Calibrate Guitar Markers")
-            self.setup_instruction.setText("1. Point camera at your guitar.\n2. Adjust IR Threshold if needed.\n3. Click to start calibration.\n4. Snap to 4 points on your guitar.")
-
-            # Add IR Threshold Slider to Wizard
-            ir_label = QLabel("IR Threshold:")
-            self.setup_group_layout.addWidget(ir_label)
-
-            wizard_ir_slider = QSlider(Qt.Horizontal)
-            wizard_ir_slider.setRange(0, 255)
-            wizard_ir_slider.setValue(self.ir_threshold_slider.value())
-            wizard_ir_slider.valueChanged.connect(self.update_ir_threshold)
-            # Sync with main slider
-            wizard_ir_slider.valueChanged.connect(self.ir_threshold_slider.setValue)
-            self.ir_threshold_slider.valueChanged.connect(wizard_ir_slider.setValue)
-            self.setup_group_layout.addWidget(wizard_ir_slider)
-
-            btn = QPushButton("Open Marker Calibration")
-            btn.clicked.connect(self.open_marker_selection_dialog)
-            btn.setMinimumHeight(40)
-            self.setup_group_layout.addWidget(btn)
-        elif self.setup_step == 2: # Background
-            self.setup_group.setTitle("Step 3: Background Mask")
+        if self.setup_step == 1: # Background
+            self.setup_group.setTitle("Step 2: Background Mask")
             self.setup_instruction.setText("Create a mask for your background projection area.")
             btn = QPushButton("Start Drawing Background Mask")
             btn.clicked.connect(self.start_setup_bg_mask)
             self.setup_group_layout.addWidget(btn)
-        elif self.setup_step == 3: # Guitar
-            self.setup_group.setTitle("Step 4: Guitar Mask")
-            self.setup_instruction.setText("1. Draw a mask for your guitar.\n2. Click 'Finish & Save'.\n3. Click 'Link to Tracking' to bind it.")
-            btn = QPushButton("Start Drawing Guitar Mask")
+        elif self.setup_step == 2: # Guitar
+            self.setup_group.setTitle("Step 3: Guitar Setup")
+            self.setup_instruction.setText("1. Pick dots on guitar\n2. Draw Guitar Mask\n3. Click 'Link' to finish.")
+
+            # Add IR Threshold Slider to Wizard
+            ir_label = QLabel("IR Threshold:")
+            self.setup_group_layout.addWidget(ir_label)
+            wizard_ir_slider = QSlider(Qt.Horizontal)
+            wizard_ir_slider.setRange(0, 255)
+            wizard_ir_slider.setValue(self.ir_threshold_slider.value())
+            wizard_ir_slider.valueChanged.connect(self.update_ir_threshold)
+            wizard_ir_slider.valueChanged.connect(self.ir_threshold_slider.setValue)
+            self.ir_threshold_slider.valueChanged.connect(wizard_ir_slider.setValue)
+            self.setup_group_layout.addWidget(wizard_ir_slider)
+
+            btn_guided = QPushButton("START GUIDED GUITAR SETUP")
+            btn_guided.clicked.connect(self.start_guided_guitar_setup)
+            btn_guided.setMinimumHeight(60)
+            btn_guided.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; font-size: 14px;")
+            self.setup_group_layout.addWidget(btn_guided)
+
+            # Keep individual buttons as fallbacks
+            marker_btn = QPushButton("Recalibrate Markers Only")
+            marker_btn.clicked.connect(self.open_marker_selection_dialog)
+            marker_btn.setStyleSheet("background-color: #4a148c; color: white;")
+            self.setup_group_layout.addWidget(marker_btn)
+
+            btn = QPushButton("Redraw Mask Only")
             btn.clicked.connect(self.start_setup_amp_mask)
             self.setup_group_layout.addWidget(btn)
 
@@ -594,7 +615,7 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
             self.setup_group_layout.addWidget(self.setup_link_status_label)
             self.update_mask_combos()
-        elif self.setup_step == 4: # Done
+        elif self.setup_step == 3: # Done
             self.setup_group.setTitle("Setup Complete")
             self.setup_instruction.setText("Setup finished! You can save this configuration as a preset below.")
 
@@ -647,6 +668,10 @@ class ProjectionMappingApp(QMainWindow):
         self.mask_type_combo.setCurrentText("static")
         self.add_wizard_finish_button()
         self.enter_mask_creation_mode()
+
+    def start_guided_guitar_setup(self):
+        if self.open_marker_selection_dialog():
+            self.start_setup_amp_mask()
 
     def start_setup_amp_mask(self):
         self.video_display.clear_mask_points()
@@ -954,6 +979,11 @@ class ProjectionMappingApp(QMainWindow):
         self.edit_playlist_btn.clicked.connect(self.open_playlist_editor)
         cue_layout.addWidget(self.edit_playlist_btn)
 
+        self.play_cue_btn = QPushButton("▶ PLAY / RESTART CUE")
+        self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+        self.play_cue_btn.clicked.connect(self.play_selected_cue)
+        cue_layout.addWidget(self.play_cue_btn)
+
         cue_group.setLayout(cue_layout)
         layout.addWidget(cue_group, 2)
 
@@ -1002,7 +1032,8 @@ class ProjectionMappingApp(QMainWindow):
         depth_layout = QFormLayout()
         self.calibrate_depth_button = QPushButton("Calibrate Depth")
         self.calibrate_depth_button.clicked.connect(self.calibrate_depth)
-        depth_layout.addRow(self.calibrate_depth_button)
+        self.depth_calibration_label = QLabel("Not Calibrated")
+        depth_layout.addRow(self.calibrate_depth_button, self.depth_calibration_label)
 
         self.depth_sensitivity_slider = QSlider(Qt.Horizontal)
         self.depth_sensitivity_slider.setRange(0, 200)
@@ -1542,9 +1573,22 @@ class ProjectionMappingApp(QMainWindow):
                 mask.feather = self.mask_feather_slider.value()
 
                 self.update_cue_table()
+                self.update_mask_combos()
                 self.worker.set_masks(self.masks)
                 self.statusBar().showMessage(f"Mask '{mask.name}' saved with {len(mask_points)} points.", 3000)
                 self.maybe_auto_save()
+
+    def play_selected_cue(self):
+        row = self.cue_table.currentRow()
+        if row >= 0 and row < len(self.masks):
+            mask = self.masks[row]
+            if mask.video_path:
+                self.worker.restart_mask_video(mask.video_path)
+                self.statusBar().showMessage(f"Restarted playback for '{mask.name}'", 2000)
+            else:
+                self.statusBar().showMessage("No video assigned to this mask.", 3000)
+        else:
+            self.statusBar().showMessage("Select a mask in the table first.", 3000)
 
     def open_playlist_editor(self):
         selected_mask_row = self.cue_table.currentRow()
@@ -1617,6 +1661,10 @@ class ProjectionMappingApp(QMainWindow):
             self.statusBar().showMessage("Please draw the mask points first.", 3000)
             return
 
+        if mask.is_linked:
+            self.statusBar().showMessage(f"Mask '{mask.name}' is already linked. Redraw it to change its shape.", 5000)
+            return
+
         # Normalize points to reference frame so they stay locked to the guitar
         # regardless of where it was when "Link" was clicked.
         mask.source_points = self.worker.normalize_points_to_reference(mask.source_points)
@@ -1626,12 +1674,18 @@ class ProjectionMappingApp(QMainWindow):
         # Update Status Labels
         status_text = "Status: LINKED"
         status_color = "#00c853"
-        if hasattr(self, 'setup_link_status_label'):
-            self.setup_link_status_label.setText(status_text)
-            self.setup_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
-        if hasattr(self, 'workspace_link_status_label'):
-            self.workspace_link_status_label.setText(status_text)
-            self.workspace_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
+
+        if getattr(self, 'setup_link_status_label', None):
+            try:
+                self.setup_link_status_label.setText(status_text)
+                self.setup_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
+            except RuntimeError: pass
+
+        if getattr(self, 'workspace_link_status_label', None):
+            try:
+                self.workspace_link_status_label.setText(status_text)
+                self.workspace_link_status_label.setStyleSheet(f"font-weight: bold; color: {status_color};")
+            except RuntimeError: pass
 
         self.update_cue_table() # Refresh table to show link status
         self.statusBar().showMessage(f"Mask '{mask.name}' linked to guitar tracking.", 3000)
