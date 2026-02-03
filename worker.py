@@ -950,11 +950,17 @@ class Worker(QObject):
                         # Warp video to the dynamic polygon
                         # We need a homography from video full frame to current mask polygon
                         video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
-                        # If mask points are 4, use perspective transform, else homography
+
+                        # If mask points are not 4, we map the 4 video corners to the bounding box of the polygon
+                        # to ensure the video "fills" the area without OpenCV errors.
                         if len(dst_pts) == 4:
                             matrix = cv2.getPerspectiveTransform(video_corners, dst_pts)
                         else:
-                            matrix, _ = cv2.findHomography(video_corners, dst_pts)
+                            # Use bounding box for non-4-point polygons
+                            min_x, min_y = np.min(dst_pts, axis=0)
+                            max_x, max_y = np.max(dst_pts, axis=0)
+                            bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+                            matrix = cv2.getPerspectiveTransform(video_corners, bbox_pts)
 
                         warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
                         self.mask_buffer.fill(0)
@@ -994,7 +1000,16 @@ class Worker(QObject):
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
                             dst_pts = np.float32(mask.source_points)
-                            matrix, _ = cv2.findHomography(src_pts, dst_pts)
+
+                            if len(dst_pts) == 4:
+                                matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                            else:
+                                # Use bounding box for non-4-point polygons
+                                min_x, min_y = np.min(dst_pts, axis=0)
+                                max_x, max_y = np.max(dst_pts, axis=0)
+                                bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+                                matrix = cv2.getPerspectiveTransform(src_pts, bbox_pts)
+
                             warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
 
                             self.mask_buffer.fill(0)
