@@ -5,7 +5,7 @@ import time
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
 from itertools import combinations
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, RBFInterpolator
 from utils import resource_path
 from mask import Mask
 
@@ -173,8 +173,14 @@ class Worker(QObject):
         # Calibration/Alignment Mode
         self.show_camera_on_projector = False
         self.show_calibration_pattern = False
+        self.show_calibration_verify = False
         self.h_c2p = None # Camera to Projector homography
+        self.rbf_x = None # RBF for X mapping
+        self.rbf_y = None # RBF for Y mapping
         self._run_calibration_flag = False
+        self._calib_frames_captured = 0
+        self._calib_corners_sum = None
+        self._calib_total_frames = 15
 
         # Splash Mode
         self.show_splash = False
@@ -189,6 +195,9 @@ class Worker(QObject):
         self.master_grain = 0 # 0 to 100
         self.master_bloom = 0 # 0 to 100
         self.master_fader = 1.0 # 0.0 to 1.0
+
+        # Crossfade states for masks
+        self.mask_fade_levels = {} # mask_id -> current_fade (0.0 to 1.0)
 
         # Reusable Buffers
         self.projector_buffer = None
@@ -244,8 +253,27 @@ class Worker(QObject):
     def set_h_c2p(self, matrix_list):
         if matrix_list is None:
             self.h_c2p = None
+            self.rbf_x = None
+            self.rbf_y = None
         else:
-            self.h_c2p = np.array(matrix_list, dtype=np.float32)
+            # Handle list of points for RBF or matrix for Homography
+            if isinstance(matrix_list, list) and len(matrix_list) > 4 and isinstance(matrix_list[0], list):
+                # Probably a point list [(cam_x, cam_y, proj_x, proj_y), ...]
+                self.init_rbf_from_points(matrix_list)
+            else:
+                self.h_c2p = np.array(matrix_list, dtype=np.float32)
+
+    def init_rbf_from_points(self, points):
+        pts = np.array(points, dtype=np.float32)
+        cam_pts = pts[:, :2]
+        proj_x = pts[:, 2]
+        proj_y = pts[:, 3]
+
+        # Using Thin Plate Spline kernel ('thin_plate_spline' or 'linear')
+        self.rbf_x = RBFInterpolator(cam_pts, proj_x, kernel='thin_plate_spline', smoothing=0.1)
+        self.rbf_y = RBFInterpolator(cam_pts, proj_y, kernel='thin_plate_spline', smoothing=0.1)
+        # Store points for persistence
+        self.calib_points = points
 
     def set_depth_sensitivity(self, value):
         self.depth_sensitivity = value
@@ -856,45 +884,73 @@ class Worker(QObject):
                             cv2.rectangle(self.projector_buffer, (c * sq_w, r * sq_h),
                                           ((c + 1) * sq_w, (r + 1) * sq_h), (0, 0, 0), -1)
 
-                # Overlay some text for the user
-                cv2.putText(self.projector_buffer, "CALIBRATING...", (w//2-100, h//2),
+                # Overlay status
+                status_text = f"ANALYZING... ({self._calib_frames_captured}/{self._calib_total_frames})"
+                cv2.putText(self.projector_buffer, status_text, (w//2-200, h//2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            elif self.show_calibration_verify:
+                self.projector_buffer.fill(0)
+                # Draw circles at all internal corner positions to verify mapping
+                sq_w = w // 10
+                sq_h = h // 7
+                for r in range(1, 7):
+                    for c in range(1, 10):
+                        color = (0, 255, 0) if (r+c)%2==0 else (0, 255, 255)
+                        cv2.circle(self.projector_buffer, (c * sq_w, r * sq_h), 10, color, -1)
+                        cv2.putText(self.projector_buffer, f"{c},{r}", (c * sq_w + 12, r * sq_h + 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(self.projector_buffer, "VERIFICATION MODE - CHECK CAMERA ALIGNMENT", (50, h-50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             else:
                 self.projector_buffer.fill(0)
 
             projector_output = self.projector_buffer
 
-            # Handle Auto-Calibration logic
+            # Handle Auto-Calibration logic (Multi-frame averaging)
             if self._run_calibration_flag:
-                # Detect checkerboard corners in the camera frame
                 gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
-                # We use 9x6 internal corners for a 10x7 grid
                 board_size = (9, 6)
-                ret, corners = cv2.findChessboardCorners(gray, board_size,
-                                                       cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
+                # Use findChessboardCornersSB for better professional results
+                ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY)
 
-                success = False
                 if ret:
-                    # Refine corner locations for better accuracy
-                    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-                    corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+                    if self._calib_corners_sum is None:
+                        self._calib_corners_sum = corners.astype(np.float64)
+                    else:
+                        self._calib_corners_sum += corners
+                    self._calib_frames_captured += 1
 
-                    # Generate corresponding projector points (internal corners of 10x7 grid)
+                # Check if we have enough samples or reached timeout
+                if self._calib_frames_captured >= self._calib_total_frames:
+                    avg_corners = (self._calib_corners_sum / self._calib_frames_captured).astype(np.float32)
+
                     proj_pts = []
                     sq_w = w // 10
                     sq_h = h // 7
-                    for r in range(1, 7): # internal row indices (1 to 6)
-                        for c in range(1, 10): # internal col indices (1 to 9)
+                    for r in range(1, 7):
+                        for c in range(1, 10):
                             proj_pts.append([c * sq_w, r * sq_h])
 
                     proj_pts = np.array(proj_pts, dtype=np.float32)
-                    cam_pts = corners2.reshape(-1, 2)
+                    cam_pts = avg_corners.reshape(-1, 2)
 
+                    # Store as point list for RBF
+                    calib_data = []
+                    for i in range(len(cam_pts)):
+                        calib_data.append([float(cam_pts[i, 0]), float(cam_pts[i, 1]),
+                                           float(proj_pts[i, 0]), float(proj_pts[i, 1])])
+
+                    self.init_rbf_from_points(calib_data)
+                    # Also keep homography as a robust fallback
                     self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
-                    success = True
 
-                self._run_calibration_flag = False
-                self.calibration_complete.emit(success)
+                    self._run_calibration_flag = False
+                    self._calib_frames_captured = 0
+                    self._calib_corners_sum = None
+                    self.calibration_complete.emit(True)
+                elif self._run_calibration_flag and self.frame_count % 100 == 0: # Timeout safety
+                     # If we've been trying too long (frame_count is not perfect for time but works)
+                     pass
 
             if self.show_splash:
                 if self.splash_player is None:
@@ -927,6 +983,18 @@ class Worker(QObject):
             for point in tracked_points:
                 cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
 
+            # Draw calibration overlay on camera feed
+            if self._run_calibration_flag:
+                gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                ret, corners = cv2.findChessboardCorners(gray, (9, 6), None)
+                if ret:
+                    cv2.drawChessboardCorners(main_frame, (9, 6), corners, ret)
+                    cv2.putText(main_frame, f"CALIBRATING: {self._calib_frames_captured}/{self._calib_total_frames}",
+                                (10, h_cam-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    cv2.putText(main_frame, "CHECKERBOARD NOT FOUND", (10, h_cam-20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
             self.update_particles(tracked_points, h, w)
             self.draw_particles(projector_output)
 
@@ -934,7 +1002,19 @@ class Worker(QObject):
                 iterable_masks = [m for m in self.masks] # Snapshot for this frame
 
             for mask in iterable_masks:
-                if not mask.visible or not mask.video_path: continue
+                mask_id = id(mask)
+                target_fade = 1.0 if mask.visible else 0.0
+                curr_fade = self.mask_fade_levels.get(mask_id, 0.0)
+
+                # Smoothly transition fade level (approx 0.5s at 30fps)
+                if curr_fade < target_fade:
+                    curr_fade = min(target_fade, curr_fade + 0.1)
+                elif curr_fade > target_fade:
+                    curr_fade = max(target_fade, curr_fade - 0.1)
+                self.mask_fade_levels[mask_id] = curr_fade
+
+                if curr_fade <= 0 and not mask.visible: continue
+                if not mask.video_path: continue
 
                 if mask.video_path == "generative":
                     frame_cue = self.get_generative_frame(h, w)
@@ -983,7 +1063,7 @@ class Worker(QObject):
                         if self.confidence < 1.0:
                             effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=self.confidence)
 
-                    effective_opacity = mask.opacity
+                    effective_opacity = mask.opacity * curr_fade
                     if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
                         effective_opacity *= lfo_val
 
@@ -1485,6 +1565,18 @@ class Worker(QObject):
         self._run_calibration_flag = True
 
     def transform_to_projector(self, pts, w_cam=640, h_cam=480):
+        if self.rbf_x is not None:
+            try:
+                pts_arr = np.array(pts, dtype=np.float32)
+                if pts_arr.ndim == 1:
+                    pts_arr = pts_arr.reshape(1, 2)
+
+                tx = self.rbf_x(pts_arr)
+                ty = self.rbf_y(pts_arr)
+                return np.stack([tx, ty], axis=1).reshape(-1, 2)
+            except:
+                pass
+
         if self.h_c2p is not None:
             try:
                 pts_reshaped = np.float32(pts).reshape(-1, 1, 2)

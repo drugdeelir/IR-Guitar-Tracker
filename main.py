@@ -567,6 +567,11 @@ class ProjectionMappingApp(QMainWindow):
         self.manual_align_btn.clicked.connect(self.start_manual_calibration)
         self.setup_group_layout.addWidget(self.manual_align_btn)
 
+        self.verify_align_btn = QPushButton("VERIFY ALIGNMENT")
+        self.verify_align_btn.setCheckable(True)
+        self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
+        self.setup_group_layout.addWidget(self.verify_align_btn)
+
         self.test_pattern_check = QCheckBox("Show Test Pattern (Manual Alignment Check)")
         self.test_pattern_check.toggled.connect(self.toggle_test_pattern)
         self.setup_group_layout.addWidget(self.test_pattern_check)
@@ -1379,6 +1384,7 @@ class ProjectionMappingApp(QMainWindow):
                 'midi_mappings': self.midi_mappings,
                 'marker_config': self.worker.marker_config,
                 'h_c2p': self.worker.h_c2p.tolist() if self.worker.h_c2p is not None else None,
+                'calib_points': getattr(self.worker, 'calib_points', None),
                 'baseline_distance': self.worker.baseline_distance,
                 'setup_reference': ref_frame_b64,
                 'master_visuals': {
@@ -1473,8 +1479,13 @@ class ProjectionMappingApp(QMainWindow):
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
 
                 h_c2p = data.get('h_c2p')
-                if h_c2p:
+                calib_points = data.get('calib_points')
+                if calib_points:
+                    self.worker.set_h_c2p(calib_points)
+                elif h_c2p:
                     self.worker.set_h_c2p(h_c2p)
+
+                if calib_points or h_c2p:
                     if hasattr(self, 'setup_status_label') and self.setup_status_label:
                         self.setup_status_label.setText("Mapping: ALIGNED (Loaded) ✓")
                         self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
@@ -1884,6 +1895,13 @@ class ProjectionMappingApp(QMainWindow):
 
     def update_tracker_label(self, count):
         self.ir_trackers_label.setText(f"Trackers detected: {count}")
+
+    def toggle_verify_alignment(self, checked):
+        self.worker.show_calibration_verify = checked
+        if checked:
+            self.statusBar().showMessage("Verify: Projected circles should match camera dots.", 0)
+        else:
+            self.statusBar().showMessage("", 0)
 
     def toggle_test_pattern(self, checked):
         self.worker.show_calibration_pattern = checked
