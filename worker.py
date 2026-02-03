@@ -873,31 +873,60 @@ class Worker(QObject):
             if self.show_camera_on_projector:
                 cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
             elif self.show_calibration_pattern:
-                # Draw a checkerboard pattern for robust calibration
+                # Draw a centered checkerboard pattern for robust calibration
+                # Inset by 15% to ensure it stays on camera even if alignment is rough
                 self.projector_buffer.fill(255) # White background
-                cols, rows = 10, 7
-                sq_w = w // cols
-                sq_h = h // rows
+                margin_x = int(w * 0.15)
+                margin_y = int(h * 0.15)
+                grid_w = w - 2 * margin_x
+                grid_h = h - 2 * margin_y
+
+                cols, rows = 10, 7 # 9x6 internal corners
+                sq_w = grid_w // cols
+                sq_h = grid_h // rows
+
+                # Center the actual grid
+                start_x = margin_x + (grid_w % cols) // 2
+                start_y = margin_y + (grid_h % rows) // 2
+
                 for r in range(rows):
                     for c in range(cols):
                         if (r + c) % 2 == 1:
-                            cv2.rectangle(self.projector_buffer, (c * sq_w, r * sq_h),
-                                          ((c + 1) * sq_w, (r + 1) * sq_h), (0, 0, 0), -1)
+                            cv2.rectangle(self.projector_buffer,
+                                          (start_x + c * sq_w, start_y + r * sq_h),
+                                          (start_x + (c + 1) * sq_w, start_y + (r + 1) * sq_h),
+                                          (0, 0, 0), -1)
 
-                # Overlay status
+                # Overlay status (moved to bottom to avoid grid interference)
                 status_text = f"ANALYZING... ({self._calib_frames_captured}/{self._calib_total_frames})"
-                cv2.putText(self.projector_buffer, status_text, (w//2-200, h//2),
+                if hasattr(self, '_last_calib_attempt_time') and time.time() - self._last_calib_attempt_time > 3.0:
+                    status_text += " (Check Exposure/Alignment)"
+                cv2.putText(self.projector_buffer, status_text, (w//2-200, h - 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+                # Visual capture confirmation
+                if hasattr(self, '_last_calib_success_time') and time.time() - self._last_calib_success_time < 0.2:
+                    # Flash green border on successful frame capture
+                    cv2.rectangle(self.projector_buffer, (0, 0), (w, h), (0, 255, 0), 20)
             elif self.show_calibration_verify:
                 self.projector_buffer.fill(0)
                 # Draw circles at all internal corner positions to verify mapping
-                sq_w = w // 10
-                sq_h = h // 7
+                margin_x = int(w * 0.15)
+                margin_y = int(h * 0.15)
+                grid_w = w - 2 * margin_x
+                grid_h = h - 2 * margin_y
+                sq_w = grid_w // 10
+                sq_h = grid_h // 7
+                start_x = margin_x + (grid_w % 10) // 2
+                start_y = margin_y + (grid_h % 7) // 2
+
                 for r in range(1, 7):
                     for c in range(1, 10):
                         color = (0, 255, 0) if (r+c)%2==0 else (0, 255, 255)
-                        cv2.circle(self.projector_buffer, (c * sq_w, r * sq_h), 10, color, -1)
-                        cv2.putText(self.projector_buffer, f"{c},{r}", (c * sq_w + 12, r * sq_h + 5),
+                        target_x = start_x + c * sq_w
+                        target_y = start_y + r * sq_h
+                        cv2.circle(self.projector_buffer, (target_x, target_y), 10, color, -1)
+                        cv2.putText(self.projector_buffer, f"{c},{r}", (target_x + 12, target_y + 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                 cv2.putText(self.projector_buffer, "VERIFICATION MODE - CHECK CAMERA ALIGNMENT", (50, h-50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -910,8 +939,8 @@ class Worker(QObject):
             if self._run_calibration_flag:
                 gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
                 board_size = (9, 6)
-                # Use findChessboardCornersSB for better professional results
-                ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY)
+                # Use findChessboardCornersSB with EXHAUSTIVE for maximum robustness
+                ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY | cv2.CALIB_CB_EXHAUSTIVE)
 
                 if ret:
                     if self._calib_corners_sum is None:
@@ -919,17 +948,43 @@ class Worker(QObject):
                     else:
                         self._calib_corners_sum += corners
                     self._calib_frames_captured += 1
+                    self._last_calib_success_time = time.time()
+                    self._last_calib_attempt_time = time.time()
+                else:
+                    if not hasattr(self, '_last_calib_attempt_time'):
+                        self._last_calib_attempt_time = time.time()
+
+                    if time.time() - self._last_calib_attempt_time > 5.0:
+                        # If stuck for 5 seconds, try standard detection as fallback
+                        ret, corners = cv2.findChessboardCorners(gray, board_size,
+                                                                cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
+                        if ret:
+                            if self._calib_corners_sum is None:
+                                self._calib_corners_sum = corners.astype(np.float64)
+                            else:
+                                self._calib_corners_sum += corners
+                            self._calib_frames_captured += 1
+                            self._last_calib_success_time = time.time()
+                            self._last_calib_attempt_time = time.time()
 
                 # Check if we have enough samples or reached timeout
                 if self._calib_frames_captured >= self._calib_total_frames:
                     avg_corners = (self._calib_corners_sum / self._calib_frames_captured).astype(np.float32)
 
+                    # Calculate reference points matching the centered pattern
+                    margin_x = int(w * 0.15)
+                    margin_y = int(h * 0.15)
+                    grid_w = w - 2 * margin_x
+                    grid_h = h - 2 * margin_y
+                    sq_w = grid_w // 10
+                    sq_h = grid_h // 7
+                    start_x = margin_x + (grid_w % 10) // 2
+                    start_y = margin_y + (grid_h % 7) // 2
+
                     proj_pts = []
-                    sq_w = w // 10
-                    sq_h = h // 7
                     for r in range(1, 7):
                         for c in range(1, 10):
-                            proj_pts.append([c * sq_w, r * sq_h])
+                            proj_pts.append([start_x + c * sq_w, start_y + r * sq_h])
 
                     proj_pts = np.array(proj_pts, dtype=np.float32)
                     cam_pts = avg_corners.reshape(-1, 2)
@@ -1106,12 +1161,23 @@ class Worker(QObject):
                         # to ensure the video "fills" the area without OpenCV errors.
                         # Using findHomography for better robustness with varied point counts.
                         if len(dst_pts) == 4:
-                            dst_pts_warp = np.float32(dst_pts).reshape(4, 2)
-                        else:
+                            dst_pts_warp = np.float32(dst_pts).reshape(-1, 2)
+                        elif len(dst_pts) >= 3:
                             # Use bounding box for non-4-point polygons
-                            min_x, min_y = np.min(dst_pts, axis=0)
-                            max_x, max_y = np.max(dst_pts, axis=0)
+                            dst_pts_arr = np.array(dst_pts, dtype=np.float32)
+                            if not np.all(np.isfinite(dst_pts_arr)):
+                                continue
+                            min_x, min_y = np.min(dst_pts_arr, axis=0)
+                            max_x, max_y = np.max(dst_pts_arr, axis=0)
                             dst_pts_warp = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+                        else:
+                            continue # Not enough points to warp
+
+                        if dst_pts_warp.shape[0] != 4 or video_corners.shape[0] != 4:
+                            continue
+
+                        if not np.all(np.isfinite(dst_pts_warp)):
+                            continue
 
                         matrix, _ = cv2.findHomography(video_corners, dst_pts_warp)
 
