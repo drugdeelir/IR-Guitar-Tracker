@@ -965,14 +965,19 @@ class Worker(QObject):
 
                         # If mask points are not 4, we map the 4 video corners to the bounding box of the polygon
                         # to ensure the video "fills" the area without OpenCV errors.
+                        # Using findHomography for better robustness with varied point counts.
                         if len(dst_pts) == 4:
-                            matrix = cv2.getPerspectiveTransform(video_corners, dst_pts)
+                            dst_pts_warp = np.float32(dst_pts).reshape(4, 2)
                         else:
                             # Use bounding box for non-4-point polygons
                             min_x, min_y = np.min(dst_pts, axis=0)
                             max_x, max_y = np.max(dst_pts, axis=0)
-                            bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
-                            matrix = cv2.getPerspectiveTransform(video_corners, bbox_pts)
+                            dst_pts_warp = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+
+                        matrix, _ = cv2.findHomography(video_corners, dst_pts_warp)
+
+                        if matrix is None:
+                            continue
 
                         warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
                         self.mask_buffer.fill(0)
@@ -1351,7 +1356,7 @@ class Worker(QObject):
                 ny = int(center[1] + (dist-10) * np.sin(angle + 100/(dist-10)))
                 cv2.line(frame, (x, y), (nx, ny), (100, 50, 150), 1, cv2.LINE_AA)
 
-        return frame
+        return frame.copy()
 
     def get_generative_frame(self, h, w):
         self.noise_offset += 0.05

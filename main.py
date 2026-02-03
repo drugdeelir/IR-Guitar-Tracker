@@ -565,40 +565,39 @@ class ProjectionMappingApp(QMainWindow):
 
         if self.setup_step == 1: # Background
             self.setup_group.setTitle("Step 2: Background Mask")
-            self.setup_instruction.setText("Create a mask for your background projection area.")
+            self.setup_instruction.setText("Create a mask for your background projection area. This area will stay static.")
             btn = QPushButton("Start Drawing Background Mask")
             btn.clicked.connect(self.start_setup_bg_mask)
+            btn.setMinimumHeight(50)
             self.setup_group_layout.addWidget(btn)
-        elif self.setup_step == 2: # Guitar
-            self.setup_group.setTitle("Step 3: Guitar Setup")
-            self.setup_instruction.setText("1. Pick dots on guitar\n2. Draw Guitar Mask\n3. Click 'Link' to finish.")
+        elif self.setup_step == 2: # Guitar Markers
+            self.setup_group.setTitle("Step 3: Guitar Markers")
+            self.setup_instruction.setText("Identify the IR markers on your guitar. This allows the system to track its movement.")
 
-            # Add IR Threshold Slider to Wizard
-            ir_label = QLabel("IR Threshold:")
+            # IR Threshold Slider
+            ir_label = QLabel("IR Threshold (Adjust until only dots are visible):")
             self.setup_group_layout.addWidget(ir_label)
             wizard_ir_slider = QSlider(Qt.Horizontal)
             wizard_ir_slider.setRange(0, 255)
             wizard_ir_slider.setValue(self.ir_threshold_slider.value())
             wizard_ir_slider.valueChanged.connect(self.update_ir_threshold)
-            wizard_ir_slider.valueChanged.connect(self.ir_threshold_slider.setValue)
-            self.ir_threshold_slider.valueChanged.connect(wizard_ir_slider.setValue)
             self.setup_group_layout.addWidget(wizard_ir_slider)
 
-            btn_guided = QPushButton("START GUIDED GUITAR SETUP")
-            btn_guided.clicked.connect(self.start_guided_guitar_setup)
-            btn_guided.setMinimumHeight(60)
-            btn_guided.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; font-size: 14px;")
-            self.setup_group_layout.addWidget(btn_guided)
-
-            # Keep individual buttons as fallbacks
-            marker_btn = QPushButton("Recalibrate Markers Only")
+            marker_btn = QPushButton("CALIBRATE MARKERS")
             marker_btn.clicked.connect(self.open_marker_selection_dialog)
-            marker_btn.setStyleSheet("background-color: #4a148c; color: white;")
+            marker_btn.setMinimumHeight(60)
+            marker_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(marker_btn)
 
-            btn = QPushButton("Redraw Mask Only")
-            btn.clicked.connect(self.start_setup_amp_mask)
-            self.setup_group_layout.addWidget(btn)
+        elif self.setup_step == 3: # Guitar Mask
+            self.setup_group.setTitle("Step 4: Guitar Mask")
+            self.setup_instruction.setText("Draw the shape of your guitar or amp. This mask will follow the markers you calibrated.")
+
+            mask_btn = QPushButton("DRAW GUITAR MASK")
+            mask_btn.clicked.connect(self.start_setup_amp_mask)
+            mask_btn.setMinimumHeight(60)
+            mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
+            self.setup_group_layout.addWidget(mask_btn)
 
             self.setup_link_mask_combo = QComboBox()
             self.setup_link_mask_combo.setMinimumHeight(30)
@@ -607,7 +606,7 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_group_layout.addWidget(self.setup_link_mask_combo)
 
             link_btn = QPushButton("Link Selected Mask to Tracking")
-            link_btn.setStyleSheet("background-color: #311b92; color: white; height: 40px; margin-bottom: 10px;")
+            link_btn.setStyleSheet("background-color: #311b92; color: white; height: 40px;")
             link_btn.clicked.connect(self.link_mask_to_markers)
             self.setup_group_layout.addWidget(link_btn)
 
@@ -615,7 +614,8 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
             self.setup_group_layout.addWidget(self.setup_link_status_label)
             self.update_mask_combos()
-        elif self.setup_step == 3: # Done
+
+        elif self.setup_step == 4: # Done
             self.setup_group.setTitle("Setup Complete")
             self.setup_instruction.setText("Setup finished! You can save this configuration as a preset below.")
 
@@ -757,10 +757,14 @@ class ProjectionMappingApp(QMainWindow):
         mask_layout.addWidget(self.cue_list_widget)
 
         btn_layout = QHBoxLayout()
-        self.create_mask_button = QPushButton("New Mask")
+        self.create_mask_button = QPushButton("Draw/Edit Points")
         self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
+        self.add_mask_btn = QPushButton("Add New Mask")
+        self.add_mask_btn.clicked.connect(self.add_new_mask_prompt)
+        self.add_mask_btn.setStyleSheet("background-color: #1b5e20; color: white;")
         self.remove_cue_button = QPushButton("Delete")
         self.remove_cue_button.clicked.connect(self.remove_cue)
+        btn_layout.addWidget(self.add_mask_btn)
         btn_layout.addWidget(self.create_mask_button)
         btn_layout.addWidget(self.remove_cue_button)
         mask_layout.addLayout(btn_layout)
@@ -793,6 +797,28 @@ class ProjectionMappingApp(QMainWindow):
 
         mask_layout.addLayout(form)
 
+        # Tracking & Link in Workspace
+        self.tracking_section = QGroupBox("Tracking && Link")
+        link_layout = QVBoxLayout()
+
+        self.workspace_link_mask_combo = QComboBox()
+        self.workspace_link_mask_combo.setMinimumHeight(30)
+        self.workspace_link_mask_combo.currentIndexChanged.connect(self.refresh_link_status_labels)
+        link_layout.addWidget(QLabel("Select Mask to Link:"))
+        link_layout.addWidget(self.workspace_link_mask_combo)
+
+        self.workspace_link_btn = QPushButton("Link Selected Mask to Tracking")
+        self.workspace_link_btn.setStyleSheet("background-color: #311b92; color: white; min-height: 35px;")
+        self.workspace_link_btn.clicked.connect(self.link_mask_to_markers)
+        link_layout.addWidget(self.workspace_link_btn)
+
+        self.workspace_link_status_label = QLabel("Status: Not Linked")
+        self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        link_layout.addWidget(self.workspace_link_status_label)
+
+        self.tracking_section.setLayout(link_layout)
+        mask_layout.addWidget(self.tracking_section)
+
         edit_btns = QHBoxLayout()
         self.finish_mask_button = QPushButton("SAVE POINTS")
         self.finish_mask_button.setStyleSheet("background-color: #4a148c; color: white; font-weight: bold;")
@@ -804,19 +830,6 @@ class ProjectionMappingApp(QMainWindow):
         edit_btns.addWidget(self.finish_mask_button)
         edit_btns.addWidget(self.cancel_mask_button)
         mask_layout.addLayout(edit_btns)
-
-        self.workspace_link_mask_combo = QComboBox()
-        self.workspace_link_mask_combo.currentIndexChanged.connect(self.refresh_link_status_labels)
-        mask_layout.addWidget(QLabel("Select Mask to Link:"))
-        mask_layout.addWidget(self.workspace_link_mask_combo)
-
-        self.link_mask_button = QPushButton("Link to IR Tracking")
-        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
-        mask_layout.addWidget(self.link_mask_button)
-
-        self.workspace_link_status_label = QLabel("Status: Not Linked")
-        self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        mask_layout.addWidget(self.workspace_link_status_label)
 
         layer_layout = QHBoxLayout()
         self.front_btn = QPushButton("Bring to Front")
@@ -1541,15 +1554,20 @@ class ProjectionMappingApp(QMainWindow):
     def show_camera_error(self, index):
         self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
 
-    def enter_mask_creation_mode(self):
-        if self.cue_list_widget.currentRow() < 0:
-            mask_name, ok = QInputDialog.getText(self, "New Mask", "Enter Name for new mask:")
-            if not ok or not mask_name: return
+    def add_new_mask_prompt(self):
+        mask_name, ok = QInputDialog.getText(self, "New Mask", "Enter Name for new mask:")
+        if ok and mask_name:
             new_mask = Mask(mask_name, [], None)
             self.masks.append(new_mask)
             self.update_cue_table()
             self.cue_list_widget.setCurrentRow(len(self.masks)-1)
             self.update_mask_combos()
+            self.enter_mask_creation_mode()
+
+    def enter_mask_creation_mode(self):
+        if self.cue_list_widget.currentRow() < 0:
+            self.add_new_mask_prompt()
+            return
 
         self.video_display.set_mask_creation_mode(True)
         self.create_mask_button.setEnabled(False)
@@ -1560,23 +1578,49 @@ class ProjectionMappingApp(QMainWindow):
         mask_points = list(self.video_display.get_mask_points())
         self.video_display.set_mask_creation_mode(False)
         
-        current_item = self.cue_list_widget.currentItem()
-        if current_item and mask_points:
-            row = self.cue_list_widget.row(current_item)
-            if 0 <= row < len(self.masks):
-                mask = self.masks[row]
-                mask.source_points = [ (p.x(), p.y()) for p in mask_points]
-                mask.tag = self.mask_tag_combo.currentText()
-                mask.type = self.mask_type_combo.currentText()
-                mask.blend_mode = self.mask_blend_combo.currentText()
-                mask.bezier_enabled = self.bezier_check.isChecked()
-                mask.feather = self.mask_feather_slider.value()
+        if not mask_points:
+            self.cancel_mask_creation()
+            return
 
-                self.update_cue_table()
-                self.update_mask_combos()
-                self.worker.set_masks(self.masks)
-                self.statusBar().showMessage(f"Mask '{mask.name}' saved with {len(mask_points)} points.", 3000)
-                self.maybe_auto_save()
+        current_item = self.cue_list_widget.currentItem()
+        if current_item:
+            row = self.cue_list_widget.row(current_item)
+            mask = self.masks[row]
+        else:
+            # Creation mode was entered without a selection, or selection was cleared
+            new_name = f"Mask {len(self.masks) + 1}"
+            mask = Mask(new_name, [], None)
+            self.masks.append(mask)
+
+        mask.source_points = [(p.x(), p.y()) for p in mask_points]
+
+        # Update metadata from Workspace combos if they exist
+        if hasattr(self, 'mask_tag_combo'):
+            mask.tag = self.mask_tag_combo.currentText()
+        if hasattr(self, 'mask_type_combo'):
+            mask.type = self.mask_type_combo.currentText()
+        if hasattr(self, 'mask_blend_combo'):
+            mask.blend_mode = self.mask_blend_combo.currentText()
+        if hasattr(self, 'bezier_check'):
+            mask.bezier_enabled = self.bezier_check.isChecked()
+        if hasattr(self, 'mask_feather_slider'):
+            mask.feather = self.mask_feather_slider.value()
+
+        # Specific handling for Setup Wizard tags
+        if self.setup_step == 1: # Background step
+            mask.tag = 'background'
+            mask.type = 'static'
+            mask.name = 'Background'
+        elif self.setup_step == 3: # Guitar Mask step (now step 4, index 3)
+            mask.tag = 'amp'
+            mask.type = 'dynamic'
+            mask.name = 'Guitar'
+
+        self.update_cue_table()
+        self.update_mask_combos()
+        self.worker.set_masks(self.masks)
+        self.statusBar().showMessage(f"Mask '{mask.name}' saved with {len(mask_points)} points.", 3000)
+        self.maybe_auto_save()
 
     def play_selected_cue(self):
         row = self.cue_table.currentRow()
