@@ -563,6 +563,10 @@ class ProjectionMappingApp(QMainWindow):
         self.align_btn.clicked.connect(self.start_auto_calibration)
         self.setup_group_layout.addWidget(self.align_btn)
 
+        self.manual_align_btn = QPushButton("MANUAL ALIGNMENT")
+        self.manual_align_btn.clicked.connect(self.start_manual_calibration)
+        self.setup_group_layout.addWidget(self.manual_align_btn)
+
         self.test_pattern_check = QCheckBox("Show Test Pattern (Manual Alignment Check)")
         self.test_pattern_check.toggled.connect(self.toggle_test_pattern)
         self.setup_group_layout.addWidget(self.test_pattern_check)
@@ -594,6 +598,42 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.show_calibration_pattern = True
         # Wait a moment for the projector to actually show it before capturing
         QTimer.singleShot(1000, self.worker.run_auto_calibration)
+
+    def start_manual_calibration(self):
+        self.statusBar().showMessage("Manual Alignment: Click the 4 corners of the projector's output.", 5000)
+        self.worker.show_calibration_pattern = True
+
+        # We reuse MarkerSelectionDialog but for 4 corners
+        self.marker_selection_dialog.setWindowTitle("Manual Alignment - Select 4 Projector Corners")
+        self.worker.capture_still_frame()
+
+        if self.marker_selection_dialog.exec_():
+            points = self.marker_selection_dialog.get_selected_points()
+            if len(points) == 4:
+                import numpy as np
+                cam_pts = np.array([(p.x(), p.y()) for p in points], dtype=np.float32)
+
+                # Sort them
+                s = cam_pts.sum(axis=1)
+                tl = cam_pts[np.argmin(s)]
+                br = cam_pts[np.argmax(s)]
+                diff = np.diff(cam_pts, axis=1)
+                tr = cam_pts[np.argmin(diff)]
+                bl = cam_pts[np.argmax(diff)]
+                cam_ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+
+                w = self.worker.projector_width
+                h = self.worker.projector_height
+                proj_ordered = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+
+                h_matrix, _ = cv2.findHomography(cam_ordered, proj_ordered)
+                self.worker.set_h_c2p(h_matrix.tolist())
+                self.handle_calibration_complete(True)
+            else:
+                self.statusBar().showMessage("Manual Alignment failed: Please select exactly 4 corners.", 5000)
+
+        self.worker.show_calibration_pattern = False
+        self.marker_selection_dialog.setWindowTitle("Select Markers")
 
     def handle_calibration_complete(self, success):
         self.worker.show_calibration_pattern = False

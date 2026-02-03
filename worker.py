@@ -845,13 +845,20 @@ class Worker(QObject):
             if self.show_camera_on_projector:
                 cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
             elif self.show_calibration_pattern:
-                self.projector_buffer.fill(0)
-                # Draw a bright green rectangle with a white border for easy detection
-                margin = 20
-                cv2.rectangle(self.projector_buffer, (margin, margin), (w - margin, h - margin), (0, 255, 0), -1)
-                cv2.rectangle(self.projector_buffer, (margin, margin), (w - margin, h - margin), (255, 255, 255), 5)
+                # Draw a checkerboard pattern for robust calibration
+                self.projector_buffer.fill(255) # White background
+                cols, rows = 10, 7
+                sq_w = w // cols
+                sq_h = h // rows
+                for r in range(rows):
+                    for c in range(cols):
+                        if (r + c) % 2 == 1:
+                            cv2.rectangle(self.projector_buffer, (c * sq_w, r * sq_h),
+                                          ((c + 1) * sq_w, (r + 1) * sq_h), (0, 0, 0), -1)
+
+                # Overlay some text for the user
                 cv2.putText(self.projector_buffer, "CALIBRATING...", (w//2-100, h//2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
             else:
                 self.projector_buffer.fill(0)
 
@@ -859,46 +866,32 @@ class Worker(QObject):
 
             # Handle Auto-Calibration logic
             if self._run_calibration_flag:
-                # We expect the calibration pattern to be visible in main_frame
-                hsv = cv2.cvtColor(main_frame, cv2.COLOR_BGR2HSV)
-                # Look for the bright green pattern
-                lower_green = np.array([35, 50, 50])
-                upper_green = np.array([85, 255, 255])
-                mask_green = cv2.inRange(hsv, lower_green, upper_green)
+                # Detect checkerboard corners in the camera frame
+                gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                # We use 9x6 internal corners for a 10x7 grid
+                board_size = (9, 6)
+                ret, corners = cv2.findChessboardCorners(gray, board_size,
+                                                       cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
 
-                contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 success = False
-                if contours:
-                    cnt = max(contours, key=cv2.contourArea)
-                    if cv2.contourArea(cnt) > (w_cam * h_cam * 0.05): # At least 5% of frame
-                        peri = cv2.arcLength(cnt, True)
-                        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-                        if len(approx) == 4:
-                            # We found 4 corners in camera space
-                            cam_corners = approx.reshape(4, 2).astype(np.float32)
+                if ret:
+                    # Refine corner locations for better accuracy
+                    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                    corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
 
-                            # Sort corners: top-left, top-right, bottom-right, bottom-left
-                            # Sum (x+y) gives TL and BR, Diff (y-x) gives TR and BL
-                            s = cam_corners.sum(axis=1)
-                            tl = cam_corners[np.argmin(s)]
-                            br = cam_corners[np.argmax(s)]
-                            diff = np.diff(cam_corners, axis=1)
-                            tr = cam_corners[np.argmin(diff)]
-                            bl = cam_corners[np.argmax(diff)]
+                    # Generate corresponding projector points (internal corners of 10x7 grid)
+                    proj_pts = []
+                    sq_w = w // 10
+                    sq_h = h // 7
+                    for r in range(1, 7): # internal row indices (1 to 6)
+                        for c in range(1, 10): # internal col indices (1 to 9)
+                            proj_pts.append([c * sq_w, r * sq_h])
 
-                            cam_ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+                    proj_pts = np.array(proj_pts, dtype=np.float32)
+                    cam_pts = corners2.reshape(-1, 2)
 
-                            # Corresponding projector corners (matching the green rect we drew)
-                            margin = 20
-                            proj_ordered = np.array([
-                                [margin, margin],
-                                [w - margin, margin],
-                                [w - margin, h - margin],
-                                [margin, h - margin]
-                            ], dtype=np.float32)
-
-                            self.h_c2p, _ = cv2.findHomography(cam_ordered, proj_ordered)
-                            success = True
+                    self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
+                    success = True
 
                 self._run_calibration_flag = False
                 self.calibration_complete.emit(success)
@@ -1023,7 +1016,7 @@ class Worker(QObject):
                             dst_pts_cam = src_pts
 
                         # Transform camera coordinates to projector coordinates
-                        dst_pts = self.transform_to_projector(dst_pts_cam)
+                        dst_pts = self.transform_to_projector(dst_pts_cam, w_cam, h_cam)
 
                         # Warp video to the dynamic polygon
                         # We need a homography from video full frame to current mask polygon
@@ -1083,7 +1076,7 @@ class Worker(QObject):
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
                             # Transform camera source points to projector space
-                            dst_pts = self.transform_to_projector(mask.source_points)
+                            dst_pts = self.transform_to_projector(mask.source_points, w_cam, h_cam)
 
                             if len(dst_pts) == 4:
                                 matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -1114,7 +1107,7 @@ class Worker(QObject):
                     else:
                         draw_pts_cam = np.array(mask.source_points)
 
-                    draw_pts = self.transform_to_projector(draw_pts_cam).astype(np.int32)
+                    draw_pts = self.transform_to_projector(draw_pts_cam, w_cam, h_cam).astype(np.int32)
 
                     if len(draw_pts) >= 3:
                         cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
@@ -1491,15 +1484,28 @@ class Worker(QObject):
     def run_auto_calibration(self):
         self._run_calibration_flag = True
 
-    def transform_to_projector(self, pts):
-        if self.h_c2p is None:
-            return pts
-        try:
-            pts_reshaped = np.float32(pts).reshape(-1, 1, 2)
-            transformed = cv2.perspectiveTransform(pts_reshaped, self.h_c2p)
-            return transformed.reshape(-1, 2)
-        except:
-            return pts
+    def transform_to_projector(self, pts, w_cam=640, h_cam=480):
+        if self.h_c2p is not None:
+            try:
+                pts_reshaped = np.float32(pts).reshape(-1, 1, 2)
+                transformed = cv2.perspectiveTransform(pts_reshaped, self.h_c2p)
+                return transformed.reshape(-1, 2)
+            except:
+                pass
+
+        # Fallback: Simple proportional scaling if not calibrated
+        # This prevents the "top-left corner" issue when calibration is missing.
+        scale_x = self.projector_width / max(1, w_cam)
+        scale_y = self.projector_height / max(1, h_cam)
+
+        pts_arr = np.array(pts, dtype=np.float32)
+        if pts_arr.ndim == 1:
+            return np.array([pts_arr[0] * scale_x, pts_arr[1] * scale_y])
+
+        pts_arr_c = pts_arr.copy()
+        pts_arr_c[:, 0] *= scale_x
+        pts_arr_c[:, 1] *= scale_y
+        return pts_arr_c
 
     def set_warp_points(self, points):
         self.warp_points = points
