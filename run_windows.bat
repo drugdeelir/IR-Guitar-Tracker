@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 echo Starting Projection Mapper for Windows...
 
 :: Check if requirements are installed

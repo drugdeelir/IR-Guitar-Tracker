@@ -1022,7 +1022,7 @@ class Worker(QObject):
 
             if self._capture_still_frame_flag:
                 rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                self.still_frame_ready.emit(QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy(), tracked_points)
+                self.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
                 self._capture_still_frame_flag = False
 
             self.frame_count += 1

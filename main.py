@@ -394,9 +394,10 @@ class ProjectionMappingApp(QMainWindow):
 
     def start_marker_capture_countdown(self):
         self.marker_selection_dialog.take_picture_button.setEnabled(False)
-        self.countdown_timer = QTimer(self)
         self.countdown_seconds = 7
-        self.countdown_timer.timeout.connect(self.update_countdown)
+        if not hasattr(self, 'countdown_timer'):
+            self.countdown_timer = QTimer(self)
+            self.countdown_timer.timeout.connect(self.update_countdown)
         self.countdown_timer.start(1000)
 
     def update_countdown(self):
