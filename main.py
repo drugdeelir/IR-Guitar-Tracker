@@ -132,6 +132,7 @@ class ProjectionMappingApp(QMainWindow):
         self.selected_markers = []
         self.snapshots = [None] * 8
         self.setup_step = 0 # 0: Camera, 1: Markers, 2: BG, 3: Amp, 4: Done
+        self.current_project_path = None
 
         # Default MIDI Mappings
         self.midi_mappings = {
@@ -235,6 +236,7 @@ class ProjectionMappingApp(QMainWindow):
         self.update_cue_table()
         self.worker.set_masks(self.masks)
         self.statusBar().showMessage(f"Assigned {len(mask.playlist)} videos to {mask.name}", 3000)
+        self.maybe_auto_save()
 
     def update_cue_table(self):
         self.cue_table.setRowCount(len(self.masks))
@@ -266,9 +268,29 @@ class ProjectionMappingApp(QMainWindow):
         self.marker_selection_dialog.take_picture_button.clicked.connect(self.start_marker_capture_countdown)
 
         if self.marker_selection_dialog.exec_():
-            self.selected_markers = self.marker_selection_dialog.get_selected_points()
+            import numpy as np
+            new_markers = self.marker_selection_dialog.get_selected_points()
+
+            # If we already have a configuration, try to transition masks
+            if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 4:
+                old_pts = np.float32(self.worker.marker_config).reshape(-1, 1, 2)
+                new_pts = np.float32([(p.x(), p.y()) for p in new_markers]).reshape(-1, 1, 2)
+                matrix, _ = cv2.findHomography(old_pts, new_pts)
+
+                if matrix is not None:
+                    for mask in self.masks:
+                        # Only transform static masks; linked ones are already relative to markers
+                        if not mask.is_linked and mask.source_points:
+                            pts = np.float32(mask.source_points).reshape(-1, 1, 2)
+                            trans_pts = cv2.perspectiveTransform(pts, matrix).reshape(-1, 2)
+                            mask.source_points = [(float(p[0]), float(p[1])) for p in trans_pts]
+
+                    self.statusBar().showMessage("Adjusted static masks to new camera perspective.", 3000)
+
+            self.selected_markers = new_markers
             print(f"Selected {len(self.selected_markers)} markers.")
             self.worker.set_marker_points(self.selected_markers)
+            self.maybe_auto_save()
 
     def start_marker_capture_countdown(self):
         self.marker_selection_dialog.take_picture_button.setEnabled(False)
@@ -288,7 +310,8 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.capture_still_frame()
 
     def set_marker_selection_image(self, image, points):
-        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points)
+        guide_pts = self.worker.marker_config if hasattr(self.worker, 'marker_config') else None
+        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points, guide_pts)
 
     def clear_marker_selection(self):
         self.selected_markers = []
@@ -316,6 +339,11 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_cam_combo.addItems([f"Camera {i}" for i in self.available_cameras])
         self.setup_cam_combo.currentIndexChanged.connect(self.change_camera)
         self.setup_group_layout.addWidget(self.setup_cam_combo)
+
+        self.load_template_btn = QPushButton("OR: Load Existing Template / Project")
+        self.load_template_btn.clicked.connect(self.load_project)
+        self.load_template_btn.setStyleSheet("background-color: #455a64; color: white; margin-top: 10px;")
+        self.setup_group_layout.addWidget(self.load_template_btn)
 
         self.setup_next_btn = QPushButton("Next Step")
         self.setup_next_btn.setMinimumHeight(50)
@@ -351,7 +379,13 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_group_layout.addWidget(btn)
         elif self.setup_step == 4: # Done
             self.setup_group.setTitle("Setup Complete")
-            self.setup_instruction.setText("Setup finished! Switching to Performance Mode.")
+            self.setup_instruction.setText("Setup finished! You can save this configuration as a preset below.")
+
+            save_preset_btn = QPushButton("Save Project / Preset")
+            save_preset_btn.clicked.connect(lambda: self.save_project())
+            save_preset_btn.setStyleSheet("background-color: #2e7d32; color: white; height: 40px; margin-bottom: 10px;")
+            self.setup_group_layout.addWidget(save_preset_btn)
+
             self.setup_next_btn.setText("Enter Performance Mode")
             self.setup_next_btn.clicked.disconnect()
             self.setup_next_btn.clicked.connect(self.enter_performance_mode)
@@ -421,13 +455,21 @@ class ProjectionMappingApp(QMainWindow):
 
         # Project controls
         proj_group = QGroupBox("Project")
-        proj_layout = QHBoxLayout()
+        proj_layout = QVBoxLayout()
+
+        btn_layout = QHBoxLayout()
         self.save_button = QPushButton("Save")
         self.save_button.clicked.connect(self.save_project)
         self.load_button = QPushButton("Load")
         self.load_button.clicked.connect(self.load_project)
-        proj_layout.addWidget(self.save_button)
-        proj_layout.addWidget(self.load_button)
+        btn_layout.addWidget(self.save_button)
+        btn_layout.addWidget(self.load_button)
+        proj_layout.addLayout(btn_layout)
+
+        self.auto_save_check = QCheckBox("Auto-Save on Changes")
+        self.auto_save_check.setChecked(True)
+        proj_layout.addWidget(self.auto_save_check)
+
         proj_group.setLayout(proj_layout)
         layout.addWidget(proj_group)
 
@@ -602,6 +644,12 @@ class ProjectionMappingApp(QMainWindow):
         self.calibrate_depth_button.clicked.connect(self.calibrate_depth)
         depth_layout.addRow(self.calibrate_depth_button)
 
+        self.depth_sensitivity_slider = QSlider(Qt.Horizontal)
+        self.depth_sensitivity_slider.setRange(0, 200)
+        self.depth_sensitivity_slider.setValue(100)
+        self.depth_sensitivity_slider.valueChanged.connect(self.update_depth_sensitivity)
+        depth_layout.addRow("Depth Sensitivity:", self.depth_sensitivity_slider)
+
         self.smoothing_slider = QSlider(Qt.Horizontal)
         self.smoothing_slider.setRange(0, 100)
         self.smoothing_slider.setValue(50)
@@ -744,16 +792,19 @@ class ProjectionMappingApp(QMainWindow):
     def update_smoothing(self, value):
         self.worker.set_smoothing(value / 100.0)
 
-    def save_project(self):
-        filename, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "Project Files (*.json)")
+    def save_project(self, filename=None):
+        if not filename:
+            filename, _ = QFileDialog.getSaveFileName(self, "Save Project", self.current_project_path or "", "Project Files (*.json)")
+
         if filename:
+            self.current_project_path = filename
             project_data = {
                 'masks': [mask.to_dict() for mask in self.masks],
                 'media_library': self.media_library,
                 'warp_points': self.projector_window.get_warp_points_normalized(),
                 'ir_threshold': self.ir_threshold_slider.value(),
                 'auto_ir': self.auto_ir_check.isChecked(),
-                'depth_sensitivity': self.depth_sensitivity_slider.value(),
+                'depth_sensitivity': self.depth_sensitivity_slider.value() if hasattr(self, 'depth_sensitivity_slider') else 100,
                 'smoothing': self.smoothing_slider.value(),
                 'midi_port': self.midi_combo.currentText(),
                 'midi_mappings': self.midi_mappings,
@@ -764,13 +815,20 @@ class ProjectionMappingApp(QMainWindow):
                 json.dump(project_data, f, indent=4)
             self.statusBar().showMessage(f"Project saved to {filename}", 3000)
 
+    def maybe_auto_save(self):
+        if hasattr(self, 'auto_save_check') and self.auto_save_check.isChecked() and self.current_project_path:
+            self.save_project(self.current_project_path)
+
     def open_help(self):
         file_path = resource_path('HELP_MAINSTAGE.md')
         QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
 
-    def load_project(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
+    def load_project(self, filename=None):
+        if not filename:
+            filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
+
         if filename:
+            self.current_project_path = filename
             try:
                 with open(filename, 'r') as f:
                     data = json.load(f)
@@ -812,6 +870,10 @@ class ProjectionMappingApp(QMainWindow):
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
 
                 self.statusBar().showMessage(f"Project loaded from {filename}", 3000)
+
+                # If we are in the setup wizard, advance to the calibration step
+                if self.setup_step == 0 and self.tabs.currentIndex() == 0:
+                    self.next_setup_step()
             except Exception as e:
                 self.statusBar().showMessage(f"Error loading project: {e}", 5000)
 
@@ -1028,6 +1090,7 @@ class ProjectionMappingApp(QMainWindow):
                 self.update_cue_table()
                 self.worker.set_masks(self.masks)
                 self.statusBar().showMessage(f"Mask '{mask.name}' saved with {len(mask_points)} points.", 3000)
+                self.maybe_auto_save()
         else:
             self.statusBar().showMessage("Mask not saved: No points or no cue selected.", 5000)
 
@@ -1067,6 +1130,7 @@ class ProjectionMappingApp(QMainWindow):
 
             mask.is_linked = True
             self.statusBar().showMessage(f"Mask '{mask.name}' linked to guitar tracking.", 3000)
+            self.maybe_auto_save()
 
     def update_ir_threshold(self, value):
         self.worker.set_ir_threshold(value)
@@ -1119,6 +1183,7 @@ class ProjectionMappingApp(QMainWindow):
             del self.masks[row]
             self.update_cue_table()
             self.worker.set_masks(self.masks)
+            self.maybe_auto_save()
 
     def closeEvent(self, event):
         self.worker.stop()

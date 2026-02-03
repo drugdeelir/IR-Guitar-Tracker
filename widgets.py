@@ -11,11 +11,13 @@ class MarkerImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.detected_points = []
         self.selected_points = []
+        self.guide_points = []
         self.pix = None
 
-    def set_data(self, pixmap, detected_points):
+    def set_data(self, pixmap, detected_points, guide_points=None):
         self.pix = pixmap
         self.detected_points = detected_points
+        self.guide_points = guide_points or []
         self.selected_points = []
         self.setPixmap(self.pix)
         self.update()
@@ -66,6 +68,11 @@ class MarkerImageLabel(QLabel):
         for dp in self.detected_points:
             painter.drawEllipse(QPoint(int(dp[0]), int(dp[1])), 12, 12)
 
+        # Draw guide points (from template) as faint cyan circles
+        painter.setPen(QPen(Qt.cyan, 2, Qt.DotLine))
+        for gp in self.guide_points:
+            painter.drawEllipse(QPoint(int(gp[0]), int(gp[1])), 15, 15)
+
         # Draw selected points as solid green targets
         painter.setPen(QPen(Qt.green, 3))
         for sp in self.selected_points:
@@ -90,8 +97,8 @@ class MarkerSelectionDialog(QDialog):
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.confirm_button)
 
-    def set_pixmap(self, pixmap, detected_points):
-        self.image_label.set_data(pixmap, detected_points)
+    def set_pixmap(self, pixmap, detected_points, guide_points=None):
+        self.image_label.set_data(pixmap, detected_points, guide_points)
 
     def get_selected_points(self):
         return self.image_label.selected_points
