@@ -41,7 +41,8 @@ class MarkerImageLabel(QLabel):
             best_pt = click_pt
             min_dist = 30
             for dp in self.detected_points:
-                dp_pt = QPoint(int(dp[0]), int(dp[1]))
+                # dp is normalized
+                dp_pt = QPoint(int(dp[0] * pix_w), int(dp[1] * pix_h))
                 dist = (click_pt - dp_pt).manhattanLength()
                 if dist < min_dist:
                     min_dist = dist
@@ -66,12 +67,14 @@ class MarkerImageLabel(QLabel):
         # Draw detected points as faint red circles
         painter.setPen(QPen(Qt.red, 2, Qt.DashLine))
         for dp in self.detected_points:
-            painter.drawEllipse(QPoint(int(dp[0]), int(dp[1])), 12, 12)
+            # detected_points are now normalized
+            painter.drawEllipse(QPoint(int(dp[0] * pix_w), int(dp[1] * pix_h)), 12, 12)
 
         # Draw guide points (from template) as faint cyan circles
         painter.setPen(QPen(Qt.cyan, 2, Qt.DotLine))
         for gp in self.guide_points:
-            painter.drawEllipse(QPoint(int(gp[0]), int(gp[1])), 15, 15)
+            # guide_points are also normalized
+            painter.drawEllipse(QPoint(int(gp[0] * pix_w), int(gp[1] * pix_h)), 15, 15)
 
         # Draw selected points as solid neon purple targets
         painter.setPen(QPen(Qt.magenta, 3))
@@ -108,7 +111,7 @@ class MarkerSelectionDialog(QDialog):
         self.image_label.update()
 
 class VideoDisplay(QWidget):
-    mask_point_added = pyqtSignal(QPoint)
+    mask_point_added = pyqtSignal(QPointF)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -168,8 +171,9 @@ class VideoDisplay(QWidget):
             # Denormalize mask points for drawing
             draw_pts = []
             for p in self.mask_points:
-                dx = x + (p.x() * sw / pix_w)
-                dy = y + (p.y() * sh / pix_h)
+                # p is normalized (0-1)
+                dx = x + (p.x() * sw)
+                dy = y + (p.y() * sh)
                 draw_pts.append(QPoint(int(dx), int(dy)))
 
             poly = QPolygon(draw_pts)
@@ -192,8 +196,10 @@ class VideoDisplay(QWidget):
             if 0 <= px < pix_w and 0 <= py < pix_h:
                 click_pt = QPoint(int(px), int(py))
 
-                # Check if we are clicking an existing point to drag
-                for i, pt in enumerate(self.mask_points):
+                # Check if we are clicking an existing point to drag (threshold in pixmap pixels)
+                for i, p in enumerate(self.mask_points):
+                    # Denormalize mask point to pixmap space for distance check
+                    pt = QPoint(int(p.x() * pix_w), int(p.y() * pix_h))
                     if (click_pt - pt).manhattanLength() < 15:
                         self.dragging_idx = i
                         return
@@ -203,20 +209,25 @@ class VideoDisplay(QWidget):
                 if self.snap_to_markers:
                     min_dist = 30 # Snapping radius in pixels
                     for marker in self.detected_markers:
-                        m_pt = QPoint(int(marker[0]), int(marker[1]))
+                        # marker is normalized
+                        m_pt = QPoint(int(marker[0] * pix_w), int(marker[1] * pix_h))
                         dist = (click_pt - m_pt).manhattanLength()
                         if dist < min_dist:
                             min_dist = dist
                             snapped_pt = m_pt
 
-                self.mask_points.append(snapped_pt)
-                self.mask_point_added.emit(snapped_pt)
+                # Store normalized point
+                norm_pt = QPointF(snapped_pt.x() / pix_w, snapped_pt.y() / pix_h)
+                self.mask_points.append(norm_pt)
+                self.mask_point_added.emit(norm_pt)
                 self.update()
 
     def mouseMoveEvent(self, event):
         if self.mask_creation_mode and self.dragging_idx != -1:
+            if not self.current_pixmap: return
+            pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
             px, py = self.map_to_pixmap(event.pos())
-            self.mask_points[self.dragging_idx] = QPoint(int(px), int(py))
+            self.mask_points[self.dragging_idx] = QPointF(px / pix_w, py / pix_h)
             self.update()
 
     def mouseReleaseEvent(self, event):

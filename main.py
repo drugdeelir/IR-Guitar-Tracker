@@ -316,7 +316,7 @@ class ProjectionMappingApp(QMainWindow):
 
     def refresh_link_status_labels(self):
         try:
-            if hasattr(self, 'setup_link_status_label') and self.setup_link_status_label and hasattr(self, 'setup_link_mask_combo'):
+            if getattr(self, 'setup_link_status_label', None) and getattr(self, 'setup_link_mask_combo', None):
                 selected = self.setup_link_mask_combo.currentText()
                 linked = any(m.name == selected and m.is_linked for m in self.masks)
                 if linked:
@@ -325,11 +325,11 @@ class ProjectionMappingApp(QMainWindow):
                 else:
                     self.setup_link_status_label.setText("Status: Not Linked")
                     self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
             pass
 
         try:
-            if hasattr(self, 'workspace_link_status_label') and self.workspace_link_status_label and hasattr(self, 'workspace_link_mask_combo'):
+            if getattr(self, 'workspace_link_status_label', None) and getattr(self, 'workspace_link_mask_combo', None):
                 selected = self.workspace_link_mask_combo.currentText()
                 linked = any(m.name == selected and m.is_linked for m in self.masks)
                 if linked:
@@ -338,7 +338,7 @@ class ProjectionMappingApp(QMainWindow):
                 else:
                     self.workspace_link_status_label.setText("Status: Not Linked")
                     self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
             pass
 
     def assign_media_to_mask(self):
@@ -486,14 +486,20 @@ class ProjectionMappingApp(QMainWindow):
 
             # If we already have a configuration, try to transition masks
             if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 4:
+                # markers in dialog are in still-frame pixels
+                w_still = self.marker_selection_dialog.image_label.pix.width()
+                h_still = self.marker_selection_dialog.image_label.pix.height()
+
+                # Both old and new pts are now normalized for resolution-independence
                 old_pts = np.float32(self.worker.marker_config).reshape(-1, 1, 2)
-                new_pts = np.float32([(p.x(), p.y()) for p in new_markers]).reshape(-1, 1, 2)
+                new_pts = np.float32([(p.x() / w_still, p.y() / h_still) for p in new_markers]).reshape(-1, 1, 2)
                 matrix, _ = cv2.findHomography(old_pts, new_pts)
 
                 if matrix is not None:
                     for mask in self.masks:
                         # Only transform static masks; linked ones are already relative to markers
                         if not mask.is_linked and mask.source_points:
+                            # mask.source_points are normalized
                             pts = np.float32(mask.source_points).reshape(-1, 1, 2)
                             trans_pts = cv2.perspectiveTransform(pts, matrix).reshape(-1, 2)
                             mask.source_points = [(float(p[0]), float(p[1])) for p in trans_pts]
