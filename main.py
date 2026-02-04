@@ -735,8 +735,11 @@ class ProjectionMappingApp(QMainWindow):
 
         # Advance Wizard or update UI
         if self.setup_step == 0:
-            self.setup_status_label.setText("Boundary: DETECTED ✓")
-            self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
+            try:
+                if self.setup_status_label:
+                    self.setup_status_label.setText("Boundary: DETECTED ✓")
+                    self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
+            except RuntimeError: pass
 
     def next_setup_step(self):
         # Ensure any active calibration is stopped before moving to next step
@@ -877,7 +880,7 @@ class ProjectionMappingApp(QMainWindow):
                 break
 
         if not amp_mask:
-            amp_mask = Mask("Guitar", [], None, tag="amp", mask_type="dynamic")
+            amp_mask = Mask("Guitar", [], None, tag="amp", mask_type="static")
             self.masks.append(amp_mask)
             self.update_cue_table()
             self.update_mask_combos()
@@ -886,7 +889,7 @@ class ProjectionMappingApp(QMainWindow):
         self.cue_list_widget.setCurrentRow(idx)
         # Sync workspace UI so saving works correctly
         self.mask_tag_combo.setCurrentText("amp")
-        self.mask_type_combo.setCurrentText("dynamic")
+        self.mask_type_combo.setCurrentText("static")
         self.add_wizard_finish_button()
         self.enter_mask_creation_mode()
 
@@ -1445,10 +1448,13 @@ class ProjectionMappingApp(QMainWindow):
         self.tabs.addTab(tab, "Connectivity")
 
     def log_message(self, msg):
-        item = QTableWidgetItem(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        self.diag_log.insertItem(0, f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if self.diag_log.count() > 100:
-            self.diag_log.takeItem(self.diag_log.count() - 1)
+        try:
+            if not self.diag_log: return
+            item = QTableWidgetItem(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            self.diag_log.insertItem(0, f"[{time.strftime('%H:%M:%S')}] {msg}")
+            if self.diag_log.count() > 100:
+                self.diag_log.takeItem(self.diag_log.count() - 1)
+        except RuntimeError: pass
 
     def start_osc_server(self):
         self.osc_handler = OSCHandler()
@@ -1981,7 +1987,7 @@ class ProjectionMappingApp(QMainWindow):
             mask.name = 'Background'
         elif self.setup_step == 3: # Guitar Mask step (now step 4, index 3)
             mask.tag = 'amp'
-            mask.type = 'dynamic'
+            mask.type = 'static'
             mask.name = 'Guitar'
 
         self.update_cue_table()
@@ -2107,7 +2113,10 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.set_ir_threshold(value)
 
     def update_tracker_label(self, count):
-        self.ir_trackers_label.setText(f"Trackers detected: {count}")
+        try:
+            if self.ir_trackers_label:
+                self.ir_trackers_label.setText(f"Trackers detected: {count}")
+        except RuntimeError: pass
 
     def toggle_verify_alignment(self, checked):
         self.worker.show_calibration_verify = checked

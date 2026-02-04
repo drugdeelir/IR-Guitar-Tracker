@@ -122,6 +122,10 @@ class TrackingThread(QThread):
                     act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     self.worker._current_camera_res = (act_w, act_h)
 
+                    # Clear frame buffer to avoid resolution mismatch
+                    with QMutexLocker(self.worker.latest_main_frame_mutex):
+                         self.worker.latest_main_frame = None
+
                     # If we requested max res, update the request to match reality
                     # to prevent constant re-initialization
                     if w_req > 5000:
@@ -149,7 +153,11 @@ class TrackingThread(QThread):
             h_cam, w_cam = main_frame.shape[:2]
 
             # IR Tracking
-            tracked_points = self.worker.get_tracked_points(main_frame)
+            # Optimization: Skip tracking during setup/calibration to save CPU
+            if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
+                tracked_points = self.worker.get_tracked_points(main_frame)
+            else:
+                tracked_points = []
 
             with QMutexLocker(self.worker.tracking_mutex):
                 self.worker.last_tracked_points_internal = tracked_points
@@ -340,8 +348,8 @@ class Worker(QObject):
         self.mask_fade_levels = {} # mask_id -> current_fade (0.0 to 1.0)
 
         # Performance Tuning
-        self.render_width = 1280
-        self.render_height = 720
+        self.render_width = 960
+        self.render_height = 540
         self.throttle_level = 0.0 # 0.0 to 1.0 (degrade quality)
 
         # Caching
@@ -1118,7 +1126,7 @@ class Worker(QObject):
 
             # Projector and Render Resolution
             h_proj, w_proj = self.projector_height, self.projector_width
-            # Use fixed 720p internal for performance, then upscale
+            # Use fixed 540p internal for performance, then upscale
             w, h = self.render_width, self.render_height
 
             if self.camera_matrix is None:
@@ -1179,6 +1187,7 @@ class Worker(QObject):
                     # Clean up
                     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
                     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
                     thresh = cv2.dilate(thresh, kernel, iterations=2)
 
                     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1191,14 +1200,18 @@ class Worker(QObject):
                             msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
                             self.system_warning.emit(msg)
 
-                        # Simplify to a polygon (e.g. 8 points for some flexibility)
+                        # Simplify for boundary - use smaller epsilon for higher fidelity
                         peri = cv2.arcLength(main_contour, True)
-                        approx = cv2.approxPolyDP(main_contour, 0.01 * peri, True)
+                        approx = cv2.approxPolyDP(main_contour, 0.002 * peri, True)
+
+                        # If too many points, simplify a bit more but keep it detailed
+                        if len(approx) > 16:
+                             approx = cv2.approxPolyDP(main_contour, 0.005 * peri, True)
 
                         # Ensure we have at least 4 points
                         if len(approx) < 4:
                             rect = cv2.minAreaRect(main_contour)
-                            approx = cv2.boxPoints(rect)
+                            approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
                         pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
                         self.projector_boundary = pts
@@ -1259,15 +1272,21 @@ class Worker(QObject):
                     self.sls_valid_mask = valid.astype(np.uint8)
 
                     # Automatically derive Projector Boundary from SLS valid mask
-                    # Dilate slightly to fill small gaps in the mask for a solid boundary
-                    kernel = np.ones((5, 5), np.uint8)
-                    mask_solid = cv2.dilate(self.sls_valid_mask, kernel, iterations=1)
+                    # Clean up the mask aggressively to fill holes and smooth edges
+                    kernel = np.ones((7, 7), np.uint8)
+                    mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
+                    mask_solid = cv2.dilate(mask_solid, kernel, iterations=1)
+
                     contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if contours:
                         main_contour = max(contours, key=cv2.contourArea)
-                        # Simplify for boundary
+                        # Simplify for boundary - use small epsilon to capture corners of wall/floor
                         peri = cv2.arcLength(main_contour, True)
-                        approx = cv2.approxPolyDP(main_contour, 0.005 * peri, True)
+                        approx = cv2.approxPolyDP(main_contour, 0.002 * peri, True)
+
+                        # If too many points, simplify a bit more
+                        if len(approx) > 16:
+                             approx = cv2.approxPolyDP(main_contour, 0.004 * peri, True)
 
                         if len(approx) < 4:
                             rect = cv2.minAreaRect(main_contour)
@@ -1486,11 +1505,13 @@ class Worker(QObject):
                     cv2.putText(main_frame, "CHECKERBOARD NOT FOUND", (10, h_cam-20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            self.update_particles(tracked_points, h, w, w_cam, h_cam)
-            self.draw_particles(projector_output)
+            # Skip particles and occlusion during setup to save CPU and avoid corrupting calibration patterns
+            if not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
+                self.update_particles(tracked_points, h, w, w_cam, h_cam)
+                self.draw_particles(projector_output)
 
             # Performer Occlusion Logic
-            if self.occlusion_enabled:
+            if self.occlusion_enabled and not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
                 fg_mask = self.back_subtractor.apply(main_frame)
                 # Cleanup mask
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -2199,6 +2220,14 @@ class Worker(QObject):
         # Prefer Dense LUT if available
         if self.sls_lut_x is not None:
             try:
+                # Validate LUT resolution against current camera resolution
+                h_lut, w_lut = self.sls_valid_mask.shape
+                if h_lut != h_cam or w_lut != w_cam:
+                    # Invalidate LUT if camera resolution has changed
+                    self.sls_lut_x = None
+                    self.sls_lut_y = None
+                    raise ValueError("LUT resolution mismatch")
+
                 pts_arr = np.array(pts, dtype=np.float32)
                 res = []
                 for p in pts_arr.reshape(-1, 2):
