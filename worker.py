@@ -107,16 +107,25 @@ class TrackingThread(QThread):
         while self._running:
             start_time = time.time()
 
-            if self.worker._camera_changed:
-                if main_cap: main_cap.release()
-                main_cap = cv2.VideoCapture(self.worker.video_source)
-                if main_cap.isOpened():
-                    main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
+                if self.worker._camera_changed:
+                    if main_cap: main_cap.release()
+                    main_cap = cv2.VideoCapture(self.worker.video_source)
+                    self.worker._camera_changed = False
+
+                if main_cap and main_cap.isOpened():
+                    w_req, h_req = self.worker.requested_camera_res
+                    main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
+                    main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
+                    # Read back actual resolution
+                    act_w = main_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                    act_h = main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                    self.worker._current_camera_res = (int(act_w), int(act_h))
+                    self.worker.camera_matrix = None # Reset estimation
                 else:
-                    self.worker.camera_error.emit(self.worker.video_source)
+                    if self.worker._camera_changed:
+                        self.worker.camera_error.emit(self.worker.video_source)
                     main_cap = None
-                self.worker._camera_changed = False
 
             if main_cap is None:
                 QThread.msleep(1000)
@@ -205,6 +214,8 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
+        self.requested_camera_res = (640, 480)
+        self._current_camera_res = (640, 480)
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
         self._calibrate_depth_flag = False
@@ -263,6 +274,7 @@ class Worker(QObject):
         self.tracking_frame_count = 0
         self.last_stats_time = time.time()
         self.show_hud = True
+        self.blackout_active = False
 
         # Safety Mode
         self.safety_mode_enabled = True
@@ -343,10 +355,19 @@ class Worker(QObject):
         self.generator_buffer = None
         self.blend_temp1 = None
         self.blend_temp2 = None
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
 
         # Start Tracking Thread
         self.tracking_thread = TrackingThread(self)
         self.tracking_thread.start()
+
+    def boost_contrast(self, frame):
+        if frame is None: return None
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return self.clahe.apply(gray)
+        else:
+            return self.clahe.apply(frame)
 
     def init_kalman(self, count):
         self.kalman_filters = []
@@ -553,7 +574,16 @@ class Worker(QObject):
         if not mask.active_fx and mask.design_overlay == 'none':
             return frame
 
+        # Performance: skip FX if heavily throttled and not essential
+        if self.throttle_level > 0.9 and not live_only:
+             # Just return original if we are dying
+             return frame
+
         live_fx = {'strobe', 'hue_cycle', 'glitch', 'trails', 'feedback', 'matrix', 'ooze', 'scanline', 'vhs'}
+
+        # Skip heavy procedural FX if throttled
+        if self.throttle_level > 0.7:
+             live_fx.difference_update({'matrix', 'ooze', 'vhs'})
 
         # Since frame_cue is already a copy from VideoPlayer or a generator,
         # we can modify it in-place to save performance.
@@ -882,17 +912,17 @@ class Worker(QObject):
                     cY = int(M["m01"] / M["m00"]) + roi_y
                     detected_points.append((cX, cY))
 
-        if self.marker_config and len(self.marker_config) > 1 and len(detected_points) >= len(self.marker_config):
+        if marker_cfg and len(marker_cfg) > 1 and len(detected_points) >= len(marker_cfg):
             # If we were tracking, prioritize points near last known location
             if self.confidence > 0.5 and self.last_tracked_points:
                 center = np.mean(self.last_tracked_points, axis=0)
                 detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
 
             # Limit points to check to avoid O(N^K) explosion (N=12, K=4 -> 495 combos)
-            limit = 12 if len(self.marker_config) >= 4 else 15
+            limit = 12 if len(marker_cfg) >= 4 else 15
             points_to_check = detected_points[:limit]
 
-            num_markers = len(self.marker_config)
+            num_markers = len(marker_cfg)
 
             # Optimization: Pre-calculate pairwise distances between detected points
             # to avoid redundant norm calculations in the combinations loop.
@@ -920,15 +950,15 @@ class Worker(QObject):
 
                 current_fingerprint = sorted(current_distances)
 
-                if len(current_fingerprint) == len(self.marker_fingerprint):
+                if len(current_fingerprint) == len(marker_fp):
                     point_combo = [points_to_check[i] for i in indices]
                     is_match = True
                     for i in range(len(current_fingerprint)):
-                        if not np.isclose(current_fingerprint[i], self.marker_fingerprint[i], rtol=0.15):
+                        if not np.isclose(current_fingerprint[i], marker_fp[i], rtol=0.15):
                             is_match = False
                             break
                     if is_match:
-                        src_pts = np.float32(self.marker_config).reshape(-1, 1, 2)
+                        src_pts = np.float32(marker_cfg).reshape(-1, 1, 2)
                         dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
                         matrix, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
                         if matrix is not None:
@@ -1050,6 +1080,14 @@ class Worker(QObject):
         while self._running:
             start_time = time.time()
 
+            if self.blackout_active:
+                h_proj, w_proj = self.projector_height, self.projector_width
+                black = np.zeros((h_proj, w_proj, 3), dtype=np.uint8)
+                self.projector_frame_ready.emit(QImage(black.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
+                elapsed = time.time() - start_time
+                QThread.msleep(max(1, int((frame_time - elapsed) * 1000)))
+                continue
+
             # 1. Update Tracking Info (from shared data)
             with QMutexLocker(self.tracking_mutex):
                 tracked_points = self.last_tracked_points_internal
@@ -1062,6 +1100,7 @@ class Worker(QObject):
             with QMutexLocker(self.latest_main_frame_mutex):
                 main_frame = self.latest_main_frame.copy() if self.latest_main_frame is not None else None
                 ui_tracked_points = self.latest_tracked_points_for_ui
+                curr_frame_id = self.latest_main_frame_id
 
             if main_frame is None:
                 main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -1090,16 +1129,12 @@ class Worker(QObject):
                 self.static_warp_cache.clear()
 
             if self._run_boundary_detection_flag:
-                # Get the frame ID safely
-                with QMutexLocker(self.latest_main_frame_mutex):
-                    curr_frame_id = self.latest_main_frame_id
-
                 if self._boundary_step == 0:
                     # Capture Black Frame
                     self.projector_buffer.fill(0)
                     if self._sls_curr_wait >= self._sls_wait_frames:
                         if curr_frame_id > self._last_captured_frame_id:
-                            self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
+                            self._boundary_captures.append(self.boost_contrast(main_frame))
                             self._boundary_step = 1
                             self._sls_curr_wait = 0
                             self._last_captured_frame_id = curr_frame_id
@@ -1110,7 +1145,7 @@ class Worker(QObject):
                     self.projector_buffer.fill(255)
                     if self._sls_curr_wait >= self._sls_wait_frames:
                         if curr_frame_id > self._last_captured_frame_id:
-                            self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
+                            self._boundary_captures.append(self.boost_contrast(main_frame))
                             self._boundary_step = 2
                             self._sls_curr_wait = 0
                             self._last_captured_frame_id = curr_frame_id
@@ -1122,8 +1157,11 @@ class Worker(QObject):
                     black = self._boundary_captures[0]
                     white = self._boundary_captures[1]
                     diff = cv2.absdiff(white, black)
-                    # Lower threshold (15 instead of 30) for IR cameras or high-ambient stages
-                    _, thresh = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+                    # Use Otsu's thresholding for IR cameras
+                    _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    # Fallback if Otsu results in near-zero coverage
+                    if np.mean(thresh) < 1.0:
+                         _, thresh = cv2.threshold(diff, 5, 255, cv2.THRESH_BINARY)
 
                     # Clean up
                     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -1157,6 +1195,7 @@ class Worker(QObject):
                         self.boundary_detected.emit([])
 
                     self._run_boundary_detection_flag = False
+                    self.requested_camera_res = (640, 480) # Revert to performance mode
                     self._boundary_step = 0
                     self._boundary_captures = []
             elif self._run_sls_flag:
@@ -1164,16 +1203,12 @@ class Worker(QObject):
                 total_x = len(self._sls_patterns_x)
                 total_y = len(self._sls_patterns_y)
 
-                # Get the frame ID safely
-                with QMutexLocker(self.latest_main_frame_mutex):
-                    curr_frame_id = self.latest_main_frame_id
-
                 if self._sls_step < total_x:
                     pattern = self._sls_patterns_x[self._sls_step]
                     self.projector_buffer = cv2.merge([pattern, pattern, pattern])
                     if self._sls_curr_wait >= self._sls_wait_frames:
                         if curr_frame_id > self._last_captured_frame_id:
-                            gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                            gray = self.boost_contrast(main_frame)
                             self._sls_captures_x.append(gray)
                             self._sls_step += 1
                             self._sls_curr_wait = 0
@@ -1186,7 +1221,7 @@ class Worker(QObject):
                     self.projector_buffer = cv2.merge([pattern, pattern, pattern])
                     if self._sls_curr_wait >= self._sls_wait_frames:
                         if curr_frame_id > self._last_captured_frame_id:
-                            gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                            gray = self.boost_contrast(main_frame)
                             self._sls_captures_y.append(gray)
                             self._sls_step += 1
                             self._sls_curr_wait = 0
@@ -1196,8 +1231,8 @@ class Worker(QObject):
                 else:
                     # Decoding
                     print("Decoding Room Scan...")
-                    proj_x, valid_x = decode_gray_code(self._sls_captures_x)
-                    proj_y, valid_y = decode_gray_code(self._sls_captures_y)
+                    proj_x, valid_x = decode_gray_code(self._sls_captures_x, self.projector_width)
+                    proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
                     valid = valid_x & valid_y
 
                     # Store dense LUT
@@ -1226,6 +1261,7 @@ class Worker(QObject):
                         self.calibration_complete.emit(False)
 
                     self._run_sls_flag = False
+                    self.requested_camera_res = (640, 480) # Revert to performance mode
                     self.show_calibration_verify = True # Automatically show verification
             elif self.show_camera_on_projector:
                 cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
@@ -1310,11 +1346,8 @@ class Worker(QObject):
 
             # Handle Auto-Calibration logic (Multi-frame averaging)
             if self._run_calibration_flag:
-                with QMutexLocker(self.latest_main_frame_mutex):
-                    curr_frame_id = self.latest_main_frame_id
-
                 if curr_frame_id > self._last_captured_frame_id:
-                    gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                    gray = self.boost_contrast(main_frame)
                     board_size = (9, 6)
 
                     # Try high-accuracy detection first
@@ -1372,6 +1405,7 @@ class Worker(QObject):
                     self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
 
                     self._run_calibration_flag = False
+                    self.requested_camera_res = (640, 480) # Revert to performance mode
                     self._calib_frames_captured = 0
                     self._calib_corners_sum = None
                     self.calibration_complete.emit(True)
@@ -1412,7 +1446,7 @@ class Worker(QObject):
                     cv2.putText(main_frame, "CHECKERBOARD NOT FOUND", (10, h_cam-20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            self.update_particles(tracked_points, h, w)
+            self.update_particles(tracked_points, h, w, w_cam, h_cam)
             self.draw_particles(projector_output)
 
             # Performer Occlusion Logic
@@ -1428,7 +1462,7 @@ class Worker(QObject):
                     pts = np.array(tracked_points, dtype=np.int32)
                     cv2.fillPoly(fg_mask, [cv2.convexHull(pts)], 0)
 
-                # Transform occlusion mask to projector space
+                # Transform occlusion mask to internal render space
                 self.occlusion_mask = self.warp_full_frame_to_projector(fg_mask, w_cam, h_cam, w, h)
 
             with QMutexLocker(self.mask_mutex):
@@ -1567,8 +1601,8 @@ class Worker(QObject):
                                 # Tracking lost or not linked: stay at source points or fallback
                                 dst_pts_cam = src_pts
 
-                            # Transform camera coordinates to projector coordinates
-                            dst_pts = self.transform_to_projector(dst_pts_cam, w_cam, h_cam)
+                            # Transform camera coordinates to internal render coordinates
+                            dst_pts = self.transform_to_projector(dst_pts_cam, w_cam, h_cam, target_w=w, target_h=h)
 
                             # Warp video to the dynamic polygon
                             video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
@@ -1623,7 +1657,7 @@ class Worker(QObject):
                                 mask_img = np.full((h, w, 3), 255, dtype=np.uint8)
                             else:
                                 src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
-                                dst_pts = self.transform_to_projector(mask.source_points, w_cam, h_cam)
+                                dst_pts = self.transform_to_projector(mask.source_points, w_cam, h_cam, target_w=w, target_h=h)
 
                                 if len(dst_pts) == 4:
                                     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -1657,7 +1691,7 @@ class Worker(QObject):
                     else:
                         draw_pts_cam = np.array(mask.source_points)
 
-                    draw_pts = self.transform_to_projector(draw_pts_cam, w_cam, h_cam).astype(np.int32)
+                    draw_pts = self.transform_to_projector(draw_pts_cam, w_cam, h_cam, target_w=w, target_h=h).astype(np.int32)
 
                     if len(draw_pts) >= 3:
                         cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
@@ -1750,10 +1784,10 @@ class Worker(QObject):
             if self.master_fader < 1.0:
                 projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
 
-            # Apply Projector Boundary Global Clip
+            # Apply Projector Boundary Global Clip (in internal resolution)
             if self.projector_boundary:
                 clip_mask = np.zeros((h, w), dtype=np.uint8)
-                proj_pts = self.transform_to_projector(self.projector_boundary, w_cam, h_cam)
+                proj_pts = self.transform_to_projector(self.projector_boundary, w_cam, h_cam, target_w=w, target_h=h)
                 cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
                 projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
 
@@ -1796,7 +1830,7 @@ class Worker(QObject):
         self.tracking_thread.wait()
         for player in self.video_players.values(): player.stop()
 
-    def update_particles(self, tracked_points, h, w):
+    def update_particles(self, tracked_points, h, w, w_cam, h_cam):
         if self.particle_preset == 'none':
             self.particles = []
             return
@@ -1806,7 +1840,9 @@ class Worker(QObject):
 
         # Emit new particles
         if tracked_points and len(self.particles) < effective_max:
-            for pt in tracked_points:
+            # Transform tracked points to projector space once for emission
+            proj_pts = self.transform_to_projector(tracked_points, w_cam, h_cam, target_w=w, target_h=h)
+            for pt in proj_pts:
                 if np.random.random() > 0.7:
                     p = {
                         'x': float(pt[0]),
@@ -1842,7 +1878,9 @@ class Worker(QObject):
     def get_vj_generator(self, pattern, h, w):
         # Performance: Render generators at lower resolution if throttled
         orig_w, orig_h = w, h
-        if self.throttle_level > 0.4:
+        if self.throttle_level > 0.8:
+            w, h = w // 4, h // 4
+        elif self.throttle_level > 0.4:
             w, h = w // 2, h // 2
 
         if self.generator_buffer is None or self.generator_buffer.shape[:2] != (h, w):
@@ -2070,15 +2108,26 @@ class Worker(QObject):
     def stop(self): self._running = False
 
     def run_boundary_detection(self):
+        self.requested_camera_res = (9999, 9999) # Request max FOV
         self._boundary_step = 0
         self._boundary_captures = []
         self._sls_curr_wait = 0
         self._run_boundary_detection_flag = True
 
+    def stop_calibration(self):
+        self._run_calibration_flag = False
+        self._run_sls_flag = False
+        self._run_boundary_detection_flag = False
+        self.requested_camera_res = (640, 480)
+        self.show_calibration_pattern = False
+        self.show_calibration_verify = False
+
     def run_auto_calibration(self):
+        self.requested_camera_res = (9999, 9999) # Request max FOV
         self._run_calibration_flag = True
 
     def run_room_scan(self):
+        self.requested_camera_res = (9999, 9999) # Request max FOV
         self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
         self._sls_step = 0
         self._sls_captures_x = []
@@ -2086,12 +2135,24 @@ class Worker(QObject):
         self._sls_curr_wait = 0
         self._run_sls_flag = True
 
-    def warp_full_frame_to_projector(self, frame, w_cam, h_cam, w_proj, h_proj):
+    def warp_full_frame_to_projector(self, frame, w_cam, h_cam, w_target, h_target):
         if self.h_c2p is not None:
-            return cv2.warpPerspective(frame, self.h_c2p, (w_proj, h_proj))
-        return cv2.resize(frame, (w_proj, h_proj))
+            # h_c2p maps to native projector resolution
+            # We need to scale it to target resolution
+            scale_w = w_target / self.projector_width
+            scale_h = h_target / self.projector_height
+            S = np.array([[scale_w, 0, 0], [0, scale_h, 0], [0, 0, 1]], dtype=np.float32)
+            M = S @ self.h_c2p
+            return cv2.warpPerspective(frame, M, (w_target, h_target))
+        return cv2.resize(frame, (w_target, h_target))
 
-    def transform_to_projector(self, pts, w_cam=640, h_cam=480):
+    def transform_to_projector(self, pts, w_cam=640, h_cam=480, target_w=None, target_h=None):
+        if target_w is None: target_w = self.projector_width
+        if target_h is None: target_h = self.projector_height
+
+        scale_w = target_w / self.projector_width
+        scale_h = target_h / self.projector_height
+
         # Prefer Dense LUT if available
         if self.sls_lut_x is not None:
             try:
@@ -2100,14 +2161,16 @@ class Worker(QObject):
                 for p in pts_arr.reshape(-1, 2):
                     ix, iy = int(round(p[0])), int(round(p[1]))
                     if 0 <= ix < w_cam and 0 <= iy < h_cam and self.sls_valid_mask[iy, ix]:
-                        res.append([self.sls_lut_x[iy, ix], self.sls_lut_y[iy, ix]])
+                        res.append([self.sls_lut_x[iy, ix] * scale_w, self.sls_lut_y[iy, ix] * scale_h])
                     else:
                         # Fallback to RBF for out-of-bounds or invalid pixels
                         if self.rbf_x:
-                            res.append([self.rbf_x(p.reshape(1,2))[0], self.rbf_y(p.reshape(1,2))[0]])
+                            rx = self.rbf_x(p.reshape(1,2))[0] * scale_w
+                            ry = self.rbf_y(p.reshape(1,2))[0] * scale_h
+                            res.append([rx, ry])
                         else:
                             # Proportional fallback
-                            res.append([p[0] * (self.projector_width / w_cam), p[1] * (self.projector_height / h_cam)])
+                            res.append([p[0] * (target_w / w_cam), p[1] * (target_h / h_cam)])
                 return np.array(res).reshape(-1, 2)
             except:
                 pass
@@ -2118,8 +2181,8 @@ class Worker(QObject):
                 if pts_arr.ndim == 1:
                     pts_arr = pts_arr.reshape(1, 2)
 
-                tx = self.rbf_x(pts_arr)
-                ty = self.rbf_y(pts_arr)
+                tx = self.rbf_x(pts_arr) * scale_w
+                ty = self.rbf_y(pts_arr) * scale_h
                 return np.stack([tx, ty], axis=1).reshape(-1, 2)
             except:
                 pass
@@ -2128,14 +2191,17 @@ class Worker(QObject):
             try:
                 pts_reshaped = np.float32(pts).reshape(-1, 1, 2)
                 transformed = cv2.perspectiveTransform(pts_reshaped, self.h_c2p)
-                return transformed.reshape(-1, 2)
+                res = transformed.reshape(-1, 2)
+                res[:, 0] *= scale_w
+                res[:, 1] *= scale_h
+                return res
             except:
                 pass
 
         # Fallback: Simple proportional scaling if not calibrated
         # This prevents the "top-left corner" issue when calibration is missing.
-        scale_x = self.projector_width / max(1, w_cam)
-        scale_y = self.projector_height / max(1, h_cam)
+        scale_x = target_w / max(1, w_cam)
+        scale_y = target_h / max(1, h_cam)
 
         pts_arr = np.array(pts, dtype=np.float32)
         if pts_arr.ndim == 1:

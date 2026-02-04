@@ -7,16 +7,19 @@ def gray_to_binary(n):
         mask = mask >> 1
     return n
 
-def generate_gray_code_patterns(width, height):
-    n_x = int(np.ceil(np.log2(width)))
-    n_y = int(np.ceil(np.log2(height)))
+def generate_gray_code_patterns(width, height, max_bits=8):
+    # Limit bits to ensure stripes are resolvable by camera (min ~5px)
+    n_x = min(int(np.ceil(np.log2(width))), max_bits)
+    n_y = min(int(np.ceil(np.log2(height))), max_bits)
 
     patterns_x = []
     for i in range(n_x):
         # bit i of gray code
         p = np.zeros((height, width), dtype=np.uint8)
         for x in range(width):
-            gray = x ^ (x >> 1)
+            # Scale x to the range covered by n_x bits
+            x_scaled = (x * (2**n_x)) // width
+            gray = x_scaled ^ (x_scaled >> 1)
             if (gray >> (n_x - 1 - i)) & 1:
                 p[:, x] = 255
         patterns_x.append(p)
@@ -26,7 +29,8 @@ def generate_gray_code_patterns(width, height):
     for i in range(n_y):
         p = np.zeros((height, width), dtype=np.uint8)
         for y in range(height):
-            gray = y ^ (y >> 1)
+            y_scaled = (y * (2**n_y)) // height
+            gray = y_scaled ^ (y_scaled >> 1)
             if (gray >> (n_y - 1 - i)) & 1:
                 p[y, :] = 255
         patterns_y.append(p)
@@ -34,7 +38,10 @@ def generate_gray_code_patterns(width, height):
 
     return patterns_x, patterns_y
 
-def decode_gray_code(captures, threshold=5):
+def decode_gray_code(captures, target_range, threshold=3):
+    if not captures:
+        return np.zeros((480, 640), dtype=np.int32), np.zeros((480, 640), dtype=bool)
+
     # captures: list of (pattern, inverse_pattern) pairs
     # returns bitmask where bits are set if pattern > inverse_pattern + threshold
     bits = []
@@ -44,12 +51,13 @@ def decode_gray_code(captures, threshold=5):
 
         bit = np.zeros(p.shape, dtype=np.uint8)
         # We only care about pixels where there is enough contrast
-        # Lower threshold for IR cameras seeing faint visible light
+        # Very low threshold for IR cameras
         valid = np.abs(p - inv) > threshold
         bit[p > inv] = 1
         bits.append((bit, valid))
 
     # Reconstruct value
+    n_bits = len(bits)
     val = np.zeros(captures[0].shape, dtype=np.int32)
     total_valid = np.ones(captures[0].shape, dtype=bool)
 
@@ -58,10 +66,13 @@ def decode_gray_code(captures, threshold=5):
         total_valid &= valid
 
     # Convert gray to binary
-    # This is a bit slow for whole image, better use a LUT or vectorization
-    # But since we only have 10-11 bits, we can vectorize
     binary_val = val.copy()
     for shift in [16, 8, 4, 2, 1]:
         binary_val ^= (binary_val >> shift)
 
-    return binary_val, total_valid
+    # Scale back to target_range (width or height)
+    # Using float for accuracy then rounding
+    scale = target_range / (2**n_bits)
+    scaled_val = (binary_val.astype(np.float32) * scale).astype(np.int32)
+
+    return scaled_val, total_valid

@@ -93,6 +93,7 @@ class MIDIMappingDialog(QDialog):
             ('Particles: Dust', 'part_dust'),
             ('Particles: Rain', 'part_rain'),
             ('Particles: Off', 'part_none'),
+            ('Blackout (Panic)', 'blackout_toggle'),
         ]
 
         for i in range(8):
@@ -1839,6 +1840,9 @@ class ProjectionMappingApp(QMainWindow):
         elif key == 'toggle_projector_splash':
             if value > 64:
                 self.splash_check.setChecked(not self.splash_check.isChecked())
+        elif key == 'blackout_toggle':
+            if value > 64:
+                self.toggle_blackout()
         elif key.startswith('snap_save_'):
             idx = int(key.split('_')[-1])
             if value > 64: self.save_snapshot(idx)
@@ -1871,12 +1875,16 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage(f"Applied {mood_name} mood.", 3000)
 
     def toggle_blackout(self):
-        # Toggle all masks visibility as a panic blackout
-        is_visible = any(m.visible for m in self.masks)
-        for m in self.masks:
-            m.visible = not is_visible
-        self.worker.set_masks(self.masks)
-        self.statusBar().showMessage("BLACKOUT ENABLED" if is_visible else "BLACKOUT DISABLED", 3000)
+        # Instant blackout via worker flag
+        self.worker.blackout_active = not self.worker.blackout_active
+        if self.worker.blackout_active:
+            self.blackout_btn.setText("DISABLE BLACKOUT")
+            self.blackout_btn.setStyleSheet("background-color: #ff5252; color: white; font-weight: bold; height: 40px;")
+            self.statusBar().showMessage("BLACKOUT ENABLED (PANIC)", 0)
+        else:
+            self.blackout_btn.setText("BLACKOUT (PANIC)")
+            self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
+            self.statusBar().showMessage("BLACKOUT DISABLED", 3000)
 
     def toggle_splash_mode(self, checked):
         self.worker.show_splash = checked
