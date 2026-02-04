@@ -232,6 +232,7 @@ class ProjectionMappingApp(QMainWindow):
         self.create_workspace_tab()
         self.create_media_tab()
         self.create_calibration_tab()
+        self.create_boundary_tab()
         self.create_system_tab()
         self.create_diagnostics_tab()
 
@@ -250,7 +251,9 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
+        self.worker.system_warning.connect(lambda msg: self.statusBar().showMessage(msg, 10000))
         self.worker.calibration_complete.connect(self.handle_calibration_complete)
+        self.worker.boundary_detected.connect(self.handle_boundary_detected)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
@@ -538,10 +541,10 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_layout.addWidget(self.setup_title)
         self.setup_layout.addWidget(self.setup_desc)
 
-        self.setup_group = QGroupBox("Step 1: Devices & Alignment")
+        self.setup_group = QGroupBox("Step 1: Devices & Boundary Detection")
         self.setup_group_layout = QVBoxLayout()
 
-        self.setup_instruction = QLabel("Select your camera and projector, then run Auto-Alignment.")
+        self.setup_instruction = QLabel("Select your camera and projector, then detect where the projector light is visible.")
         self.setup_instruction.setWordWrap(True)
         self.setup_group_layout.addWidget(self.setup_instruction)
 
@@ -563,12 +566,12 @@ class ProjectionMappingApp(QMainWindow):
         proj_layout.addWidget(self.setup_proj_combo)
         self.setup_group_layout.addLayout(proj_layout)
 
-        # Auto-Alignment
-        self.align_btn = QPushButton("RUN AUTO-ALIGNMENT")
-        self.align_btn.setMinimumHeight(50)
-        self.align_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; margin-top: 10px;")
-        self.align_btn.clicked.connect(self.start_auto_calibration)
-        self.setup_group_layout.addWidget(self.align_btn)
+        # Boundary Detection
+        self.detect_bounds_btn = QPushButton("DETECT PROJECTOR BOUNDS")
+        self.detect_bounds_btn.setMinimumHeight(50)
+        self.detect_bounds_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; margin-top: 10px;")
+        self.detect_bounds_btn.clicked.connect(self.worker.run_boundary_detection)
+        self.setup_group_layout.addWidget(self.detect_bounds_btn)
 
         self.manual_align_btn = QPushButton("MANUAL ALIGNMENT")
         self.manual_align_btn.clicked.connect(self.start_manual_calibration)
@@ -689,6 +692,36 @@ class ProjectionMappingApp(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
 
+    def handle_boundary_detected(self, points):
+        if not points:
+            self.statusBar().showMessage("Boundary Detection Failed! Ensure camera sees projector.", 5000)
+            return
+
+        self.statusBar().showMessage(f"Detected Projector Boundary with {len(points)} points.", 3000)
+
+        # Create/Update Background Mask
+        bg_mask = None
+        for m in self.masks:
+            if m.tag == 'background':
+                bg_mask = m
+                break
+
+        if not bg_mask:
+            bg_mask = Mask("Background", points, None, tag="background", mask_type="static")
+            self.masks.append(bg_mask)
+        else:
+            bg_mask.source_points = points
+            bg_mask.visible = True
+
+        self.update_cue_table()
+        self.update_mask_combos()
+        self.worker.set_masks(self.masks)
+
+        # Advance Wizard or update UI
+        if self.setup_step == 0:
+            self.setup_status_label.setText("Boundary: DETECTED ✓")
+            self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
+
     def next_setup_step(self):
         self.setup_step += 1
         self.clear_setup_layout()
@@ -698,13 +731,31 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_instruction.setWordWrap(True)
         self.setup_group_layout.addWidget(self.setup_instruction)
 
-        if self.setup_step == 1: # Background
-            self.setup_group.setTitle("Step 2: Background Mask")
-            self.setup_instruction.setText("Create a mask for your background projection area. This area will stay static.")
-            btn = QPushButton("Start Drawing Background Mask")
-            btn.clicked.connect(self.start_setup_bg_mask)
-            btn.setMinimumHeight(50)
-            self.setup_group_layout.addWidget(btn)
+        if self.setup_step == 1: # Alignment
+            self.setup_group.setTitle("Step 2: Camera Alignment")
+            self.setup_instruction.setText("Align the camera to the projector coordinates.")
+
+            # Auto-Alignment
+            self.align_btn = QPushButton("RUN AUTO-ALIGNMENT")
+            self.align_btn.setMinimumHeight(50)
+            self.align_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; margin-top: 10px;")
+            self.align_btn.clicked.connect(self.start_auto_calibration)
+            self.setup_group_layout.addWidget(self.align_btn)
+
+            self.manual_align_btn = QPushButton("MANUAL ALIGNMENT")
+            self.manual_align_btn.clicked.connect(self.start_manual_calibration)
+            self.setup_group_layout.addWidget(self.manual_align_btn)
+
+            self.scan_room_btn = QPushButton("SCAN ROOM (AUTO-ALIGN)")
+            self.scan_room_btn.setMinimumHeight(50)
+            self.scan_room_btn.setStyleSheet("background-color: #00bcd4; color: black; font-weight: bold;")
+            self.scan_room_btn.clicked.connect(self.start_room_scan)
+            self.setup_group_layout.addWidget(self.scan_room_btn)
+
+            self.verify_align_btn = QPushButton("VERIFY ALIGNMENT")
+            self.verify_align_btn.setCheckable(True)
+            self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
+            self.setup_group_layout.addWidget(self.verify_align_btn)
         elif self.setup_step == 2: # Guitar Markers
             self.setup_group.setTitle("Step 3: Guitar Markers")
             self.setup_instruction.setText("Identify the IR markers on your guitar. This allows the system to track its movement.")
@@ -1148,6 +1199,89 @@ class ProjectionMappingApp(QMainWindow):
 
         self.tabs.addTab(tab, "Media & Cues")
 
+    def create_boundary_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        group = QGroupBox("Projector Usable Area (Camera View)")
+        glayout = QVBoxLayout()
+
+        glayout.addWidget(QLabel("This defines where the projector light is visible to the camera."))
+
+        self.edit_bounds_btn = QPushButton("MANUALLY EDIT BOUNDARY")
+        self.edit_bounds_btn.setCheckable(True)
+        self.edit_bounds_btn.toggled.connect(self.toggle_boundary_edit)
+        glayout.addWidget(self.edit_bounds_btn)
+
+        num_layout = QHBoxLayout()
+        num_layout.addWidget(QLabel("Point Count:"))
+        self.bounds_points_spin = QComboBox()
+        self.bounds_points_spin.addItems(["4", "6", "8", "10", "12"])
+        self.bounds_points_spin.setCurrentText("8")
+        num_layout.addWidget(self.bounds_points_spin)
+        self.bounds_points_spin.currentTextChanged.connect(self.reset_boundary_to_count)
+        glayout.addLayout(num_layout)
+
+        self.apply_bounds_btn = QPushButton("SAVE BOUNDARY AS BACKGROUND")
+        self.apply_bounds_btn.clicked.connect(self.save_boundary_as_bg)
+        glayout.addWidget(self.apply_bounds_btn)
+
+        self.clear_bounds_btn = QPushButton("CLEAR ALL POINTS")
+        self.clear_bounds_btn.clicked.connect(lambda: self.video_display.clear_mask_points())
+        glayout.addWidget(self.clear_bounds_btn)
+
+        group.setLayout(glayout)
+        layout.addWidget(group)
+        layout.addStretch()
+        self.tabs.addTab(tab, "Boundary")
+
+    def reset_boundary_to_count(self, count_str):
+        if not self.edit_bounds_btn.isChecked(): return
+
+        count = int(count_str)
+        # Generate a simple centered polygon with N points
+        w_cam, h_cam = 640, 480 # Standard camera resolution used in worker
+        cx, cy = w_cam / 2, h_cam / 2
+        rx, ry = w_cam * 0.4, h_cam * 0.4
+
+        new_pts = []
+        import numpy as np
+        for i in range(count):
+            angle = 2 * np.pi * i / count
+            px = cx + rx * np.cos(angle)
+            py = cy + ry * np.sin(angle)
+            new_pts.append(QPointF(px, py))
+
+        self.video_display.set_mask_points(new_pts)
+        self.worker.projector_boundary = [(p.x(), p.y()) for p in new_pts]
+
+    def toggle_boundary_edit(self, checked):
+        if checked:
+            self.video_display.clear_mask_points()
+            if self.worker.projector_boundary:
+                # Load current boundary points into display
+                pts = [QPointF(p[0], p[1]) for p in self.worker.projector_boundary]
+                self.video_display.set_mask_points(pts)
+            self.video_display.set_mask_creation_mode(True, Qt.yellow)
+            self.edit_bounds_btn.setText("FINISH EDITING")
+        else:
+            self.video_display.set_mask_creation_mode(False)
+            self.edit_bounds_btn.setText("MANUALLY EDIT BOUNDARY")
+            # Don't save yet, wait for apply button or just auto-update?
+            # User said "drag corners", so we should update worker immediately or on finish.
+            pts = list(self.video_display.get_mask_points())
+            if pts:
+                self.worker.projector_boundary = [(p.x(), p.y()) for p in pts]
+
+    def save_boundary_as_bg(self):
+        pts = self.worker.projector_boundary
+        if not pts:
+            self.statusBar().showMessage("No boundary defined!", 3000)
+            return
+
+        self.handle_boundary_detected(pts)
+        self.statusBar().showMessage("Boundary saved as Background mask.", 3000)
+
     def create_calibration_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1430,6 +1564,7 @@ class ProjectionMappingApp(QMainWindow):
                 'h_c2p': self.worker.h_c2p.tolist() if self.worker.h_c2p is not None else None,
                 'calib_points': getattr(self.worker, 'calib_points', None),
                 'baseline_distance': self.worker.baseline_distance,
+                'projector_boundary': self.worker.projector_boundary,
                 'pnp_enabled': self.pnp_check.isChecked(),
                 'occlusion_enabled': self.occlusion_check.isChecked(),
                 'setup_reference': ref_frame_b64,
@@ -1527,6 +1662,7 @@ class ProjectionMappingApp(QMainWindow):
                     self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
 
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
+                self.worker.projector_boundary = data.get('projector_boundary')
                 self.pnp_check.setChecked(data.get('pnp_enabled', False))
                 self.occlusion_check.setChecked(data.get('occlusion_enabled', False))
 

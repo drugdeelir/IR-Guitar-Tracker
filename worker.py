@@ -92,7 +92,9 @@ class Worker(QObject):
     trackers_detected = pyqtSignal(int)
     trackers_ready = pyqtSignal(list)
     camera_error = pyqtSignal(int)
+    system_warning = pyqtSignal(str)
     calibration_complete = pyqtSignal(bool)
+    boundary_detected = pyqtSignal(list) # List of points
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,6 +202,12 @@ class Worker(QObject):
         self._sls_captures_y = []
         self._sls_wait_frames = 2
         self._sls_curr_wait = 0
+
+        # Projector Boundary Detection
+        self._run_boundary_detection_flag = False
+        self._boundary_step = 0
+        self._boundary_captures = []
+        self.projector_boundary = None # Mask points (camera space)
 
         # Splash Mode
         self.show_splash = False
@@ -910,7 +918,68 @@ class Worker(QObject):
                 self.projector_buffer = np.zeros((h, w, 3), dtype=np.uint8)
                 self.mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
 
-            if self._run_sls_flag:
+            if self._run_boundary_detection_flag:
+                if self._boundary_step == 0:
+                    # Capture Black Frame
+                    self.projector_buffer.fill(0)
+                    if self._sls_curr_wait >= self._sls_wait_frames:
+                        self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
+                        self._boundary_step = 1
+                        self._sls_curr_wait = 0
+                    else:
+                        self._sls_curr_wait += 1
+                elif self._boundary_step == 1:
+                    # Capture White Frame
+                    self.projector_buffer.fill(255)
+                    if self._sls_curr_wait >= self._sls_wait_frames:
+                        self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
+                        self._boundary_step = 2
+                        self._sls_curr_wait = 0
+                    else:
+                        self._sls_curr_wait += 1
+                elif self._boundary_step == 2:
+                    # Process Detection
+                    print("Processing Projector Boundary...")
+                    black = self._boundary_captures[0]
+                    white = self._boundary_captures[1]
+                    diff = cv2.absdiff(white, black)
+                    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+
+                    # Clean up
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+                    thresh = cv2.dilate(thresh, kernel, iterations=2)
+
+                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        # Find largest contour
+                        main_contour = max(contours, key=cv2.contourArea)
+                        area_ratio = cv2.contourArea(main_contour) / (w_cam * h_cam)
+
+                        if area_ratio < 0.05:
+                            msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
+                            self.system_warning.emit(msg)
+
+                        # Simplify to a polygon (e.g. 8 points for some flexibility)
+                        peri = cv2.arcLength(main_contour, True)
+                        approx = cv2.approxPolyDP(main_contour, 0.01 * peri, True)
+
+                        # Ensure we have at least 4 points
+                        if len(approx) < 4:
+                            rect = cv2.minAreaRect(main_contour)
+                            approx = cv2.boxPoints(rect)
+
+                        pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
+                        self.projector_boundary = pts
+                        self.boundary_detected.emit(pts)
+                    else:
+                        print("Error: No projector light detected!")
+                        self.boundary_detected.emit([])
+
+                    self._run_boundary_detection_flag = False
+                    self._boundary_step = 0
+                    self._boundary_captures = []
+            elif self._run_sls_flag:
                 # Structured Light Scanning takes priority
                 total_x = len(self._sls_patterns_x)
                 total_y = len(self._sls_patterns_y)
@@ -1494,6 +1563,13 @@ class Worker(QObject):
             if self.master_fader < 1.0:
                 projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
 
+            # Apply Projector Boundary Global Clip
+            if self.projector_boundary:
+                clip_mask = np.zeros((h, w), dtype=np.uint8)
+                proj_pts = self.transform_to_projector(self.projector_boundary, w_cam, h_cam)
+                cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
+                projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
+
             # Apply Performer Occlusion
             if self.occlusion_enabled and self.occlusion_mask is not None:
                 # Black out the performer
@@ -1783,6 +1859,12 @@ class Worker(QObject):
         return points
 
     def stop(self): self._running = False
+
+    def run_boundary_detection(self):
+        self._boundary_step = 0
+        self._boundary_captures = []
+        self._sls_curr_wait = 0
+        self._run_boundary_detection_flag = True
 
     def run_auto_calibration(self):
         self._run_calibration_flag = True

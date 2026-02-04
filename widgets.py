@@ -1,7 +1,7 @@
 
 from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QDialog
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer, QPointF
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon, QPolygonF
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon, QPolygonF, QColor
 
 class MarkerImageLabel(QLabel):
     point_selected = pyqtSignal(QPoint)
@@ -118,6 +118,7 @@ class VideoDisplay(QWidget):
         self.detected_markers = []
         self.current_pixmap = None
         self.current_mask_color = Qt.magenta
+        self.dragging_idx = -1
 
     def set_mask_color(self, color):
         self.current_mask_color = color
@@ -134,55 +135,68 @@ class VideoDisplay(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.black)
 
+        pix_w, pix_h = 640, 480
         if self.current_pixmap:
+            pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
             # Scale to fit while maintaining aspect ratio
             scaled_pixmap = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-            # Center the pixmap
             sw, sh = scaled_pixmap.width(), scaled_pixmap.height()
-            x = (self.width() - sw) // 2
-            y = (self.height() - sh) // 2
-            self.draw_rect = scaled_pixmap.rect().translated(x, y)
+        else:
+            # Fallback scaling for empty display
+            sw, sh = self.width(), self.height()
+            if sw * 480 > sh * 640:
+                sw = sh * 640 // 480
+            else:
+                sh = sw * 480 // 640
+
+        x = (self.width() - sw) // 2
+        y = (self.height() - sh) // 2
+
+        if self.current_pixmap:
             painter.drawPixmap(x, y, scaled_pixmap)
+        else:
+            # Draw a dark gray rectangle to represent the camera FOV
+            painter.fillRect(x, y, sw, sh, QColor(30, 30, 30))
+            painter.setPen(QPen(Qt.gray, 1, Qt.DashLine))
+            painter.drawRect(x, y, sw, sh)
+            painter.drawText(x + 10, y + 20, "Waiting for Camera...")
 
-            if self.mask_creation_mode and self.mask_points:
-                painter.setPen(QPen(self.current_mask_color, 2))
-                painter.setBrush(QBrush(self.current_mask_color, Qt.Dense6Pattern))
+        if self.mask_creation_mode and self.mask_points:
+            painter.setPen(QPen(self.current_mask_color, 2))
+            painter.setBrush(QBrush(self.current_mask_color, Qt.Dense6Pattern))
 
-                # Denormalize mask points for drawing
-                pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
-                draw_pts = []
-                for p in self.mask_points:
-                    dx = x + (p.x() * sw / pix_w)
-                    dy = y + (p.y() * sh / pix_h)
-                    draw_pts.append(QPoint(int(dx), int(dy)))
+            # Denormalize mask points for drawing
+            draw_pts = []
+            for p in self.mask_points:
+                dx = x + (p.x() * sw / pix_w)
+                dy = y + (p.y() * sh / pix_h)
+                draw_pts.append(QPoint(int(dx), int(dy)))
 
-                poly = QPolygon(draw_pts)
-                painter.drawPolygon(poly)
+            poly = QPolygon(draw_pts)
+            painter.drawPolygon(poly)
+
+            # Draw handles
+            painter.setBrush(Qt.white)
+            for pt in draw_pts:
+                painter.drawEllipse(pt, 5, 5)
     
     def mousePressEvent(self, event):
         if self.mask_creation_mode:
             # Map point to pixmap coordinates
             if not self.current_pixmap: return
-
-            lbl_w, lbl_h = self.width(), self.height()
             pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
 
-            # Re-calculate scaling used in paintEvent
-            scaled_size = self.current_pixmap.size()
-            scaled_size.scale(self.size(), Qt.KeepAspectRatio)
-
-            sw = scaled_size.width()
-            sh = scaled_size.height()
-
-            offset_x = (lbl_w - sw) // 2
-            offset_y = (lbl_h - sh) // 2
-
-            px = (event.pos().x() - offset_x) * pix_w / sw
-            py = (event.pos().y() - offset_y) * pix_h / sh
+            # Use a helper to map coordinates
+            px, py = self.map_to_pixmap(event.pos())
 
             if 0 <= px < pix_w and 0 <= py < pix_h:
                 click_pt = QPoint(int(px), int(py))
+
+                # Check if we are clicking an existing point to drag
+                for i, pt in enumerate(self.mask_points):
+                    if (click_pt - pt).manhattanLength() < 15:
+                        self.dragging_idx = i
+                        return
 
                 # Auto-Snapping to detected IR markers
                 snapped_pt = click_pt
@@ -199,6 +213,28 @@ class VideoDisplay(QWidget):
                 self.mask_point_added.emit(snapped_pt)
                 self.update()
 
+    def mouseMoveEvent(self, event):
+        if self.mask_creation_mode and self.dragging_idx != -1:
+            px, py = self.map_to_pixmap(event.pos())
+            self.mask_points[self.dragging_idx] = QPoint(int(px), int(py))
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self.dragging_idx = -1
+
+    def map_to_pixmap(self, pos):
+        if not self.current_pixmap: return 0, 0
+        lbl_w, lbl_h = self.width(), self.height()
+        pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
+        scaled_size = self.current_pixmap.size()
+        scaled_size.scale(self.size(), Qt.KeepAspectRatio)
+        sw, sh = scaled_size.width(), scaled_size.height()
+        offset_x = (lbl_w - sw) // 2
+        offset_y = (lbl_h - sh) // 2
+        px = (pos.x() - offset_x) * pix_w / sw
+        py = (pos.y() - offset_y) * pix_h / sh
+        return px, py
+
     def set_mask_creation_mode(self, enabled, color=Qt.magenta):
         self.mask_creation_mode = enabled
         self.current_mask_color = color
@@ -212,6 +248,10 @@ class VideoDisplay(QWidget):
 
     def get_mask_points(self):
         return self.mask_points
+
+    def set_mask_points(self, points):
+        self.mask_points = points
+        self.update()
 
     def clear_mask_points(self):
         self.mask_points = []
