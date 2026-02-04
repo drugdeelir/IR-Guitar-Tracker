@@ -574,26 +574,6 @@ class ProjectionMappingApp(QMainWindow):
         self.detect_bounds_btn.clicked.connect(self.worker.run_boundary_detection)
         self.setup_group_layout.addWidget(self.detect_bounds_btn)
 
-        self.manual_align_btn = QPushButton("MANUAL ALIGNMENT")
-        self.manual_align_btn.clicked.connect(self.start_manual_calibration)
-        self.setup_group_layout.addWidget(self.manual_align_btn)
-
-        # Scan Room (Structured Light)
-        self.scan_room_btn = QPushButton("SCAN ROOM (AUTO-ALIGN)")
-        self.scan_room_btn.setMinimumHeight(50)
-        self.scan_room_btn.setStyleSheet("background-color: #00bcd4; color: black; font-weight: bold;")
-        self.scan_room_btn.clicked.connect(self.start_room_scan)
-        self.setup_group_layout.addWidget(self.scan_room_btn)
-
-        self.verify_align_btn = QPushButton("VERIFY ALIGNMENT")
-        self.verify_align_btn.setCheckable(True)
-        self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
-        self.setup_group_layout.addWidget(self.verify_align_btn)
-
-        self.test_pattern_check = QCheckBox("Show Test Pattern (Manual Alignment Check)")
-        self.test_pattern_check.toggled.connect(self.toggle_test_pattern)
-        self.setup_group_layout.addWidget(self.test_pattern_check)
-
         self.setup_status_label = QLabel("Mapping: Not Aligned")
         self.setup_status_label.setAlignment(Qt.AlignCenter)
         self.setup_status_label.setStyleSheet("color: #ff5252; font-weight: bold;")
@@ -664,10 +644,14 @@ class ProjectionMappingApp(QMainWindow):
 
     def handle_calibration_complete(self, success):
         self.worker.show_calibration_pattern = False
-        if hasattr(self, 'test_pattern_check') and self.test_pattern_check:
-            self.test_pattern_check.blockSignals(True)
-            self.test_pattern_check.setChecked(False)
-            self.test_pattern_check.blockSignals(False)
+        # Safe check for widget existence to avoid RuntimeError if deleted during step transition
+        try:
+            if getattr(self, 'test_pattern_check', None):
+                self.test_pattern_check.blockSignals(True)
+                self.test_pattern_check.setChecked(False)
+                self.test_pattern_check.blockSignals(False)
+        except RuntimeError:
+            self.test_pattern_check = None
         if success:
             self.statusBar().showMessage("Auto-Alignment Successful!", 5000)
             if hasattr(self, 'setup_status_label') and self.setup_status_label:
@@ -685,6 +669,12 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_link_status_label = None
         self.setup_link_mask_combo = None
         self.setup_status_label = None
+        self.test_pattern_check = None
+        self.verify_align_btn = None
+        self.scan_room_btn = None
+        self.manual_align_btn = None
+        self.align_btn = None
+        self.detect_bounds_btn = None
 
         while self.setup_group_layout.count():
             item = self.setup_group_layout.takeAt(0)
@@ -724,6 +714,9 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
 
     def next_setup_step(self):
+        # Ensure any active calibration is stopped before moving to next step
+        self.worker.stop_calibration()
+
         self.setup_step += 1
         self.clear_setup_layout()
 
@@ -757,6 +750,10 @@ class ProjectionMappingApp(QMainWindow):
             self.verify_align_btn.setCheckable(True)
             self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
             self.setup_group_layout.addWidget(self.verify_align_btn)
+
+            self.test_pattern_check = QCheckBox("Show Test Pattern (Manual Alignment Check)")
+            self.test_pattern_check.toggled.connect(self.toggle_test_pattern)
+            self.setup_group_layout.addWidget(self.test_pattern_check)
         elif self.setup_step == 2: # Guitar Markers
             self.setup_group.setTitle("Step 3: Guitar Markers")
             self.setup_instruction.setText("Identify the IR markers on your guitar. This allows the system to track its movement.")
