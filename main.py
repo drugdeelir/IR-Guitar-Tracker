@@ -218,6 +218,8 @@ class ProjectionMappingApp(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QHBoxLayout(self.central_widget)
+        self.layout.setSpacing(15)
+        self.layout.setContentsMargins(10, 10, 10, 10)
 
         self.video_display = VideoDisplay()
         self.video_display.setMinimumWidth(800)
@@ -534,6 +536,8 @@ class ProjectionMappingApp(QMainWindow):
     def create_setup_tab(self):
         self.setup_tab = QWidget()
         self.setup_layout = QVBoxLayout(self.setup_tab)
+        self.setup_layout.setSpacing(12)
+        self.setup_layout.setContentsMargins(15, 15, 15, 15)
 
         self.setup_title = QLabel("<h2>Guided Setup</h2>")
         self.setup_desc = QLabel("Welcome! Let's get your projection mapped. Follow the steps below.")
@@ -650,7 +654,7 @@ class ProjectionMappingApp(QMainWindow):
                 proj_ordered = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
 
                 h_matrix, _ = cv2.findHomography(cam_ordered, proj_ordered)
-                self.worker.set_h_c2p(h_matrix.tolist())
+                self.worker.set_h_c2p(h_matrix.tolist(), cam_res=self.worker._current_camera_res)
                 self.handle_calibration_complete(True)
             else:
                 self.statusBar().showMessage("Manual Alignment failed: Please select exactly 4 corners.", 5000)
@@ -785,32 +789,31 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_group_layout.addWidget(marker_btn)
 
         elif self.setup_step == 3: # Guitar Mask
-            self.setup_group.setTitle("Step 4: Guitar Mask")
-            self.setup_instruction.setText("Draw the shape of your guitar or amp. This mask will follow the markers you calibrated.")
+            self.setup_group.setTitle("Step 4: Guitar Mask (DYNAMIC)")
+            self.setup_instruction.setText("Draw the shape of your guitar. This mask will AUTOMATICALLY FOLLOW the markers you calibrated.")
 
-            mask_btn = QPushButton("DRAW GUITAR MASK")
-            mask_btn.clicked.connect(self.start_setup_amp_mask)
+            mask_btn = QPushButton("DRAW TRACKED GUITAR MASK")
+            mask_btn.clicked.connect(self.start_setup_guitar_mask)
             mask_btn.setMinimumHeight(60)
             mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(mask_btn)
-
-            self.setup_link_mask_combo = QComboBox()
-            self.setup_link_mask_combo.setMinimumHeight(30)
-            self.setup_link_mask_combo.currentIndexChanged.connect(self.refresh_link_status_labels)
-            self.setup_group_layout.addWidget(QLabel("Select Mask to Link:"))
-            self.setup_group_layout.addWidget(self.setup_link_mask_combo)
-
-            link_btn = QPushButton("Link Selected Mask to Tracking")
-            link_btn.setStyleSheet("background-color: #311b92; color: white; height: 40px;")
-            link_btn.clicked.connect(self.link_mask_to_markers)
-            self.setup_group_layout.addWidget(link_btn)
 
             self.setup_link_status_label = QLabel("Status: Not Linked")
             self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
             self.setup_group_layout.addWidget(self.setup_link_status_label)
             self.update_mask_combos()
 
-        elif self.setup_step == 4: # Done
+        elif self.setup_step == 4: # Amp Mask
+            self.setup_group.setTitle("Step 5: Amp Mask (STATIC)")
+            self.setup_instruction.setText("Draw the shape of your stationary amp or cabinet. This mask will stay in place.")
+
+            mask_btn = QPushButton("DRAW STATIONARY AMP MASK")
+            mask_btn.clicked.connect(self.start_setup_amp_mask)
+            mask_btn.setMinimumHeight(60)
+            mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
+            self.setup_group_layout.addWidget(mask_btn)
+
+        elif self.setup_step == 5: # Done
             self.setup_group.setTitle("Setup Complete")
             self.setup_instruction.setText("Setup finished! You can save this configuration as a preset below.")
 
@@ -869,26 +872,48 @@ class ProjectionMappingApp(QMainWindow):
         if self.open_marker_selection_dialog():
             self.start_setup_amp_mask()
 
-    def start_setup_amp_mask(self):
+    def start_setup_guitar_mask(self):
         self.video_display.clear_mask_points()
-        self.video_display.set_snap_to_markers(False)
+        self.video_display.set_snap_to_markers(True)
         self.video_display.set_mask_color(Qt.green)
-        amp_mask = None
+        mask = None
         for m in self.masks:
-            if m.tag == 'amp':
-                amp_mask = m
+            if m.name == 'Guitar':
+                mask = m
                 break
 
-        if not amp_mask:
-            amp_mask = Mask("Guitar", [], None, tag="amp", mask_type="static")
-            self.masks.append(amp_mask)
+        if not mask:
+            mask = Mask("Guitar", [], None, tag="amp", mask_type="dynamic")
+            self.masks.append(mask)
             self.update_cue_table()
             self.update_mask_combos()
 
-        idx = self.masks.index(amp_mask)
+        idx = self.masks.index(mask)
         self.cue_list_widget.setCurrentRow(idx)
-        # Sync workspace UI so saving works correctly
         self.mask_tag_combo.setCurrentText("amp")
+        self.mask_type_combo.setCurrentText("dynamic")
+        self.add_wizard_finish_button()
+        self.enter_mask_creation_mode()
+
+    def start_setup_amp_mask(self):
+        self.video_display.clear_mask_points()
+        self.video_display.set_snap_to_markers(False)
+        self.video_display.set_mask_color(Qt.cyan)
+        mask = None
+        for m in self.masks:
+            if m.name == 'Amp':
+                mask = m
+                break
+
+        if not mask:
+            mask = Mask("Amp", [], None, tag="background", mask_type="static")
+            self.masks.append(mask)
+            self.update_cue_table()
+            self.update_mask_combos()
+
+        idx = self.masks.index(mask)
+        self.cue_list_widget.setCurrentRow(idx)
+        self.mask_tag_combo.setCurrentText("background")
         self.mask_type_combo.setCurrentText("static")
         self.add_wizard_finish_button()
         self.enter_mask_creation_mode()
@@ -1580,6 +1605,7 @@ class ProjectionMappingApp(QMainWindow):
                 'marker_config': self.worker.marker_config,
                 'h_c2p': self.worker.h_c2p.tolist() if self.worker.h_c2p is not None else None,
                 'calib_points': getattr(self.worker, 'calib_points', None),
+                'calibration_camera_res': self.worker.calibration_camera_res,
                 'baseline_distance': self.worker.baseline_distance,
                 'projector_boundary': self.worker.projector_boundary,
                 'pnp_enabled': self.pnp_check.isChecked(),
@@ -1685,10 +1711,11 @@ class ProjectionMappingApp(QMainWindow):
 
                 h_c2p = data.get('h_c2p')
                 calib_points = data.get('calib_points')
+                calib_res = data.get('calibration_camera_res')
                 if calib_points:
-                    self.worker.set_h_c2p(calib_points)
+                    self.worker.set_h_c2p(calib_points, cam_res=calib_res)
                 elif h_c2p:
-                    self.worker.set_h_c2p(h_c2p)
+                    self.worker.set_h_c2p(h_c2p, cam_res=calib_res)
 
                 if calib_points or h_c2p:
                     if hasattr(self, 'setup_status_label') and self.setup_status_label:
@@ -1985,10 +2012,17 @@ class ProjectionMappingApp(QMainWindow):
             mask.tag = 'background'
             mask.type = 'static'
             mask.name = 'Background'
-        elif self.setup_step == 3: # Guitar Mask step (now step 4, index 3)
+        elif self.setup_step == 3: # Guitar Mask step
             mask.tag = 'amp'
-            mask.type = 'static'
+            mask.type = 'dynamic'
             mask.name = 'Guitar'
+            # Automatically link to markers if they exist
+            if self.selected_markers and not mask.is_linked:
+                 self.link_mask_to_markers()
+        elif self.setup_step == 4: # Amp Mask step
+            mask.tag = 'background'
+            mask.type = 'static'
+            mask.name = 'Amp'
 
         self.update_cue_table()
         self.update_mask_combos()

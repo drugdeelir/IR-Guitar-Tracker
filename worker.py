@@ -185,9 +185,11 @@ class TrackingThread(QThread):
 
             # Handle Calibration Flags (some need to run in camera thread)
             if self.worker._capture_still_frame_flag:
-                rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
-                self.worker._capture_still_frame_flag = False
+                # Wait for resolution change to apply if requested
+                if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
+                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
+                    self.worker._capture_still_frame_flag = False
 
             elapsed = time.time() - start_time
             sleep_time = max(1, int((frame_time - elapsed) * 1000))
@@ -229,8 +231,9 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
-        self.requested_camera_res = (9999, 9999) # Always request max FOV
+        self.requested_camera_res = (1280, 720) # Default for performance
         self._current_camera_res = (0, 0)
+        self.calibration_camera_res = None
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
         self._calibrate_depth_flag = False
@@ -422,17 +425,24 @@ class Worker(QObject):
         self.smoothing_factor = value
 
     def capture_still_frame(self):
+        # Set to max FOV for capture
+        self.requested_camera_res = (9999, 9999)
         self._capture_still_frame_flag = True
 
     def calibrate_depth(self):
         self._calibrate_depth_flag = True
 
-    def set_h_c2p(self, matrix_list):
+    def set_h_c2p(self, matrix_list, cam_res=None):
         if matrix_list is None:
             self.h_c2p = None
             self.rbf_x = None
             self.rbf_y = None
         else:
+            if cam_res:
+                self.calibration_camera_res = cam_res
+            else:
+                self.calibration_camera_res = self._current_camera_res
+
             # Handle list of points for RBF or matrix for Homography
             if isinstance(matrix_list, list) and len(matrix_list) > 4 and isinstance(matrix_list[0], list):
                 # Probably a point list [(cam_x, cam_y, proj_x, proj_y), ...]
@@ -591,20 +601,14 @@ class Worker(QObject):
 
         # Performance: skip FX if heavily throttled and not essential
         if self.throttle_level > 0.9 and not live_only:
-             # Just return original if we are dying
              return frame
-
-        live_fx = {'strobe', 'hue_cycle', 'glitch', 'trails', 'feedback', 'matrix', 'ooze', 'scanline', 'vhs'}
-
-        # Skip heavy procedural FX if throttled
-        if self.throttle_level > 0.7:
-             live_fx.difference_update({'matrix', 'ooze', 'vhs'})
 
         # Since frame_cue is already a copy from VideoPlayer or a generator,
         # we can modify it in-place to save performance.
         processed = frame
         h, w = processed.shape[:2]
 
+        # 1. Transform/Mirror FX
         if not live_only:
             if 'mirror_h' in mask.active_fx:
                 left = processed[:, :w//2]
@@ -613,88 +617,79 @@ class Worker(QObject):
                 top = processed[:h//2, :]
                 processed[h//2:, :] = cv2.flip(top, 0)
             if 'kaleidoscope' in mask.active_fx:
-                # 4-way symmetry
                 quad = processed[:h//2, :w//2]
                 processed[:h//2, w//2:] = cv2.flip(quad, 1)
                 processed[h//2:, :w//2] = cv2.flip(quad, 0)
                 processed[h//2:, w//2:] = cv2.flip(quad, -1)
 
+        # 2. Timing/Glitch FX (Shared Logic)
         if 'strobe' in mask.active_fx:
             trigger = False
             if self.audio_reactive_target == 'strobe':
-                if self.audio_bands[0] > 0.6: # Bass trigger
-                    trigger = True
+                if self.audio_bands[0] > 0.6: trigger = True
             else:
                 period = 60.0 / self.bpm
-                if (time.time() % period) < (period / 2.0):
-                    trigger = True
-
-            if trigger:
-                processed = np.zeros_like(processed)
+                if (time.time() % period) < (period / 2.0): trigger = True
+            if trigger: processed.fill(0)
 
         if 'rgb_shift' in mask.active_fx:
             mod = 1.0
             if self.proximity_mode == 'rgb_shift': mod = self.proximity_val
             if 'rgb_shift' in self.audio_param_mappings:
                 mod *= (self.audio_bands[self.audio_param_mappings['rgb_shift']] * 5)
-
             shift = int(10 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
-            b, g, r = cv2.split(processed)
-            b = np.roll(b, shift, axis=1)
-            r = np.roll(r, -shift, axis=1)
-            processed = cv2.merge([b, g, r])
+            if shift != 0:
+                b, g, r = cv2.split(processed)
+                b = np.roll(b, shift, axis=1)
+                r = np.roll(r, -shift, axis=1)
+                processed = cv2.merge([b, g, r])
 
         if 'glitch' in mask.active_fx:
             mod = 1.0
             if self.proximity_mode == 'glitch': mod = self.proximity_val
             if self.audio_reactive_target == 'glitch': mod *= (self.audio_bands[0] * 2)
-
             for _ in range(int(3 * mod)):
-                y = np.random.randint(0, h-10)
-                sh = np.random.randint(-20, 20)
-                processed[y:y+10, :] = np.roll(processed[y:y+10, :], sh, axis=1)
+                gy = np.random.randint(0, max(1, h-10))
+                gsh = np.random.randint(-20, 20)
+                processed[gy:gy+10, :] = np.roll(processed[gy:gy+10, :], gsh, axis=1)
 
         if 'trails' in mask.active_fx:
             if mask_id in self.trail_buffers:
-                processed = cv2.addWeighted(processed, 0.4, self.trail_buffers[mask_id], 0.6, 0)
+                cv2.addWeighted(processed, 0.4, self.trail_buffers[mask_id], 0.6, 0, dst=processed)
             self.trail_buffers[mask_id] = processed.copy()
 
         if 'feedback' in mask.active_fx:
             if mask_id in self.trail_buffers:
-                # Zoom in slightly and rotate last frame
                 prev = self.trail_buffers[mask_id]
                 M = cv2.getRotationMatrix2D((w//2, h//2), 1, 1.02)
-                prev = cv2.warpAffine(prev, M, (w, h))
-                processed = cv2.addWeighted(processed, 0.7, prev, 0.3, 0)
+                prev_w = cv2.warpAffine(prev, M, (w, h))
+                cv2.addWeighted(processed, 0.7, prev_w, 0.3, 0, dst=processed)
             self.trail_buffers[mask_id] = processed.copy()
 
         if 'hue_cycle' in mask.active_fx:
             hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV).astype(np.float32)
             shift = (time.time() * (self.bpm / 60.0) * 30) % 180
-            if mask.fx_params.get('lfo_target') == 'hue':
-                shift *= lfo_val
+            if mask.fx_params.get('lfo_target') == 'hue': shift *= lfo_val
             hsv[:,:,0] = (hsv[:,:,0] + shift) % 180
             processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
+        # 3. Static/Heavy FX
         if not live_only:
             if 'blur' in mask.active_fx:
                 mod = 1.0
                 if 'blur' in self.audio_param_mappings:
                     mod *= (self.audio_bands[self.audio_param_mappings['blur']] * 3)
-
-                # Performance: Throttle blur kernel size
                 base_size = 15 * (1.0 - self.throttle_level * 0.8)
                 ksize = int(base_size * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'blur' else 1.0))
                 if ksize % 2 == 0: ksize += 1
-                if ksize > 0:
+                if ksize > 1:
                     if self.throttle_level > 0.5:
-                        # Faster blur
-                        processed = cv2.blur(processed, (max(1, ksize), max(1, ksize)))
+                        cv2.blur(processed, (ksize, ksize), dst=processed)
                     else:
-                        processed = cv2.GaussianBlur(processed, (max(1, ksize), max(1, ksize)), 0)
+                        cv2.GaussianBlur(processed, (ksize, ksize), 0, dst=processed)
 
             if 'invert' in mask.active_fx:
-                processed = cv2.bitwise_not(processed)
+                cv2.bitwise_not(processed, dst=processed)
 
             if 'edges' in mask.active_fx:
                 gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
@@ -705,10 +700,9 @@ class Worker(QObject):
                 mod = 1.0
                 if 'tint' in self.audio_param_mappings:
                     mod *= (self.audio_bands[self.audio_param_mappings['tint']] * 3)
-
                 alpha = 0.3 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
                 tint = np.full_like(processed, mask.tint_color)
-                processed = cv2.addWeighted(processed, 1.0 - alpha, tint, alpha, 0)
+                cv2.addWeighted(processed, 1.0 - alpha, tint, alpha, 0, dst=processed)
 
             if 'duotone' in mask.active_fx:
                 gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
@@ -721,87 +715,18 @@ class Worker(QObject):
                     lut[i, 0, 2] = int(comp[2] * (1 - a) + mask.tint_color[2] * a)
                 processed = cv2.LUT(cv2.merge([gray, gray, gray]), lut)
 
-            if 'chromakey' in mask.active_fx:
-                # Simple green screen removal
-                hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV)
-                lower = np.array([40, 40, 40])
-                upper = np.array([80, 255, 255])
-                m = cv2.inRange(hsv, lower, upper)
-                processed[m > 0] = [0, 0, 0]
-
             if 'pixelate' in mask.active_fx:
-                # Scale down and back up
                 div = 16
                 small = cv2.resize(processed, (max(1, w // div), max(1, h // div)), interpolation=cv2.INTER_NEAREST)
                 processed = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
             if 'chroma_aberration' in mask.active_fx:
-                shift = 5
                 b, g, r = cv2.split(processed)
-                b = np.roll(b, shift, axis=0)
-                r = np.roll(r, -shift, axis=1)
+                b = np.roll(b, 5, axis=0)
+                r = np.roll(r, -5, axis=1)
                 processed = cv2.merge([b, g, r])
 
-        # Live FX (always applied)
-        if any(fx in live_fx for fx in mask.active_fx):
-            if 'strobe' in mask.active_fx:
-                trigger = False
-                if self.audio_reactive_target == 'strobe':
-                    if self.audio_bands[0] > 0.6: # Bass trigger
-                        trigger = True
-                else:
-                    period = 60.0 / self.bpm
-                    if (time.time() % period) < (period / 2.0):
-                        trigger = True
-
-                if trigger:
-                    processed = np.zeros_like(processed)
-
-            if 'rgb_shift' in mask.active_fx:
-                mod = 1.0
-                if self.proximity_mode == 'rgb_shift': mod = self.proximity_val
-                if 'rgb_shift' in self.audio_param_mappings:
-                    mod *= (self.audio_bands[self.audio_param_mappings['rgb_shift']] * 5)
-
-                shift = int(10 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
-                b, g, r = cv2.split(processed)
-                b = np.roll(b, shift, axis=1)
-                r = np.roll(r, -shift, axis=1)
-                processed = cv2.merge([b, g, r])
-
-            if 'glitch' in mask.active_fx:
-                mod = 1.0
-                if self.proximity_mode == 'glitch': mod = self.proximity_val
-                if self.audio_reactive_target == 'glitch': mod *= (self.audio_bands[0] * 2)
-
-                for _ in range(int(3 * mod)):
-                    y = np.random.randint(0, h-10)
-                    sh = np.random.randint(-20, 20)
-                    processed[y:y+10, :] = np.roll(processed[y:y+10, :], sh, axis=1)
-
-            if 'trails' in mask.active_fx:
-                if mask_id in self.trail_buffers:
-                    processed = cv2.addWeighted(processed, 0.4, self.trail_buffers[mask_id], 0.6, 0)
-                self.trail_buffers[mask_id] = processed.copy()
-
-            if 'feedback' in mask.active_fx:
-                if mask_id in self.trail_buffers:
-                    # Zoom in slightly and rotate last frame
-                    prev = self.trail_buffers[mask_id]
-                    M = cv2.getRotationMatrix2D((w//2, h//2), 1, 1.02)
-                    prev = cv2.warpAffine(prev, M, (w, h))
-                    processed = cv2.addWeighted(processed, 0.7, prev, 0.3, 0)
-                self.trail_buffers[mask_id] = processed.copy()
-
-            if 'hue_cycle' in mask.active_fx:
-                hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV).astype(np.float32)
-                shift = (time.time() * (self.bpm / 60.0) * 30) % 180
-                if mask.fx_params.get('lfo_target') == 'hue':
-                    shift *= lfo_val
-                hsv[:,:,0] = (hsv[:,:,0] + shift) % 180
-                processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-            if 'ooze' in mask.active_fx:
+            if 'ooze' in mask.active_fx and self.throttle_level < 0.7:
                 t = time.time()
                 for x in range(0, w, 20):
                     length = int((np.sin(t + x * 0.1) * 0.5 + 0.5) * h)
@@ -1200,17 +1125,15 @@ class Worker(QObject):
                             msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
                             self.system_warning.emit(msg)
 
-                        # Simplify for boundary - use smaller epsilon for higher fidelity
-                        peri = cv2.arcLength(main_contour, True)
-                        approx = cv2.approxPolyDP(main_contour, 0.002 * peri, True)
+                        # Simplify for boundary - User wants a "big rectangle"
+                        # Use convex hull for a clean outer boundary
+                        hull = cv2.convexHull(main_contour)
+                        peri = cv2.arcLength(hull, True)
+                        approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
 
-                        # If too many points, simplify a bit more but keep it detailed
-                        if len(approx) > 16:
-                             approx = cv2.approxPolyDP(main_contour, 0.005 * peri, True)
-
-                        # Ensure we have at least 4 points
-                        if len(approx) < 4:
-                            rect = cv2.minAreaRect(main_contour)
+                        # If still too complex, use minAreaRect for a perfect rectangle
+                        if len(approx) > 8:
+                            rect = cv2.minAreaRect(hull)
                             approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
                         pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
@@ -1236,7 +1159,9 @@ class Worker(QObject):
 
                 if self._sls_step < total_x:
                     pattern = self._sls_patterns_x[self._sls_step]
-                    self.projector_buffer = cv2.merge([pattern, pattern, pattern])
+                    # Resize pattern to internal render resolution for consistency
+                    pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
+                    self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
                     if self._sls_curr_wait >= self._sls_wait_frames:
                         if curr_frame_id > self._last_captured_frame_id:
                             gray = self.boost_contrast(main_frame)
@@ -1249,7 +1174,9 @@ class Worker(QObject):
                 elif self._sls_step < total_x + total_y:
                     idx = self._sls_step - total_x
                     pattern = self._sls_patterns_y[idx]
-                    self.projector_buffer = cv2.merge([pattern, pattern, pattern])
+                    # Resize pattern to internal render resolution for consistency
+                    pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
+                    self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
                     if self._sls_curr_wait >= self._sls_wait_frames:
                         if curr_frame_id > self._last_captured_frame_id:
                             gray = self.boost_contrast(main_frame)
@@ -1280,16 +1207,13 @@ class Worker(QObject):
                     contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if contours:
                         main_contour = max(contours, key=cv2.contourArea)
-                        # Simplify for boundary - use small epsilon to capture corners of wall/floor
-                        peri = cv2.arcLength(main_contour, True)
-                        approx = cv2.approxPolyDP(main_contour, 0.002 * peri, True)
+                        # Simplify for boundary - User wants a "big rectangle"
+                        hull = cv2.convexHull(main_contour)
+                        peri = cv2.arcLength(hull, True)
+                        approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
 
-                        # If too many points, simplify a bit more
-                        if len(approx) > 16:
-                             approx = cv2.approxPolyDP(main_contour, 0.004 * peri, True)
-
-                        if len(approx) < 4:
-                            rect = cv2.minAreaRect(main_contour)
+                        if len(approx) > 8:
+                            rect = cv2.minAreaRect(hull)
                             approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
                         pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
@@ -1311,8 +1235,9 @@ class Worker(QObject):
                     if len(calib_data) > 10:
                         self.init_rbf_from_points(calib_data)
                         # Estimate homography from sample points for fallback
-                        pts = np.array(calib_data)
-                        self.h_c2p, _ = cv2.findHomography(pts[:100, :2], pts[:100, 2:])
+                        pts_arr = np.array(calib_data)
+                        self.h_c2p, _ = cv2.findHomography(pts_arr[:100, :2], pts_arr[:100, 2:])
+                        self.calibration_camera_res = (w_cam, h_cam)
                         self.calibration_complete.emit(True)
                     else:
                         self.calibration_complete.emit(False)
@@ -1463,6 +1388,7 @@ class Worker(QObject):
                     self.init_rbf_from_points(calib_data)
                     # Also keep homography as a robust fallback
                     self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
+                    self.calibration_camera_res = (w_cam, h_cam)
 
                     self._run_calibration_flag = False
                     self._calib_frames_captured = 0
@@ -1477,7 +1403,7 @@ class Worker(QObject):
                     self.splash_player = VideoPlayer(resource_path('logo.mkv'))
                     self.splash_player.start()
 
-                splash_frame = self.splash_player.get_frame()
+                splash_frame, _ = self.splash_player.get_frame()
                 if splash_frame is not None:
                     projector_output = cv2.resize(splash_frame, (w, h))
                 else:
@@ -1529,8 +1455,9 @@ class Worker(QObject):
             with QMutexLocker(self.mask_mutex):
                 iterable_masks = [m for m in self.masks] # Snapshot for this frame
 
-            # Generator frame cache for this rendering cycle
+            # Frame cache for this rendering cycle
             cycle_generator_cache = {}
+            cycle_video_cache = {} # path -> (frame_resized, id)
 
             for mask in iterable_masks:
                 mask_id = id(mask)
@@ -1547,11 +1474,14 @@ class Worker(QObject):
                 if curr_fade <= 0 and not mask.visible: continue
                 if not mask.video_path: continue
 
+                frame_cue = None
+                frame_id = 0
+
                 if mask.video_path == "generative":
                     if "generative" not in cycle_generator_cache:
                         cycle_generator_cache["generative"] = self.get_generative_frame(h, w)
                     frame_cue = cycle_generator_cache["generative"].copy()
-                    frame_id = self.frame_count # Use rendering frame count as ID
+                    frame_id = self.frame_count
                 elif mask.video_path.startswith("generator:"):
                     pattern = mask.video_path.split(":")[-1]
                     if mask.video_path not in cycle_generator_cache:
@@ -1559,35 +1489,44 @@ class Worker(QObject):
                     frame_cue = cycle_generator_cache[mask.video_path].copy()
                     frame_id = self.frame_count
                 else:
-                    with QMutexLocker(self.player_mutex):
-                        if mask.video_path not in self.video_players:
-                            player = VideoPlayer(mask.video_path)
-                            player.start()
-                            self.video_players[mask.video_path] = player
+                    if mask.video_path in cycle_video_cache:
+                        frame_cue_orig, frame_id = cycle_video_cache[mask.video_path]
+                        if frame_cue_orig is not None:
+                            frame_cue = frame_cue_orig.copy()
+                    else:
+                        with QMutexLocker(self.player_mutex):
+                            if mask.video_path not in self.video_players:
+                                player = VideoPlayer(mask.video_path)
+                                player.start()
+                                self.video_players[mask.video_path] = player
+                            player = self.video_players[mask.video_path]
+                            frame_cue_raw, frame_id = player.get_frame()
 
-                        player = self.video_players[mask.video_path]
-                        frame_cue, frame_id = player.get_frame()
+                        if frame_cue_raw is not None:
+                            # Downscale once per video path per cycle
+                            fh_raw, fw_raw = frame_cue_raw.shape[:2]
+                            if fw_raw > w or fh_raw > h:
+                                frame_cue_raw = cv2.resize(frame_cue_raw, (w, h), interpolation=cv2.INTER_LINEAR)
+                            cycle_video_cache[mask.video_path] = (frame_cue_raw, frame_id)
+                            frame_cue = frame_cue_raw.copy()
 
                 if mask.tag in self.fades:
                     fade_info = self.fades[mask.tag]
                     elapsed = time.time() - fade_info['start_time']
                     if elapsed < self.fade_duration:
                         if fade_info['prev_path'] in self.video_players:
-                            prev_player = self.video_players[fade_info['prev_path']]
-                            prev_frame = prev_player.get_frame()
+                            with QMutexLocker(self.player_mutex):
+                                prev_player = self.video_players[fade_info['prev_path']]
+                                prev_frame, _ = prev_player.get_frame()
                             if prev_frame is not None and frame_cue is not None:
+                                if prev_frame.shape[:2] != frame_cue.shape[:2]:
+                                    prev_frame = cv2.resize(prev_frame, (frame_cue.shape[1], frame_cue.shape[0]))
                                 alpha = elapsed / self.fade_duration
-                                frame_cue = cv2.addWeighted(prev_frame, 1.0 - alpha, frame_cue, alpha, 0)
+                                cv2.addWeighted(prev_frame, 1.0 - alpha, frame_cue, alpha, 0, dst=frame_cue)
                     else:
                         del self.fades[mask.tag]
 
                 if frame_cue is not None:
-                    # Performance Optimization: Downscale video frame if it's larger than the projector resolution
-                    # This significantly speeds up all subsequent FX processing and warping.
-                    fh, fw = frame_cue.shape[:2]
-                    if fw > w or fh > h:
-                        frame_cue = cv2.resize(frame_cue, (w, h), interpolation=cv2.INTER_LINEAR)
-
                     # Performance: Only apply FX if not fully throttled or essential
                     frame_cue = self.apply_fx(frame_cue, mask)
 
@@ -2181,6 +2120,8 @@ class Worker(QObject):
         self._run_boundary_detection_flag = False
         self.show_calibration_pattern = False
         self.show_calibration_verify = False
+        # Revert to performance resolution
+        self.requested_camera_res = (1280, 720)
 
     def run_auto_calibration(self):
         self.requested_camera_res = (9999, 9999) # Request max FOV
@@ -2216,6 +2157,17 @@ class Worker(QObject):
 
         scale_w = target_w / self.projector_width
         scale_h = target_h / self.projector_height
+
+        # Rescale points if current camera resolution differs from calibration resolution
+        if self.calibration_camera_res:
+            cal_w, cal_h = self.calibration_camera_res
+            if cal_w != w_cam or cal_h != h_cam:
+                pts_arr = np.array(pts, dtype=np.float32).copy().reshape(-1, 2)
+                pts_arr[:, 0] *= (cal_w / w_cam)
+                pts_arr[:, 1] *= (cal_h / h_cam)
+                pts = pts_arr
+                # Update w_cam/h_cam for the rest of the function logic
+                w_cam, h_cam = cal_w, cal_h
 
         # Prefer Dense LUT if available
         if self.sls_lut_x is not None:
