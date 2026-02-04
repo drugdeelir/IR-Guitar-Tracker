@@ -215,6 +215,7 @@ class Worker(QObject):
         self.last_homography = None
         self.last_homography_internal = None
         self.confidence_internal = 0.0
+        self.marker_fingerprint = []
         self.roi_padding = 50
         self.tracking_mutex = QMutex()
 
@@ -1374,21 +1375,11 @@ class Worker(QObject):
                     self.splash_player.stop()
                     self.splash_player = None
 
-            tracked_points = self.get_tracked_points(main_frame)
-            self.trackers_detected.emit(len(tracked_points))
-            self.trackers_ready.emit(tracked_points)
-
-            if len(tracked_points) >= 2:
-                current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
-                if self._calibrate_depth_flag:
-                    self.baseline_distance = current_dist
-                    self._calibrate_depth_flag = False
-
-                if self.baseline_distance > 0:
-                    self.proximity_val = current_dist / self.baseline_distance
-
-            for point in tracked_points:
-                cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
+            # Tracking is now handled by TrackingThread.
+            # We use ui_tracked_points for visualization on the main_frame.
+            if ui_tracked_points:
+                for point in ui_tracked_points:
+                    cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
 
             # Draw calibration overlay on camera feed
             if self._run_calibration_flag:
