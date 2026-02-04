@@ -118,10 +118,17 @@ class TrackingThread(QThread):
                     main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                     main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
                     # Read back actual resolution
-                    act_w = main_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                    act_h = main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                    self.worker._current_camera_res = (int(act_w), int(act_h))
+                    act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    self.worker._current_camera_res = (act_w, act_h)
+
+                    # If we requested max res, update the request to match reality
+                    # to prevent constant re-initialization
+                    if w_req > 5000:
+                        self.worker.requested_camera_res = (act_w, act_h)
+
                     self.worker.camera_matrix = None # Reset estimation
+                    print(f"Camera Resolution Switched to: {act_w}x{act_h}")
                 else:
                     if self.worker._camera_changed:
                         self.worker.camera_error.emit(self.worker.video_source)
@@ -1129,6 +1136,12 @@ class Worker(QObject):
                 self.static_warp_cache.clear()
 
             if self._run_boundary_detection_flag:
+                # Ensure resolution is stable before capturing
+                if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                    # Still waiting for camera thread to catch up
+                    self._sls_curr_wait = 0
+                    continue
+
                 if self._boundary_step == 0:
                     # Capture Black Frame
                     self.projector_buffer.fill(0)
@@ -1199,6 +1212,12 @@ class Worker(QObject):
                     self._boundary_step = 0
                     self._boundary_captures = []
             elif self._run_sls_flag:
+                # Ensure resolution is stable before capturing
+                if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                    # Still waiting for camera thread to catch up
+                    self._sls_curr_wait = 0
+                    continue
+
                 # Structured Light Scanning takes priority
                 total_x = len(self._sls_patterns_x)
                 total_y = len(self._sls_patterns_y)
@@ -1346,6 +1365,10 @@ class Worker(QObject):
 
             # Handle Auto-Calibration logic (Multi-frame averaging)
             if self._run_calibration_flag:
+                # Ensure resolution is stable before capturing
+                if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                    continue
+
                 if curr_frame_id > self._last_captured_frame_id:
                     gray = self.boost_contrast(main_frame)
                     board_size = (9, 6)

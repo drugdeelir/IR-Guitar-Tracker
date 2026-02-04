@@ -42,6 +42,14 @@ def decode_gray_code(captures, target_range, threshold=3):
     if not captures:
         return np.zeros((480, 640), dtype=np.int32), np.zeros((480, 640), dtype=bool)
 
+    # Shape validation: ensure all captures have the same dimensions
+    base_shape = captures[0].shape
+    for i, cap in enumerate(captures):
+        if cap.shape != base_shape:
+            print(f"Error: Mismatched capture shape at index {i}. Expected {base_shape}, got {cap.shape}")
+            # Return empty result to avoid crash
+            return np.zeros(base_shape, dtype=np.int32), np.zeros(base_shape, dtype=bool)
+
     # captures: list of (pattern, inverse_pattern) pairs
     # returns bitmask where bits are set if pattern > inverse_pattern + threshold
     bits = []
@@ -52,14 +60,15 @@ def decode_gray_code(captures, target_range, threshold=3):
         bit = np.zeros(p.shape, dtype=np.uint8)
         # We only care about pixels where there is enough contrast
         # Very low threshold for IR cameras
-        valid = np.abs(p - inv) > threshold
+        diff = np.abs(p - inv)
+        valid = diff > threshold
         bit[p > inv] = 1
         bits.append((bit, valid))
 
     # Reconstruct value
     n_bits = len(bits)
-    val = np.zeros(captures[0].shape, dtype=np.int32)
-    total_valid = np.ones(captures[0].shape, dtype=bool)
+    val = np.zeros(base_shape, dtype=np.int32)
+    total_valid = np.ones(base_shape, dtype=bool)
 
     for i, (bit, valid) in enumerate(bits):
         val = (val << 1) | bit.astype(np.int32)
