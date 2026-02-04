@@ -430,6 +430,12 @@ class ProjectionMappingApp(QMainWindow):
             if hasattr(self, 'workspace_link_mask_combo'):
                 self.workspace_link_mask_combo.setCurrentText(mask.name)
 
+            # Update display color
+            color = Qt.magenta
+            if mask.tag == 'background': color = Qt.blue
+            elif mask.tag == 'amp': color = Qt.green
+            self.video_display.set_mask_color(color)
+
             # Update LFO UI
             self.lfo_enable_check.setChecked(mask.fx_params.get('lfo_enabled', False))
             self.lfo_target_combo.setCurrentText(mask.fx_params.get('lfo_target', 'none'))
@@ -567,6 +573,13 @@ class ProjectionMappingApp(QMainWindow):
         self.manual_align_btn.clicked.connect(self.start_manual_calibration)
         self.setup_group_layout.addWidget(self.manual_align_btn)
 
+        # Scan Room (Structured Light)
+        self.scan_room_btn = QPushButton("SCAN ROOM (AUTO-ALIGN)")
+        self.scan_room_btn.setMinimumHeight(50)
+        self.scan_room_btn.setStyleSheet("background-color: #00bcd4; color: black; font-weight: bold;")
+        self.scan_room_btn.clicked.connect(self.start_room_scan)
+        self.setup_group_layout.addWidget(self.scan_room_btn)
+
         self.verify_align_btn = QPushButton("VERIFY ALIGNMENT")
         self.verify_align_btn.setCheckable(True)
         self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
@@ -603,6 +616,10 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.show_calibration_pattern = True
         # Wait a moment for the projector to actually show it before capturing
         QTimer.singleShot(1000, self.worker.run_auto_calibration)
+
+    def start_room_scan(self):
+        self.statusBar().showMessage("Scanning room... This will take about 10 seconds. Please keep the area still.", 0)
+        self.worker.run_room_scan()
 
     def start_manual_calibration(self):
         self.statusBar().showMessage("Manual Alignment: Click the 4 corners of the projector's output.", 5000)
@@ -765,6 +782,7 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_bg_mask(self):
         self.video_display.clear_mask_points()
         self.video_display.set_snap_to_markers(False)
+        self.video_display.set_mask_color(Qt.blue)
         # Ensure a background cue exists
         bg_mask = None
         for m in self.masks:
@@ -793,6 +811,7 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_amp_mask(self):
         self.video_display.clear_mask_points()
         self.video_display.set_snap_to_markers(False)
+        self.video_display.set_mask_color(Qt.green)
         amp_mask = None
         for m in self.masks:
             if m.tag == 'amp':
@@ -1744,7 +1763,14 @@ class ProjectionMappingApp(QMainWindow):
             self.add_new_mask_prompt()
             return
 
-        self.video_display.set_mask_creation_mode(True)
+        color = Qt.magenta
+        row = self.cue_list_widget.currentRow()
+        if 0 <= row < len(self.masks):
+            mask = self.masks[row]
+            if mask.tag == 'background': color = Qt.blue
+            elif mask.tag == 'amp': color = Qt.green
+
+        self.video_display.set_mask_creation_mode(True, color)
         self.create_mask_button.setEnabled(False)
         self.finish_mask_button.setEnabled(True)
         self.cancel_mask_button.setEnabled(True)

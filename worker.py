@@ -8,6 +8,7 @@ from itertools import combinations
 from scipy.interpolate import interp1d, RBFInterpolator
 from utils import resource_path
 from mask import Mask
+from sls_utils import generate_gray_code_patterns, decode_gray_code
 
 class VideoPlayer(QThread):
     def __init__(self, video_path):
@@ -178,10 +179,23 @@ class Worker(QObject):
         self.h_c2p = None # Camera to Projector homography
         self.rbf_x = None # RBF for X mapping
         self.rbf_y = None # RBF for Y mapping
+        self.sls_lut_x = None # Dense LUT from SLS
+        self.sls_lut_y = None # Dense LUT from SLS
+        self.sls_valid_mask = None
         self._run_calibration_flag = False
         self._calib_frames_captured = 0
         self._calib_corners_sum = None
         self._calib_total_frames = 15
+
+        # Structured Light Scanning (SLS)
+        self._run_sls_flag = False
+        self._sls_step = 0
+        self._sls_patterns_x = []
+        self._sls_patterns_y = []
+        self._sls_captures_x = []
+        self._sls_captures_y = []
+        self._sls_wait_frames = 2
+        self._sls_curr_wait = 0
 
         # Splash Mode
         self.show_splash = False
@@ -881,7 +895,67 @@ class Worker(QObject):
                 self.projector_buffer = np.zeros((h, w, 3), dtype=np.uint8)
                 self.mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
 
-            if self.show_camera_on_projector:
+            if self._run_sls_flag:
+                # Structured Light Scanning takes priority
+                total_x = len(self._sls_patterns_x)
+                total_y = len(self._sls_patterns_y)
+
+                if self._sls_step < total_x:
+                    pattern = self._sls_patterns_x[self._sls_step]
+                    self.projector_buffer = cv2.merge([pattern, pattern, pattern])
+                    if self._sls_curr_wait >= self._sls_wait_frames:
+                        gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                        self._sls_captures_x.append(gray)
+                        self._sls_step += 1
+                        self._sls_curr_wait = 0
+                    else:
+                        self._sls_curr_wait += 1
+                elif self._sls_step < total_x + total_y:
+                    idx = self._sls_step - total_x
+                    pattern = self._sls_patterns_y[idx]
+                    self.projector_buffer = cv2.merge([pattern, pattern, pattern])
+                    if self._sls_curr_wait >= self._sls_wait_frames:
+                        gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                        self._sls_captures_y.append(gray)
+                        self._sls_step += 1
+                        self._sls_curr_wait = 0
+                    else:
+                        self._sls_curr_wait += 1
+                else:
+                    # Decoding
+                    print("Decoding Room Scan...")
+                    proj_x, valid_x = decode_gray_code(self._sls_captures_x)
+                    proj_y, valid_y = decode_gray_code(self._sls_captures_y)
+                    valid = valid_x & valid_y
+
+                    # Store dense LUT
+                    self.sls_lut_x = proj_x.astype(np.float32)
+                    self.sls_lut_y = proj_y.astype(np.float32)
+                    self.sls_valid_mask = valid.astype(np.uint8)
+
+                    # Collect mapping points for RBF (sub-sampled)
+                    calib_data = []
+                    step = 10 # Sample every 10 pixels
+                    # Ensure indices are within bounds
+                    h_idx, w_idx = valid.shape
+                    for r in range(0, h_idx, step):
+                        for c in range(0, w_idx, step):
+                            if valid[r, c]:
+                                calib_data.append([float(c), float(r),
+                                                   float(proj_x[r, c]), float(proj_y[r, c])])
+
+                    if len(calib_data) > 10:
+                        self.init_rbf_from_points(calib_data)
+                        # Estimate homography from sample points for fallback
+                        pts = np.array(calib_data)
+                        self.h_c2p, _ = cv2.findHomography(pts[:100, :2], pts[:100, 2:])
+                        self.calibration_complete.emit(True)
+                    else:
+                        self.calibration_complete.emit(False)
+
+                    self._run_sls_flag = False
+                    self.show_calibration_verify = True # Automatically show verification
+            elif self.show_camera_on_projector:
                 cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
             elif self.show_calibration_pattern:
                 # Draw a centered checkerboard pattern for robust calibration
@@ -921,7 +995,7 @@ class Worker(QObject):
                     cv2.rectangle(self.projector_buffer, (0, 0), (w, h), (0, 255, 0), 20)
             elif self.show_calibration_verify:
                 self.projector_buffer.fill(0)
-                # Draw circles at all internal corner positions to verify mapping
+                # Draw high-visibility grid and circles
                 margin_x = int(w * 0.15)
                 margin_y = int(h * 0.15)
                 grid_w = w - 2 * margin_x
@@ -931,16 +1005,32 @@ class Worker(QObject):
                 start_x = margin_x + (grid_w % 10) // 2
                 start_y = margin_y + (grid_h % 7) // 2
 
+                # Draw lines
+                for r in range(rows := 7 + 1):
+                    y_line = start_y + r * sq_h
+                    if y_line < h:
+                        cv2.line(self.projector_buffer, (0, y_line), (w, y_line), (50, 50, 50), 1)
+                for c in range(cols := 10 + 1):
+                    x_line = start_x + c * sq_w
+                    if x_line < w:
+                        cv2.line(self.projector_buffer, (x_line, 0), (x_line, h), (50, 50, 50), 1)
+
                 for r in range(1, 7):
                     for c in range(1, 10):
                         color = (0, 255, 0) if (r+c)%2==0 else (0, 255, 255)
                         target_x = start_x + c * sq_w
                         target_y = start_y + r * sq_h
-                        cv2.circle(self.projector_buffer, (target_x, target_y), 10, color, -1)
-                        cv2.putText(self.projector_buffer, f"{c},{r}", (target_x + 12, target_y + 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        # Circle with crosshair
+                        cv2.circle(self.projector_buffer, (target_x, target_y), 15, color, 2, cv2.LINE_AA)
+                        cv2.circle(self.projector_buffer, (target_x, target_y), 2, (255, 255, 255), -1)
+                        cv2.line(self.projector_buffer, (target_x-20, target_y), (target_x+20, target_y), color, 1)
+                        cv2.line(self.projector_buffer, (target_x, target_y-20), (target_x, target_y+20), color, 1)
+
+                        cv2.putText(self.projector_buffer, f"{c},{r}", (target_x + 18, target_y + 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
                 cv2.putText(self.projector_buffer, "VERIFICATION MODE - CHECK CAMERA ALIGNMENT", (50, h-50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
             else:
                 self.projector_buffer.fill(0)
 
@@ -1641,7 +1731,35 @@ class Worker(QObject):
     def run_auto_calibration(self):
         self._run_calibration_flag = True
 
+    def run_room_scan(self):
+        self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
+        self._sls_step = 0
+        self._sls_captures_x = []
+        self._sls_captures_y = []
+        self._sls_curr_wait = 0
+        self._run_sls_flag = True
+
     def transform_to_projector(self, pts, w_cam=640, h_cam=480):
+        # Prefer Dense LUT if available
+        if self.sls_lut_x is not None:
+            try:
+                pts_arr = np.array(pts, dtype=np.float32)
+                res = []
+                for p in pts_arr.reshape(-1, 2):
+                    ix, iy = int(round(p[0])), int(round(p[1]))
+                    if 0 <= ix < w_cam and 0 <= iy < h_cam and self.sls_valid_mask[iy, ix]:
+                        res.append([self.sls_lut_x[iy, ix], self.sls_lut_y[iy, ix]])
+                    else:
+                        # Fallback to RBF for out-of-bounds or invalid pixels
+                        if self.rbf_x:
+                            res.append([self.rbf_x(p.reshape(1,2))[0], self.rbf_y(p.reshape(1,2))[0]])
+                        else:
+                            # Proportional fallback
+                            res.append([p[0] * (self.projector_width / w_cam), p[1] * (self.projector_height / h_cam)])
+                return np.array(res).reshape(-1, 2)
+            except:
+                pass
+
         if self.rbf_x is not None:
             try:
                 pts_arr = np.array(pts, dtype=np.float32)

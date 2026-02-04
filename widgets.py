@@ -117,6 +117,11 @@ class VideoDisplay(QWidget):
         self.mask_points = []
         self.detected_markers = []
         self.current_pixmap = None
+        self.current_mask_color = Qt.magenta
+
+    def set_mask_color(self, color):
+        self.current_mask_color = color
+        self.update()
 
     def set_detected_markers(self, points):
         self.detected_markers = points
@@ -141,8 +146,8 @@ class VideoDisplay(QWidget):
             painter.drawPixmap(x, y, scaled_pixmap)
 
             if self.mask_creation_mode and self.mask_points:
-                painter.setPen(QPen(Qt.magenta, 2))
-                painter.setBrush(QBrush(Qt.magenta, Qt.Dense6Pattern))
+                painter.setPen(QPen(self.current_mask_color, 2))
+                painter.setBrush(QBrush(self.current_mask_color, Qt.Dense6Pattern))
 
                 # Denormalize mask points for drawing
                 pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
@@ -194,8 +199,9 @@ class VideoDisplay(QWidget):
                 self.mask_point_added.emit(snapped_pt)
                 self.update()
 
-    def set_mask_creation_mode(self, enabled):
+    def set_mask_creation_mode(self, enabled, color=Qt.magenta):
         self.mask_creation_mode = enabled
+        self.current_mask_color = color
         if not enabled:
             self.clear_mask_points()
             self.snap_to_markers = True # Reset to default
