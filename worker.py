@@ -156,6 +156,7 @@ class TrackingThread(QThread):
             # HUD Data preparation (camera side)
             with QMutexLocker(self.worker.latest_main_frame_mutex):
                 self.worker.latest_main_frame = main_frame.copy()
+                self.worker.latest_main_frame_id += 1
                 self.worker.latest_tracked_points_for_ui = tracked_points
 
             # Handle Calibration Flags (some need to run in camera thread)
@@ -293,7 +294,7 @@ class Worker(QObject):
         self._sls_patterns_y = []
         self._sls_captures_x = []
         self._sls_captures_y = []
-        self._sls_wait_frames = 2
+        self._sls_wait_frames = 5
         self._sls_curr_wait = 0
 
         # Projector Boundary Detection
@@ -332,6 +333,8 @@ class Worker(QObject):
         self.mask_buffer = None
         self.latest_main_frame = None
         self.latest_main_frame_mutex = QMutex()
+        self.latest_main_frame_id = 0
+        self._last_captured_frame_id = -1
         self.latest_tracked_points_for_ui = []
         self.camera_matrix = None
         self.dist_coeffs = np.zeros((4, 1))
@@ -1087,22 +1090,30 @@ class Worker(QObject):
                 self.static_warp_cache.clear()
 
             if self._run_boundary_detection_flag:
+                # Get the frame ID safely
+                with QMutexLocker(self.latest_main_frame_mutex):
+                    curr_frame_id = self.latest_main_frame_id
+
                 if self._boundary_step == 0:
                     # Capture Black Frame
                     self.projector_buffer.fill(0)
                     if self._sls_curr_wait >= self._sls_wait_frames:
-                        self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
-                        self._boundary_step = 1
-                        self._sls_curr_wait = 0
+                        if curr_frame_id > self._last_captured_frame_id:
+                            self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
+                            self._boundary_step = 1
+                            self._sls_curr_wait = 0
+                            self._last_captured_frame_id = curr_frame_id
                     else:
                         self._sls_curr_wait += 1
                 elif self._boundary_step == 1:
                     # Capture White Frame
                     self.projector_buffer.fill(255)
                     if self._sls_curr_wait >= self._sls_wait_frames:
-                        self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
-                        self._boundary_step = 2
-                        self._sls_curr_wait = 0
+                        if curr_frame_id > self._last_captured_frame_id:
+                            self._boundary_captures.append(cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY))
+                            self._boundary_step = 2
+                            self._sls_curr_wait = 0
+                            self._last_captured_frame_id = curr_frame_id
                     else:
                         self._sls_curr_wait += 1
                 elif self._boundary_step == 2:
@@ -1111,7 +1122,8 @@ class Worker(QObject):
                     black = self._boundary_captures[0]
                     white = self._boundary_captures[1]
                     diff = cv2.absdiff(white, black)
-                    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+                    # Lower threshold (15 instead of 30) for IR cameras or high-ambient stages
+                    _, thresh = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
 
                     # Clean up
                     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -1152,14 +1164,20 @@ class Worker(QObject):
                 total_x = len(self._sls_patterns_x)
                 total_y = len(self._sls_patterns_y)
 
+                # Get the frame ID safely
+                with QMutexLocker(self.latest_main_frame_mutex):
+                    curr_frame_id = self.latest_main_frame_id
+
                 if self._sls_step < total_x:
                     pattern = self._sls_patterns_x[self._sls_step]
                     self.projector_buffer = cv2.merge([pattern, pattern, pattern])
                     if self._sls_curr_wait >= self._sls_wait_frames:
-                        gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
-                        self._sls_captures_x.append(gray)
-                        self._sls_step += 1
-                        self._sls_curr_wait = 0
+                        if curr_frame_id > self._last_captured_frame_id:
+                            gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                            self._sls_captures_x.append(gray)
+                            self._sls_step += 1
+                            self._sls_curr_wait = 0
+                            self._last_captured_frame_id = curr_frame_id
                     else:
                         self._sls_curr_wait += 1
                 elif self._sls_step < total_x + total_y:
@@ -1167,10 +1185,12 @@ class Worker(QObject):
                     pattern = self._sls_patterns_y[idx]
                     self.projector_buffer = cv2.merge([pattern, pattern, pattern])
                     if self._sls_curr_wait >= self._sls_wait_frames:
-                        gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
-                        self._sls_captures_y.append(gray)
-                        self._sls_step += 1
-                        self._sls_curr_wait = 0
+                        if curr_frame_id > self._last_captured_frame_id:
+                            gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                            self._sls_captures_y.append(gray)
+                            self._sls_step += 1
+                            self._sls_curr_wait = 0
+                            self._last_captured_frame_id = curr_frame_id
                     else:
                         self._sls_curr_wait += 1
                 else:
@@ -1290,35 +1310,34 @@ class Worker(QObject):
 
             # Handle Auto-Calibration logic (Multi-frame averaging)
             if self._run_calibration_flag:
-                gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
-                board_size = (9, 6)
-                # Use findChessboardCornersSB with EXHAUSTIVE for maximum robustness
-                ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY | cv2.CALIB_CB_EXHAUSTIVE)
+                with QMutexLocker(self.latest_main_frame_mutex):
+                    curr_frame_id = self.latest_main_frame_id
 
-                if ret:
-                    if self._calib_corners_sum is None:
-                        self._calib_corners_sum = corners.astype(np.float64)
-                    else:
-                        self._calib_corners_sum += corners
-                    self._calib_frames_captured += 1
-                    self._last_calib_success_time = time.time()
-                    self._last_calib_attempt_time = time.time()
-                else:
-                    if not hasattr(self, '_last_calib_attempt_time'):
+                if curr_frame_id > self._last_captured_frame_id:
+                    gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                    board_size = (9, 6)
+
+                    # Try high-accuracy detection first
+                    ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY | cv2.CALIB_CB_EXHAUSTIVE)
+
+                    if not ret:
+                        if not hasattr(self, '_last_calib_attempt_time'):
+                            self._last_calib_attempt_time = time.time()
+
+                        if time.time() - self._last_calib_attempt_time > 5.0:
+                            # Fallback to standard detection after 5 seconds
+                            ret, corners = cv2.findChessboardCorners(gray, board_size, cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
+
+                    if ret:
+                        if self._calib_corners_sum is None:
+                            self._calib_corners_sum = corners.astype(np.float64)
+                        else:
+                            self._calib_corners_sum += corners
+                        self._calib_frames_captured += 1
+                        self._last_calib_success_time = time.time()
                         self._last_calib_attempt_time = time.time()
 
-                    if time.time() - self._last_calib_attempt_time > 5.0:
-                        # If stuck for 5 seconds, try standard detection as fallback
-                        ret, corners = cv2.findChessboardCorners(gray, board_size,
-                                                                cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
-                        if ret:
-                            if self._calib_corners_sum is None:
-                                self._calib_corners_sum = corners.astype(np.float64)
-                            else:
-                                self._calib_corners_sum += corners
-                            self._calib_frames_captured += 1
-                            self._last_calib_success_time = time.time()
-                            self._last_calib_attempt_time = time.time()
+                    self._last_captured_frame_id = curr_frame_id
 
                 # Check if we have enough samples or reached timeout
                 if self._calib_frames_captured >= self._calib_total_frames:

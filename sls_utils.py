@@ -34,7 +34,7 @@ def generate_gray_code_patterns(width, height):
 
     return patterns_x, patterns_y
 
-def decode_gray_code(captures, threshold=20):
+def decode_gray_code(captures, threshold=5):
     # captures: list of (pattern, inverse_pattern) pairs
     # returns bitmask where bits are set if pattern > inverse_pattern + threshold
     bits = []
@@ -44,6 +44,7 @@ def decode_gray_code(captures, threshold=20):
 
         bit = np.zeros(p.shape, dtype=np.uint8)
         # We only care about pixels where there is enough contrast
+        # Lower threshold for IR cameras seeing faint visible light
         valid = np.abs(p - inv) > threshold
         bit[p > inv] = 1
         bits.append((bit, valid))
