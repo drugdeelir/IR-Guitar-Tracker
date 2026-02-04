@@ -221,8 +221,8 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
-        self.requested_camera_res = (640, 480)
-        self._current_camera_res = (640, 480)
+        self.requested_camera_res = (9999, 9999) # Always request max FOV
+        self._current_camera_res = (0, 0)
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
         self._calibrate_depth_flag = False
@@ -1208,7 +1208,6 @@ class Worker(QObject):
                         self.boundary_detected.emit([])
 
                     self._run_boundary_detection_flag = False
-                    self.requested_camera_res = (640, 480) # Revert to performance mode
                     self._boundary_step = 0
                     self._boundary_captures = []
             elif self._run_sls_flag:
@@ -1259,6 +1258,26 @@ class Worker(QObject):
                     self.sls_lut_y = proj_y.astype(np.float32)
                     self.sls_valid_mask = valid.astype(np.uint8)
 
+                    # Automatically derive Projector Boundary from SLS valid mask
+                    # Dilate slightly to fill small gaps in the mask for a solid boundary
+                    kernel = np.ones((5, 5), np.uint8)
+                    mask_solid = cv2.dilate(self.sls_valid_mask, kernel, iterations=1)
+                    contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        main_contour = max(contours, key=cv2.contourArea)
+                        # Simplify for boundary
+                        peri = cv2.arcLength(main_contour, True)
+                        approx = cv2.approxPolyDP(main_contour, 0.005 * peri, True)
+
+                        if len(approx) < 4:
+                            rect = cv2.minAreaRect(main_contour)
+                            approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+                        pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
+                        self.projector_boundary = pts
+                        self.boundary_detected.emit(pts)
+                        print(f"One-Click Sync: Detected boundary with {len(pts)} points.")
+
                     # Collect mapping points for RBF (sub-sampled)
                     calib_data = []
                     step = 10 # Sample every 10 pixels
@@ -1280,7 +1299,6 @@ class Worker(QObject):
                         self.calibration_complete.emit(False)
 
                     self._run_sls_flag = False
-                    self.requested_camera_res = (640, 480) # Revert to performance mode
                     self.show_calibration_verify = True # Automatically show verification
             elif self.show_camera_on_projector:
                 cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
@@ -1428,7 +1446,6 @@ class Worker(QObject):
                     self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
 
                     self._run_calibration_flag = False
-                    self.requested_camera_res = (640, 480) # Revert to performance mode
                     self._calib_frames_captured = 0
                     self._calib_corners_sum = None
                     self.calibration_complete.emit(True)
@@ -2141,13 +2158,16 @@ class Worker(QObject):
         self._run_calibration_flag = False
         self._run_sls_flag = False
         self._run_boundary_detection_flag = False
-        self.requested_camera_res = (640, 480)
         self.show_calibration_pattern = False
         self.show_calibration_verify = False
 
     def run_auto_calibration(self):
         self.requested_camera_res = (9999, 9999) # Request max FOV
         self._run_calibration_flag = True
+
+    def run_one_click_sync(self):
+        # The scan room process now also updates the boundary mask
+        self.run_room_scan()
 
     def run_room_scan(self):
         self.requested_camera_res = (9999, 9999) # Request max FOV

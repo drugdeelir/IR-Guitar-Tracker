@@ -545,7 +545,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_group = QGroupBox("Step 1: Devices & Boundary Detection")
         self.setup_group_layout = QVBoxLayout()
 
-        self.setup_instruction = QLabel("Select your camera and projector, then detect where the projector light is visible.")
+        self.setup_instruction = QLabel("Select your camera and projector, then perform a ONE-CLICK SYNC to align everything.")
         self.setup_instruction.setWordWrap(True)
         self.setup_group_layout.addWidget(self.setup_instruction)
 
@@ -567,10 +567,15 @@ class ProjectionMappingApp(QMainWindow):
         proj_layout.addWidget(self.setup_proj_combo)
         self.setup_group_layout.addLayout(proj_layout)
 
-        # Boundary Detection
-        self.detect_bounds_btn = QPushButton("DETECT PROJECTOR BOUNDS")
-        self.detect_bounds_btn.setMinimumHeight(50)
-        self.detect_bounds_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; margin-top: 10px;")
+        # One-Click Sync
+        self.sync_btn = QPushButton("ONE-CLICK SYNC (ALIGN & BOUNDS)")
+        self.sync_btn.setMinimumHeight(70)
+        self.sync_btn.setStyleSheet("background-color: #d500f9; color: white; font-weight: bold; font-size: 16px; margin-top: 10px;")
+        self.sync_btn.clicked.connect(self.start_one_click_sync)
+        self.setup_group_layout.addWidget(self.sync_btn)
+
+        # Boundary Detection (Legacy/Fallback)
+        self.detect_bounds_btn = QPushButton("Only Detect Projector Bounds")
         self.detect_bounds_btn.clicked.connect(self.worker.run_boundary_detection)
         self.setup_group_layout.addWidget(self.detect_bounds_btn)
 
@@ -605,6 +610,17 @@ class ProjectionMappingApp(QMainWindow):
     def start_room_scan(self):
         self.statusBar().showMessage("Scanning room... This will take about 10 seconds. Please keep the area still.", 0)
         self.worker.run_room_scan()
+
+    def start_one_click_sync(self):
+        if hasattr(self, 'sync_btn') and self.sync_btn:
+            self.sync_btn.setText("SYNCING... PLEASE WAIT")
+            self.sync_btn.setEnabled(False)
+        if hasattr(self, 'tab_sync_btn') and self.tab_sync_btn:
+            self.tab_sync_btn.setText("SYNCING...")
+            self.tab_sync_btn.setEnabled(False)
+
+        self.statusBar().showMessage("Starting ONE-CLICK SYNC. Analyzing environment and aligning...", 0)
+        self.worker.run_one_click_sync()
 
     def start_manual_calibration(self):
         self.statusBar().showMessage("Manual Alignment: Click the 4 corners of the projector's output.", 5000)
@@ -643,6 +659,14 @@ class ProjectionMappingApp(QMainWindow):
         self.marker_selection_dialog.setWindowTitle("Select Markers")
 
     def handle_calibration_complete(self, success):
+        # Reset sync buttons if they were used
+        if hasattr(self, 'sync_btn') and self.sync_btn:
+            self.sync_btn.setText("ONE-CLICK SYNC (ALIGN & BOUNDS)")
+            self.sync_btn.setEnabled(True)
+        if hasattr(self, 'tab_sync_btn') and self.tab_sync_btn:
+            self.tab_sync_btn.setText("ONE-CLICK SYNC (AUTO-ALIGN)")
+            self.tab_sync_btn.setEnabled(True)
+
         self.worker.show_calibration_pattern = False
         # Safe check for widget existence to avoid RuntimeError if deleted during step transition
         try:
@@ -675,6 +699,7 @@ class ProjectionMappingApp(QMainWindow):
         self.manual_align_btn = None
         self.align_btn = None
         self.detect_bounds_btn = None
+        self.sync_btn = None
 
         while self.setup_group_layout.count():
             item = self.setup_group_layout.takeAt(0)
@@ -726,27 +751,10 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_group_layout.addWidget(self.setup_instruction)
 
         if self.setup_step == 1: # Alignment
-            self.setup_group.setTitle("Step 2: Camera Alignment")
-            self.setup_instruction.setText("Align the camera to the projector coordinates.")
+            self.setup_group.setTitle("Step 2: Verification")
+            self.setup_instruction.setText("Verify that the alignment and background bounds are correct. If the background boundary is incorrect, you can manually adjust it in the 'Boundary' tab.")
 
-            # Auto-Alignment
-            self.align_btn = QPushButton("RUN AUTO-ALIGNMENT")
-            self.align_btn.setMinimumHeight(50)
-            self.align_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold; margin-top: 10px;")
-            self.align_btn.clicked.connect(self.start_auto_calibration)
-            self.setup_group_layout.addWidget(self.align_btn)
-
-            self.manual_align_btn = QPushButton("MANUAL ALIGNMENT")
-            self.manual_align_btn.clicked.connect(self.start_manual_calibration)
-            self.setup_group_layout.addWidget(self.manual_align_btn)
-
-            self.scan_room_btn = QPushButton("SCAN ROOM (AUTO-ALIGN)")
-            self.scan_room_btn.setMinimumHeight(50)
-            self.scan_room_btn.setStyleSheet("background-color: #00bcd4; color: black; font-weight: bold;")
-            self.scan_room_btn.clicked.connect(self.start_room_scan)
-            self.setup_group_layout.addWidget(self.scan_room_btn)
-
-            self.verify_align_btn = QPushButton("VERIFY ALIGNMENT")
+            self.verify_align_btn = QPushButton("VERIFY ALIGNMENT (GRID)")
             self.verify_align_btn.setCheckable(True)
             self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
             self.setup_group_layout.addWidget(self.verify_align_btn)
@@ -1300,8 +1308,13 @@ class ProjectionMappingApp(QMainWindow):
         self.enable_warping_button.toggled.connect(self.toggle_warping)
         self.reset_warping_button = QPushButton("Reset Grid")
         self.reset_warping_button.clicked.connect(self.projector_window.reset_warp_points)
+        self.tab_sync_btn = QPushButton("ONE-CLICK SYNC (AUTO-ALIGN)")
+        self.tab_sync_btn.clicked.connect(self.start_one_click_sync)
+        self.tab_sync_btn.setStyleSheet("background-color: #d500f9; color: white; font-weight: bold;")
+
         warp_layout.addWidget(self.enable_warping_button)
         warp_layout.addWidget(self.reset_warping_button)
+        warp_layout.addWidget(self.tab_sync_btn)
         self.warp_group.setLayout(warp_layout)
         layout.addWidget(self.warp_group)
         
