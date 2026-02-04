@@ -225,6 +225,8 @@ class ProjectionMappingApp(QMainWindow):
         self.available_cameras = get_available_cameras()
         self.screens = QApplication.screens()
 
+        self.worker = Worker()
+
         self.tabs = QTabWidget()
         self.create_setup_tab() # New Guided Setup Tab
         self.create_workspace_tab()
@@ -239,7 +241,6 @@ class ProjectionMappingApp(QMainWindow):
         self.layout.addWidget(self.tabs, stretch=1)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
 
-        self.worker = Worker()
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
 
@@ -1026,6 +1027,14 @@ class ProjectionMappingApp(QMainWindow):
         fx_layout.addWidget(QLabel("Global Mood (Color Palette):"))
         fx_layout.addWidget(self.mood_combo)
 
+        self.pnp_check = QCheckBox("Enable 3D Perspective (Tilt/Rotation)")
+        self.pnp_check.toggled.connect(self.worker.set_pnp_enabled)
+        fx_layout.addWidget(self.pnp_check)
+
+        self.occlusion_check = QCheckBox("Enable Performer Occlusion (Shadow Removal)")
+        self.occlusion_check.toggled.connect(self.worker.set_occlusion_enabled)
+        fx_layout.addWidget(self.occlusion_check)
+
         self.blackout_btn = QPushButton("BLACKOUT (PANIC)")
         self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
         self.blackout_btn.clicked.connect(self.toggle_blackout)
@@ -1421,6 +1430,8 @@ class ProjectionMappingApp(QMainWindow):
                 'h_c2p': self.worker.h_c2p.tolist() if self.worker.h_c2p is not None else None,
                 'calib_points': getattr(self.worker, 'calib_points', None),
                 'baseline_distance': self.worker.baseline_distance,
+                'pnp_enabled': self.pnp_check.isChecked(),
+                'occlusion_enabled': self.occlusion_check.isChecked(),
                 'setup_reference': ref_frame_b64,
                 'master_visuals': {
                     'brightness': self.brightness_slider.value(),
@@ -1516,6 +1527,8 @@ class ProjectionMappingApp(QMainWindow):
                     self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
 
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
+                self.pnp_check.setChecked(data.get('pnp_enabled', False))
+                self.occlusion_check.setChecked(data.get('occlusion_enabled', False))
 
                 h_c2p = data.get('h_c2p')
                 calib_points = data.get('calib_points')

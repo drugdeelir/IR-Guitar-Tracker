@@ -171,6 +171,10 @@ class Worker(QObject):
         # Safety Mode
         self.safety_mode_enabled = True
         self.fallback_generator = 'radial'
+        self.pnp_enabled = False
+        self.occlusion_enabled = False
+        self.back_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
+        self.occlusion_mask = None
 
         # Calibration/Alignment Mode
         self.show_camera_on_projector = False
@@ -218,6 +222,8 @@ class Worker(QObject):
         self.projector_buffer = None
         self.mask_buffer = None
         self.latest_main_frame = None
+        self.camera_matrix = None
+        self.dist_coeffs = np.zeros((4, 1))
         self.cached_plasma_grid = None
         self.cached_nebula_grid = None
         self.generator_buffer = None
@@ -891,6 +897,15 @@ class Worker(QObject):
             h_cam, w_cam = main_frame.shape[:2]
             h, w = self.projector_height, self.projector_width
 
+            if self.camera_matrix is None:
+                # Estimate camera matrix based on FOV (approx 60 deg)
+                f = max(w_cam, h_cam)
+                self.camera_matrix = np.array([
+                    [f, 0, w_cam / 2],
+                    [0, f, h_cam / 2],
+                    [0, 0, 1]
+                ], dtype=np.float32)
+
             if self.projector_buffer is None or self.projector_buffer.shape[:2] != (h, w):
                 self.projector_buffer = np.zeros((h, w, 3), dtype=np.uint8)
                 self.mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
@@ -1154,6 +1169,22 @@ class Worker(QObject):
             self.update_particles(tracked_points, h, w)
             self.draw_particles(projector_output)
 
+            # Performer Occlusion Logic
+            if self.occlusion_enabled:
+                fg_mask = self.back_subtractor.apply(main_frame)
+                # Cleanup mask
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+                fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+
+                # Exclude the guitar area from occlusion if tracking
+                if self.confidence > 0.5 and self.last_tracked_points:
+                    pts = np.array(self.last_tracked_points, dtype=np.int32)
+                    cv2.fillPoly(fg_mask, [cv2.convexHull(pts)], 0)
+
+                # Transform occlusion mask to projector space
+                self.occlusion_mask = self.warp_full_frame_to_projector(fg_mask, w_cam, h_cam, w, h)
+
             with QMutexLocker(self.mask_mutex):
                 iterable_masks = [m for m in self.masks] # Snapshot for this frame
 
@@ -1237,8 +1268,25 @@ class Worker(QObject):
                         src_pts = np.float32(mask.source_points)
 
                         if is_safe:
-                            # Transform reference mask points to current tracking space
-                            dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), self.last_homography).reshape(-1, 2)
+                            # 3D PnP Perspective Logic
+                            if self.pnp_enabled and self.marker_config and len(self.marker_config) == 4 and len(tracked_points) == 4:
+                                # Model points (markers in their reference plane, Z=0)
+                                model_pts = np.array([ [p[0], p[1], 0] for p in self.marker_config ], dtype=np.float32)
+                                image_pts = np.array(tracked_points, dtype=np.float32)
+
+                                success, rvec, tvec = cv2.solvePnP(model_pts, image_pts, self.camera_matrix, self.dist_coeffs)
+
+                                if success:
+                                    # Project the mask points based on 3D pose
+                                    # Mask points are relative to the reference markers
+                                    mask_model_pts = np.array([ [p[0], p[1], 0] for p in mask.source_points ], dtype=np.float32)
+                                    dst_pts_raw, _ = cv2.projectPoints(mask_model_pts, rvec, tvec, self.camera_matrix, self.dist_coeffs)
+                                    dst_pts_raw = dst_pts_raw.reshape(-1, 2)
+                                else:
+                                    dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), self.last_homography).reshape(-1, 2)
+                            else:
+                                # Fallback to standard Homography
+                                dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), self.last_homography).reshape(-1, 2)
 
                             # Audio Scaling
                             if self.audio_reactive_target == 'scale':
@@ -1445,6 +1493,14 @@ class Worker(QObject):
             # Apply Master Fader
             if self.master_fader < 1.0:
                 projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
+
+            # Apply Performer Occlusion
+            if self.occlusion_enabled and self.occlusion_mask is not None:
+                # Black out the performer
+                inv_mask = cv2.bitwise_not(self.occlusion_mask)
+                if len(inv_mask.shape) == 2:
+                    inv_mask = cv2.merge([inv_mask, inv_mask, inv_mask])
+                projector_output = cv2.bitwise_and(projector_output, inv_mask)
 
             # 9-point grid warping (piecewise perspective optimization)
             if self._warp_is_identity:
@@ -1739,6 +1795,11 @@ class Worker(QObject):
         self._sls_curr_wait = 0
         self._run_sls_flag = True
 
+    def warp_full_frame_to_projector(self, frame, w_cam, h_cam, w_proj, h_proj):
+        if self.h_c2p is not None:
+            return cv2.warpPerspective(frame, self.h_c2p, (w_proj, h_proj))
+        return cv2.resize(frame, (w_proj, h_proj))
+
     def transform_to_projector(self, pts, w_cam=640, h_cam=480):
         # Prefer Dense LUT if available
         if self.sls_lut_x is not None:
@@ -1833,3 +1894,9 @@ class Worker(QObject):
             self.masks = sorted(masks, key=lambda m: m.z_order)
         self.update_video_speeds()
         self.cleanup_resources()
+
+    def set_pnp_enabled(self, enabled):
+        self.pnp_enabled = enabled
+
+    def set_occlusion_enabled(self, enabled):
+        self.occlusion_enabled = enabled
