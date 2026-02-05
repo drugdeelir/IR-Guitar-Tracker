@@ -1006,9 +1006,20 @@ class Worker(QObject):
         # Increased to 6% for better high-velocity neck tracking
         dynamic_padding = max(self.roi_padding, int(w * 0.06))
 
+        # Pre-calculate Kalman predictions early to use for ROI and stickiness
+        predictions = []
+        if not force_full and self.confidence > 0.3 and marker_cfg and len(self.kalman_filters) == len(marker_cfg):
+            for kf in self.kalman_filters:
+                pred = kf.predict()
+                predictions.append((pred[0, 0], pred[1, 0]))
+
         if not force_full and self.last_tracked_points is not None:
-            # pts are normalized
-            pts = np.array(self.last_tracked_points)
+            # Use Kalman predictions for ROI to handle fast motion better than last-frame fallback
+            if predictions:
+                pts = np.array(predictions)
+            else:
+                pts = np.array(self.last_tracked_points)
+
             min_x, min_y = np.min(pts, axis=0)
             max_x, max_y = np.max(pts, axis=0)
             # Convert to pixels for ROI calculation
@@ -1089,7 +1100,8 @@ class Worker(QObject):
 
                 # Use intensity-weighted moments for sub-pixel centroid stability
                 x_b, y_b, w_b, h_b = cv2.boundingRect(contour)
-                pad = 3
+                # Increased padding to capture the full Gaussian tail of the IR marker
+                pad = 6
                 x1 = max(0, x_b - pad)
                 y1 = max(0, y_b - pad)
                 x2 = min(roi_w, x_b + w_b + pad)
@@ -1101,9 +1113,11 @@ class Worker(QObject):
                 # while preserving intensity weighting for sub-pixel precision.
                 weighted_roi = cv2.bitwise_and(dot_roi, mask_roi)
 
-                # REFINEMENT: Localized contrast boost for the blob area
+                # REFINEMENT: Localized contrast boost and Gaussian smoothing
                 if np.max(weighted_roi) > 0:
                     weighted_roi = cv2.normalize(weighted_roi, None, 0, 255, cv2.NORM_MINMAX)
+                    # Smooth out pixelization and sensor noise for a more stable centroid
+                    weighted_roi = cv2.GaussianBlur(weighted_roi, (3, 3), 0.5)
 
                 M = cv2.moments(weighted_roi)
 
@@ -1112,7 +1126,7 @@ class Worker(QObject):
                     cy_px = (M["m01"] / M["m00"]) + y1
 
                     # Sample peak intensity in the dot area
-                    intensity = np.max(dot_roi)
+                    intensity = float(np.max(dot_roi))
 
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
@@ -1127,10 +1141,19 @@ class Worker(QObject):
         detected_points_raw.sort(key=lambda x: (x['intensity'], x['area'], x['circ']), reverse=True)
         detected_points_all = [x['pos'] for x in detected_points_raw]
 
+        # Dynamic Persistence: scale radius based on movement magnitude
+        # Helps maintain locks during fast sweeps while keeping noise rejection high when still
+        move_mag = 0
+        with QMutexLocker(self.tracking_mutex):
+            if self.smoothed_points is not None and len(self.history_points) > 1:
+                try:
+                    move_mag = np.linalg.norm(np.mean(self.history_points[-1], axis=0) - np.mean(self.history_points[-2], axis=0))
+                except: pass
+
         # Dot Persistence: only keep dots that were present in the last frame to filter out transient flashes
         detected_points = []
         # Radius for temporal persistence (normalized units)
-        persistence_radius = 0.015
+        persistence_radius = np.clip(0.012 + move_mag * 2.5, 0.012, 0.06)
 
         for p in detected_points_all:
             # Check against ALL detections from the previous frame
@@ -1156,12 +1179,7 @@ class Worker(QObject):
             # OC-TOLERANCE: If we see at least 3 markers (and 1 is missing), we can estimate the guitar pose
             num_markers = len(marker_cfg)
 
-            # Pre-calculate Kalman predictions for stickiness cost (helps handle "swallowed" markers)
-            predictions = []
-            if self.confidence > 0.3 and len(self.kalman_filters) == num_markers:
-                for kf in self.kalman_filters:
-                    pred = kf.predict()
-                    predictions.append((pred[0, 0], pred[1, 0]))
+            # predictions are already calculated at the top of the function
 
             # If we were tracking, prioritize points near last known location
             if self.confidence > 0.2 and self.last_tracked_points and len(self.last_tracked_points) > 0:
@@ -1267,7 +1285,13 @@ class Worker(QObject):
 
                                     # Geometric sanity check: Check determinant to avoid mirrors/flips
                                     det = np.linalg.det(m[:2, :2])
-                                    if det <= 0.1: continue # Quick prune
+                                    if det <= 0.1 or det > 10.0: continue # Quick prune for degenerate or implausible scaling
+
+                                    # Aspect ratio check for the transformed markers
+                                    # Ensure the guitar hasn't "squashed" into a line
+                                    _, s, _ = np.linalg.svd(m[:2, :2])
+                                    condition_number = s[0] / max(1e-9, s[1])
+                                    if condition_number > 8.0: continue # Reject overly skewed solutions
 
                                     # Fingerprint already calculated in early pruning
                                     # We just reuse fp_err or recalculate it for the cost
@@ -1281,6 +1305,7 @@ class Worker(QObject):
 
                                     # Marker Stickiness: favor points closer to their predicted positions
                                     stickiness_err = 0
+                                    intensity_match = 0
                                     if predictions and len(predictions) == num_markers:
                                         for i in range(num_markers):
                                             stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(predictions[i]))
@@ -1288,8 +1313,14 @@ class Worker(QObject):
                                         for i in range(num_markers):
                                             stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(self.last_tracked_points[i]))
 
+                                    # Intensity Matching: favor combinations of dots with similar high intensities
+                                    intensities = [float(cand['intensity']) for pt in p for cand in detected_points_raw if cand['pos'] == pt]
+                                    if intensities:
+                                        # Penalty for intensity variance (true markers should be similarly bright)
+                                        intensity_match = np.std(intensities) / 255.0
+
                                     # Increased stickiness weight to prioritize temporal continuity over visual exactness
-                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0)
+                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0) + (intensity_match * 4.0)
 
                                     if total_cost < best_overall_error:
                                         best_overall_error = total_cost
@@ -1781,14 +1812,14 @@ class Worker(QObject):
 
                         # Automatically derive Projector Boundary from SLS valid mask
                         # Clean up the mask aggressively to fill holes and smooth edges
-                        kernel = np.ones((21, 21), np.uint8)
+                        kernel = np.ones((25, 25), np.uint8)
                         mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
                         mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
-                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
+                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=3)
 
                         contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        # Filter contours by size
-                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.1)]
+                        # Filter contours by size - lowered to 0.5% of FOV for better sensitivity
+                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.005)]
 
                         if valid_contours:
                             main_contour = max(valid_contours, key=cv2.contourArea)
