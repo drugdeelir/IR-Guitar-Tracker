@@ -190,10 +190,23 @@ class TrackingThread(QThread):
                 if self.worker._capture_still_frame_flag:
                     # Wait for resolution change to apply if requested
                     if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
-                        rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                        # Burst capture (15 frames) for robust calibration
+                        frames = [main_frame]
+                        for _ in range(14):
+                            ret, f = main_cap.read()
+                            if ret: frames.append(f)
+                            QThread.msleep(15)
+
+                        # Use Max Composite to find the brightest/most persistent spots
+                        composite = frames[0].copy()
+                        for i in range(1, len(frames)):
+                            composite = cv2.max(composite, frames[i])
+
+                        rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
                         # Perform specialized high-res detection for the still frame
-                        still_dots = self.worker.get_tracked_points(main_frame, force_full=True)
-                        self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots)
+                        # Use a dedicated return for rejected candidates to guide user
+                        still_dots, rejected_dots = self.worker.get_tracked_points(composite, force_full=True, return_rejected=True)
+                        self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots, rejected_dots)
                         self.worker._capture_still_frame_flag = False
 
                 elapsed = time.time() - start_time
@@ -2034,10 +2047,6 @@ class Worker(QObject):
                             cv2.putText(projector_output, f"{mask.tag or mask.name}", (int(draw_pts[0][0]), int(draw_pts[0][1] - 5)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-                if self._capture_still_frame_flag:
-                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                    self.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
-                    self._capture_still_frame_flag = False
 
                 self.frame_count += 1
                 now = time.time()
