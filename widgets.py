@@ -9,9 +9,11 @@ class MarkerImageLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
         self.detected_points = []
         self.selected_points = []
         self.guide_points = []
+        self.hover_snap_pt = None
         self.pix = None
 
     def set_data(self, pixmap, detected_points, guide_points=None):
@@ -19,17 +21,35 @@ class MarkerImageLabel(QLabel):
         self.detected_points = detected_points
         self.guide_points = guide_points or []
         self.selected_points = []
+        self.hover_snap_pt = None
         self.setPixmap(self.pix)
         self.update()
 
-    def mousePressEvent(self, event):
+    def mouseMoveEvent(self, event):
         if not self.pix: return
+        px, py = self.map_pos_to_pixmap(event.pos())
+        pix_w = self.pix.width()
 
-        # Correctly map click position to pixmap coordinates
+        snap_threshold = max(25, int(pix_w * 0.04))
+        best_pt = None
+        min_dist = snap_threshold
+
+        click_pt = QPoint(int(px), int(py))
+        for dp in self.detected_points:
+            dp_pt = QPoint(int(dp[0] * self.pix.width()), int(dp[1] * self.pix.height()))
+            dist = (click_pt - dp_pt).manhattanLength()
+            if dist < min_dist:
+                min_dist = dist
+                best_pt = dp_pt
+
+        if best_pt != self.hover_snap_pt:
+            self.hover_snap_pt = best_pt
+            self.update()
+
+    def map_pos_to_pixmap(self, pos):
         lbl_w, lbl_h = self.width(), self.height()
         pix_w, pix_h = self.pix.width(), self.pix.height()
 
-        # Find the actual displayed size (Qt.KeepAspectRatio)
         sw, sh = pix_w, pix_h
         aspect = pix_w / pix_h
         if sw > lbl_w:
@@ -42,23 +62,29 @@ class MarkerImageLabel(QLabel):
         offset_x = (lbl_w - sw) // 2
         offset_y = (lbl_h - sh) // 2
 
-        if sw == 0 or sh == 0: return
+        if sw == 0 or sh == 0: return 0, 0
 
-        px = (event.pos().x() - offset_x) * pix_w / sw
-        py = (event.pos().y() - offset_y) * pix_h / sh
+        px = (pos.x() - offset_x) * pix_w / sw
+        py = (pos.y() - offset_y) * pix_h / sh
+        return px, py
+
+    def mousePressEvent(self, event):
+        if not self.pix: return
+        px, py = self.map_pos_to_pixmap(event.pos())
+        pix_w, pix_h = self.pix.width(), self.pix.height()
 
         if 0 <= px < pix_w and 0 <= py < pix_h:
             click_pt = QPoint(int(px), int(py))
             best_pt = click_pt
-            # Snap threshold relative to image width (approx 3% of width)
-            min_dist = max(20, int(pix_w * 0.03))
+
+            # Snap logic
+            snap_threshold = max(30, int(pix_w * 0.05))
             for dp in self.detected_points:
-                # dp is normalized
                 dp_pt = QPoint(int(dp[0] * pix_w), int(dp[1] * pix_h))
                 dist = (click_pt - dp_pt).manhattanLength()
-                if dist < min_dist:
-                    min_dist = dist
+                if dist < snap_threshold:
                     best_pt = dp_pt
+                    break # Take the first one in range
 
             self.selected_points.append(best_pt)
             self.point_selected.emit(best_pt)
@@ -73,7 +99,6 @@ class MarkerImageLabel(QLabel):
         lbl_w, lbl_h = self.width(), self.height()
         pix_w, pix_h = self.pix.width(), self.pix.height()
 
-        # Find the actual displayed size
         sw, sh = pix_w, pix_h
         aspect = pix_w / pix_h
         if sw > lbl_w:
@@ -86,35 +111,49 @@ class MarkerImageLabel(QLabel):
         offset_x = (lbl_w - sw) // 2
         offset_y = (lbl_h - sh) // 2
 
-        # Draw the pixmap centered and scaled
         painter.drawPixmap(offset_x, offset_y, sw, sh, self.pix)
 
-        # Draw detected points as faint red circles
-        painter.setPen(QPen(Qt.red, 2, Qt.DashLine))
+        # Draw detected dots (more visible)
         for dp in self.detected_points:
-            # detected_points are normalized
             sx = offset_x + dp[0] * sw
             sy = offset_y + dp[1] * sh
-            painter.drawEllipse(QPoint(int(sx), int(sy)), 12, 12)
 
-        # Draw guide points (from template) as faint cyan circles
-        painter.setPen(QPen(Qt.cyan, 2, Qt.DotLine))
+            # Glowing effect for detected dots
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 255, 0, 100)))
+            painter.drawEllipse(QPoint(int(sx), int(sy)), 15, 15)
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPoint(int(sx), int(sy)), 8, 8)
+
+        # Draw hover snap indicator
+        if self.hover_snap_pt:
+            hx = offset_x + (self.hover_snap_pt.x() * sw / pix_w)
+            hy = offset_y + (self.hover_snap_pt.y() * sh / pix_h)
+            painter.setPen(QPen(Qt.yellow, 2))
+            painter.drawEllipse(QPoint(int(hx), int(hy)), 20, 20)
+
+        # Draw guide points
+        painter.setPen(QPen(QColor(0, 255, 255, 150), 1, Qt.DotLine))
         for gp in self.guide_points:
-            # guide_points are normalized
             sx = offset_x + gp[0] * sw
             sy = offset_y + gp[1] * sh
-            painter.drawEllipse(QPoint(int(sx), int(sy)), 15, 15)
+            painter.drawEllipse(QPoint(int(sx), int(sy)), 12, 12)
 
-        # Draw selected points as solid neon purple targets
-        painter.setPen(QPen(Qt.magenta, 3))
-        for sp in self.selected_points:
-            # sp is in pixmap pixels, map to screen
+        # Draw selected markers
+        for i, sp in enumerate(self.selected_points):
             sx = offset_x + (sp.x() * sw / pix_w)
             sy = offset_y + (sp.y() * sh / pix_h)
             pt = QPoint(int(sx), int(sy))
+
+            painter.setPen(QPen(Qt.magenta, 3))
             painter.drawLine(pt.x()-15, pt.y(), pt.x()+15, pt.y())
             painter.drawLine(pt.x(), pt.y()-15, pt.x(), pt.y()+15)
-            painter.drawEllipse(pt, 5, 5)
+            painter.drawEllipse(pt, 6, 6)
+
+            # Index number
+            painter.setPen(Qt.white)
+            painter.drawText(pt.x() + 10, pt.y() - 10, str(i + 1))
 
 class MarkerSelectionDialog(QDialog):
     def __init__(self, parent=None):

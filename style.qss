@@ -29,7 +29,8 @@ QTabBar::tab:selected {
 QGroupBox {
     border: 1px solid #1a1a1a;
     border-radius: 8px;
-    margin-top: 15px;
+    margin-top: 20px;
+    padding-top: 20px;
     font-weight: bold;
     color: #d500f9;
     background-color: #000000;
@@ -45,8 +46,8 @@ QPushButton {
     background-color: #0a0a0a;
     border: 1px solid #1a1a1a;
     border-radius: 4px;
-    padding: 10px 15px;
-    min-height: 40px;
+    padding: 12px 15px;
+    min-height: 45px;
     color: #ffffff;
     font-weight: bold;
 }

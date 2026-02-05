@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
                              QDialog, QFormLayout, QInputDialog, QTabWidget, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QAbstractItemView)
+                             QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea)
 from PyQt5.QtGui import QPixmap, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor
@@ -545,9 +545,14 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage("Marker selection cleared.", 3000)
 
     def create_setup_tab(self):
+        self.setup_scroll = QScrollArea()
+        self.setup_scroll.setWidgetResizable(True)
+        self.setup_scroll.setFrameShape(QScrollArea.NoFrame)
         self.setup_tab = QWidget()
+        self.setup_scroll.setWidget(self.setup_tab)
+
         self.setup_layout = QVBoxLayout(self.setup_tab)
-        self.setup_layout.setSpacing(12)
+        self.setup_layout.setSpacing(20)
         self.setup_layout.setContentsMargins(15, 15, 15, 15)
 
         self.setup_title = QLabel("<h2>Guided Setup</h2>")
@@ -614,7 +619,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_layout.addWidget(self.setup_next_btn)
 
         self.setup_layout.addStretch()
-        self.tabs.insertTab(0, self.setup_tab, "Setup Wizard")
+        self.tabs.insertTab(0, self.setup_scroll, "Setup Wizard")
 
     def start_auto_calibration(self):
         self.statusBar().showMessage("Displaying calibration pattern...", 2000)
@@ -954,8 +959,14 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage("Configuration Mode", 3000)
 
     def create_workspace_tab(self):
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.workspace_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
 
         # Project controls
         proj_group = QGroupBox("Project")
@@ -1183,7 +1194,7 @@ class ProjectionMappingApp(QMainWindow):
         layout.addWidget(master_group)
 
         layout.addStretch()
-        self.tabs.addTab(tab, "Stage")
+        self.tabs.addTab(self.workspace_scroll, "Stage")
 
     def create_media_tab(self):
         tab = QWidget()
@@ -1328,8 +1339,14 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage("Boundary saved as Background mask.", 3000)
 
     def create_calibration_tab(self):
+        self.calib_scroll = QScrollArea()
+        self.calib_scroll.setWidgetResizable(True)
+        self.calib_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.calib_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
 
         self.warp_group = QGroupBox("Projector Warping (3x3 Grid)")
         warp_layout = QVBoxLayout()
@@ -1407,11 +1424,17 @@ class ProjectionMappingApp(QMainWindow):
         layout.addWidget(depth_group)
 
         layout.addStretch()
-        self.tabs.addTab(tab, "Calibration")
+        self.tabs.addTab(self.calib_scroll, "Calibration")
 
     def create_system_tab(self):
+        self.system_scroll = QScrollArea()
+        self.system_scroll.setWidgetResizable(True)
+        self.system_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.system_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
 
         # Camera
         cam_group = QGroupBox("Camera")
@@ -1468,7 +1491,7 @@ class ProjectionMappingApp(QMainWindow):
         layout.addWidget(audio_group)
 
         layout.addStretch()
-        self.tabs.addTab(tab, "System")
+        self.tabs.addTab(self.system_scroll, "System")
 
     def create_diagnostics_tab(self):
         tab = QWidget()

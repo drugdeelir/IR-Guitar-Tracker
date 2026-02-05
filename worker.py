@@ -190,7 +190,9 @@ class TrackingThread(QThread):
                 # Wait for resolution change to apply if requested
                 if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
                     rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
+                    # Perform specialized high-res detection for the still frame
+                    still_dots = self.worker.get_tracked_points(main_frame, force_full=True)
+                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots)
                     self.worker._capture_still_frame_flag = False
 
             elapsed = time.time() - start_time
@@ -848,17 +850,15 @@ class Worker(QObject):
         self._design_cache[cache_key] = mask
         return mask
 
-    def get_tracked_points(self, frame):
+    def get_tracked_points(self, frame, force_full=False):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
         h, w = frame.shape[:2]
         with QMutexLocker(self.tracking_mutex):
             marker_cfg = self.marker_config
             marker_fp = self.marker_fingerprint
 
-        if marker_cfg is None:
-            return []
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
-        if self.last_tracked_points is not None:
+        if not force_full and self.last_tracked_points is not None:
             # pts are normalized
             pts = np.array(self.last_tracked_points)
             min_x, min_y = np.min(pts, axis=0)
@@ -1205,10 +1205,11 @@ class Worker(QObject):
                         # Use convex hull for a clean outer boundary
                         hull = cv2.convexHull(main_contour)
                         peri = cv2.arcLength(hull, True)
-                        approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
+                        # More aggressive simplification to ensure a clean rectangle or simple polygon
+                        approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
 
-                        # If still too complex, use minAreaRect for a perfect rectangle
-                        if len(approx) > 8:
+                        # If still too complex or too many points, use minAreaRect for a perfect rectangle
+                        if len(approx) > 6:
                             rect = cv2.minAreaRect(hull)
                             approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
@@ -1279,9 +1280,10 @@ class Worker(QObject):
 
                     # Automatically derive Projector Boundary from SLS valid mask
                     # Clean up the mask aggressively to fill holes and smooth edges
-                    kernel = np.ones((7, 7), np.uint8)
-                    mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
-                    mask_solid = cv2.dilate(mask_solid, kernel, iterations=1)
+                    kernel = np.ones((15, 15), np.uint8)
+                    mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_OPEN, kernel)
+                    mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_CLOSE, kernel)
+                    mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
 
                     contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if contours:
@@ -1879,12 +1881,16 @@ class Worker(QObject):
                 projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
 
             # Apply Projector Boundary Global Clip (in internal resolution)
-            if self.projector_boundary:
+            # Disable clipping during Wizard steps 0 and 1 to prevent interference with calibration
+            is_wizard = (self.projector_width == 1280 and self.projector_height == 720) # Simple heuristic or pass flag
+
+            if self.projector_boundary and not (self._run_sls_flag or self.show_calibration_pattern or self.show_calibration_verify):
                 clip_mask = np.zeros((h, w), dtype=np.uint8)
                 # self.projector_boundary is already normalized
                 proj_pts = self.transform_to_projector(self.projector_boundary, target_w=w, target_h=h)
-                cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
-                projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
+                if len(proj_pts) >= 3:
+                    cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
+                    projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
 
             # Apply Performer Occlusion
             if self.occlusion_enabled and self.occlusion_mask is not None:
