@@ -2,11 +2,13 @@
 QMainWindow {
     background-color: #000000;
     color: #ffffff;
+    font-size: 16px;
 }
 
 QWidget {
     background-color: #000000;
     color: #ffffff;
+    font-size: 16px;
 }
 
 QTabWidget::pane {
@@ -17,8 +19,10 @@ QTabWidget::pane {
 QTabBar::tab {
     background: #050505;
     border: 1px solid #000000;
-    padding: 10px;
+    padding: 15px 25px;
     color: #ffffff;
+    font-size: 18px;
+    font-weight: bold;
 }
 
 QTabBar::tab:selected {
@@ -29,9 +33,10 @@ QTabBar::tab:selected {
 QGroupBox {
     border: 1px solid #1a1a1a;
     border-radius: 8px;
-    margin-top: 20px;
-    padding-top: 20px;
+    margin-top: 25px;
+    padding-top: 30px;
     font-weight: bold;
+    font-size: 18px;
     color: #d500f9;
     background-color: #000000;
 }
@@ -46,10 +51,11 @@ QPushButton {
     background-color: #0a0a0a;
     border: 1px solid #1a1a1a;
     border-radius: 4px;
-    padding: 12px 15px;
-    min-height: 45px;
+    padding: 15px 20px;
+    min-height: 55px;
     color: #ffffff;
     font-weight: bold;
+    font-size: 16px;
 }
 
 QPushButton:hover {
@@ -72,9 +78,10 @@ QComboBox {
     background-color: #0a0a0a;
     border: 1px solid #1a1a1a;
     border-radius: 4px;
-    padding: 8px 10px;
-    min-height: 40px;
+    padding: 10px 15px;
+    min-height: 50px;
     color: #ffffff;
+    font-size: 16px;
 }
 
 QComboBox::drop-down {
@@ -126,6 +133,19 @@ QStatusBar {
 
 QLabel {
     color: #ffffff;
+    font-size: 16px;
+}
+
+h1 {
+    color: #d500f9;
+    font-size: 32px;
+    font-weight: bold;
+}
+
+h2 {
+    color: #d500f9;
+    font-size: 24px;
+    font-weight: bold;
 }
 
 QLineEdit {
@@ -141,11 +161,11 @@ QCheckBox {
 }
 
 QCheckBox::indicator {
-    width: 18px;
-    height: 18px;
+    width: 24px;
+    height: 24px;
     background-color: #0a0a0a;
     border: 1px solid #1a1a1a;
-    border-radius: 3px;
+    border-radius: 4px;
 }
 
 QCheckBox::indicator:checked {

@@ -187,7 +187,7 @@ class ProjectionMappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projection Mapping Tool")
-        self.setGeometry(100, 100, 1400, 950)
+        self.setGeometry(50, 50, 1600, 1000)
         self.masks = []
         self.media_library = []
         self.selected_markers = []
@@ -218,8 +218,8 @@ class ProjectionMappingApp(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QHBoxLayout(self.central_widget)
-        self.layout.setSpacing(15)
-        self.layout.setContentsMargins(10, 10, 10, 10)
+        self.layout.setSpacing(25)
+        self.layout.setContentsMargins(20, 20, 20, 20)
 
         self.video_display = VideoDisplay()
         self.video_display.setMinimumWidth(800)
@@ -240,6 +240,16 @@ class ProjectionMappingApp(QMainWindow):
         self.create_diagnostics_tab()
 
         self.start_osc_server()
+
+        # Default to Display 2 (index 1) if available
+        if len(self.screens) > 1:
+            QTimer.singleShot(500, lambda: self.change_projector(1))
+            if hasattr(self, 'setup_proj_combo'):
+                self.setup_proj_combo.setCurrentIndex(1)
+            if hasattr(self, 'projector_combo'):
+                self.projector_combo.setCurrentIndex(1)
+
+        self.showFullScreen()
 
         self.layout.addWidget(self.video_display, stretch=2)
         self.layout.addWidget(self.tabs, stretch=1)
@@ -490,7 +500,7 @@ class ProjectionMappingApp(QMainWindow):
             new_markers = self.marker_selection_dialog.get_selected_points()
 
             # If we already have a configuration, try to transition masks
-            if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 4:
+            if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 3:
                 # markers in dialog are in still-frame pixels
                 w_still = self.marker_selection_dialog.image_label.pix.width()
                 h_still = self.marker_selection_dialog.image_label.pix.height()
@@ -498,7 +508,16 @@ class ProjectionMappingApp(QMainWindow):
                 # Both old and new pts are now normalized for resolution-independence
                 old_pts = np.float32(self.worker.marker_config).reshape(-1, 1, 2)
                 new_pts = np.float32([(p.x() / w_still, p.y() / h_still) for p in new_markers]).reshape(-1, 1, 2)
-                matrix, _ = cv2.findHomography(old_pts, new_pts)
+
+                if len(new_markers) >= 4:
+                    matrix, _ = cv2.findHomography(old_pts, new_pts)
+                else:
+                    matrix_affine, _ = cv2.estimateAffinePartial2D(old_pts, new_pts)
+                    if matrix_affine is not None:
+                        matrix = np.eye(3, dtype=np.float32)
+                        matrix[:2, :] = matrix_affine
+                    else:
+                        matrix = None
 
                 if matrix is not None:
                     for mask in self.masks:
@@ -552,10 +571,10 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_scroll.setWidget(self.setup_tab)
 
         self.setup_layout = QVBoxLayout(self.setup_tab)
-        self.setup_layout.setSpacing(20)
-        self.setup_layout.setContentsMargins(15, 15, 15, 15)
+        self.setup_layout.setSpacing(30)
+        self.setup_layout.setContentsMargins(25, 25, 25, 25)
 
-        self.setup_title = QLabel("<h2>Guided Setup</h2>")
+        self.setup_title = QLabel("<h1>Guided Setup</h1>")
         self.setup_desc = QLabel("Welcome! Let's get your projection mapped. Follow the steps below.")
         self.setup_desc.setWordWrap(True)
 
@@ -862,6 +881,8 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_bg_mask(self):
         self.video_display.clear_mask_points()
         self.video_display.set_snap_to_markers(False)
+        if hasattr(self, 'snap_check'):
+            self.snap_check.setChecked(False)
         self.video_display.set_mask_color(Qt.blue)
         # Ensure a background cue exists
         bg_mask = None
@@ -891,6 +912,8 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_guitar_mask(self):
         self.video_display.clear_mask_points()
         self.video_display.set_snap_to_markers(True)
+        if hasattr(self, 'snap_check'):
+            self.snap_check.setChecked(True)
         self.video_display.set_mask_color(Qt.green)
         mask = None
         for m in self.masks:
@@ -914,6 +937,8 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_amp_mask(self):
         self.video_display.clear_mask_points()
         self.video_display.set_snap_to_markers(False)
+        if hasattr(self, 'snap_check'):
+            self.snap_check.setChecked(False)
         self.video_display.set_mask_color(Qt.cyan)
         mask = None
         for m in self.masks:
@@ -966,7 +991,8 @@ class ProjectionMappingApp(QMainWindow):
         self.workspace_scroll.setWidget(tab)
 
         layout = QVBoxLayout(tab)
-        layout.setSpacing(15)
+        layout.setSpacing(25)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         # Project controls
         proj_group = QGroupBox("Project")
@@ -1028,6 +1054,11 @@ class ProjectionMappingApp(QMainWindow):
 
         self.bezier_check = QCheckBox("Bezier Curves")
         form.addRow(self.bezier_check)
+
+        self.snap_check = QCheckBox("Snap to Markers")
+        self.snap_check.setChecked(True)
+        self.snap_check.toggled.connect(self.video_display.set_snap_to_markers)
+        form.addRow(self.snap_check)
 
         self.mask_feather_slider = QSlider(Qt.Horizontal)
         self.mask_feather_slider.setRange(0, 100)
@@ -1346,7 +1377,8 @@ class ProjectionMappingApp(QMainWindow):
         self.calib_scroll.setWidget(tab)
 
         layout = QVBoxLayout(tab)
-        layout.setSpacing(15)
+        layout.setSpacing(25)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         self.warp_group = QGroupBox("Projector Warping (3x3 Grid)")
         warp_layout = QVBoxLayout()
