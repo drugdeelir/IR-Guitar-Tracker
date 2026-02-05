@@ -906,6 +906,12 @@ class Worker(QObject):
         for contour in contours:
             area = cv2.contourArea(contour)
             if 2 < area < 800:
+                # Circularity Check to filter out streaks/reflections
+                peri = cv2.arcLength(contour, True)
+                circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
+
+                if circularity < 0.3: continue # Reject non-circular blobs
+
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
                     cx_px = int(M["m10"] / M["m00"])
@@ -916,10 +922,10 @@ class Worker(QObject):
 
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
-                    detected_points_raw.append({'pos': (cX, cY), 'intensity': intensity, 'area': area})
+                    detected_points_raw.append({'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity})
 
-        # Sort by intensity (brightest first) then area
-        detected_points_raw.sort(key=lambda x: (x['intensity'], x['area']), reverse=True)
+        # Sort by intensity (brightest first) then area/circularity
+        detected_points_raw.sort(key=lambda x: (x['intensity'], x['area'], x['circ']), reverse=True)
         detected_points = [x['pos'] for x in detected_points_raw]
 
         if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= (len(marker_cfg) - 1):
@@ -1056,29 +1062,28 @@ class Worker(QObject):
 
             if best_match and best_overall_error < 0.1: # Final threshold for a valid lock
                 # Sanity Check: Filter out sudden jumps (reflections)
-                if self.last_tracked_points is not None and self.confidence > 0.4:
+                if self.last_tracked_points is not None and self.confidence > 0.3:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
                     curr_center = np.mean(best_match, axis=0)
-                    if np.linalg.norm(curr_center - prev_center) > 0.2:
-                        self.confidence = max(0.0, self.confidence - 0.3)
-                        # If we keep seeing the jump, eventually we will drop confidence enough to snap
+                    # For a guitar, moving > 12% of screen width in one frame is unlikely
+                    if np.linalg.norm(curr_center - prev_center) > 0.12:
+                        self.confidence = max(0.0, self.confidence - 0.2)
                         return self.last_tracked_points
 
-                self.last_homography = best_matrix
                 # Kalman Correction
                 kalman_pts = []
                 for i, pt in enumerate(best_match):
+                    # Clamp input to avoid extreme Kalman state changes
                     self.kalman_filters[i].correct(np.array([[np.float32(pt[0])], [np.float32(pt[1])]]))
                     pred = self.kalman_filters[i].predict()
                     kalman_pts.append((pred[0, 0], pred[1, 0]))
 
                 new_points_arr = np.array(kalman_pts, dtype=np.float32)
 
-                # Decisive Reset: If current points are too far from the history,
-                # and history is stable, we might be seeing a ghost.
+                # Decisive Reset: If current points are too far from the history
                 if self.smoothed_points is not None and self.confidence > 0.5:
                     dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
-                    if dist > 0.15: # Significant jump detected
+                    if dist > 0.1: # Significant jump detected
                         self.confidence = max(0.0, self.confidence - 0.15)
                         return self.last_tracked_points
 
@@ -1086,13 +1091,8 @@ class Worker(QObject):
                 if self.smoothed_points is None:
                     self.smoothed_points = new_points_arr
                 else:
-                    # Stricter Alpha: prioritizing new points when confidence is high
-                    # If moving fast, reduce smoothing even more
-                    vel = np.linalg.norm(new_points_arr - self.smoothed_points)
-                    motion_boost = min(0.4, vel * 5.0)
-
-                    alpha = (1.0 - self.smoothing_factor) * (0.4 + self.confidence * 0.6 + motion_boost)
-                    alpha = min(1.0, alpha)
+                    # Stricter Alpha for stability
+                    alpha = (1.0 - self.smoothing_factor) * 0.5
                     self.smoothed_points = self.smoothed_points * (1.0 - alpha) + new_points_arr * alpha
 
                 # Moving Average over history
@@ -1102,10 +1102,23 @@ class Worker(QObject):
 
                 avg_points = np.mean(self.history_points, axis=0)
 
-                # Decisive snap: if we just regained tracking, don't average with nothing/old data
+                # Decisive snap: if we just regained tracking, don't average with old data
                 if self.confidence < 0.3:
                     avg_points = new_points_arr
                     self.history_points = [new_points_arr.copy()]
+
+                # RE-ESTIMATE HOMOGRAPHY from smoothed points to ensure stability of the mask
+                src_pts = np.float32(marker_cfg).reshape(-1, 1, 2)
+                dst_pts = np.float32(avg_points).reshape(-1, 1, 2)
+                if len(src_pts) >= 4:
+                    m, _ = cv2.findHomography(src_pts, dst_pts, 0)
+                else:
+                    m, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+                    if m is not None:
+                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+
+                if m is not None:
+                    self.last_homography = m
 
                 if self.confidence < 0.5 and (self.confidence + self.confidence_gain) >= 0.5:
                     self.status_update.emit("Tracking Status: LOCKED")
@@ -2030,13 +2043,7 @@ class Worker(QObject):
                 # Disable clipping during Wizard steps 0 and 1 to prevent interference with calibration
                 is_wizard = (self.projector_width == 1280 and self.projector_height == 720) # Simple heuristic or pass flag
 
-                if self.projector_boundary and not (self._run_sls_flag or self.show_calibration_pattern or self.show_calibration_verify):
-                    clip_mask = np.zeros((h, w), dtype=np.uint8)
-                    # self.projector_boundary is already normalized
-                    proj_pts = self.transform_to_projector(self.projector_boundary, target_w=w, target_h=h)
-                    if len(proj_pts) >= 3:
-                        cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
-                        projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
+                # Global clipping removed as it was causing invisible masks and is redundant with per-mask shapes
 
                 # Apply Performer Occlusion
                 if self.occlusion_enabled and self.occlusion_mask is not None:

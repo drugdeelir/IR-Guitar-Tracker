@@ -833,11 +833,13 @@ class ProjectionMappingApp(QMainWindow):
 
         if not bg_mask:
             bg_mask = Mask("Background", points, "generator:grid", tag="background", mask_type="static")
+            bg_mask.z_order = -100 # Keep at the very back
             self.masks.append(bg_mask)
             self.log("Created new 'Background' mask.")
         else:
             bg_mask.source_points = points
             bg_mask.tag = 'background'
+            bg_mask.z_order = -100
             bg_mask.visible = True
             if not bg_mask.video_path:
                 bg_mask.video_path = "generator:grid"
@@ -887,12 +889,18 @@ class ProjectionMappingApp(QMainWindow):
 
         if self.setup_step == 1: # Alignment
             self.setup_group.setTitle("Step 2: Verification & Masking")
-            self.setup_instruction.setText("Verify that the alignment and background bounds are correct. If the background boundary is incorrect, you can manually adjust it in the 'Boundary' tab.")
+            self.setup_instruction.setText("Verify that the alignment and background bounds are correct. You can manually refine the background shape below.")
 
             self.verify_align_btn = QPushButton("VERIFY ALIGNMENT (GRID)")
             self.verify_align_btn.setCheckable(True)
             self.verify_align_btn.toggled.connect(self.toggle_verify_alignment)
             self.setup_group_layout.addWidget(self.verify_align_btn)
+
+            self.edit_bg_mask_btn = QPushButton("EDIT BACKGROUND BOUNDARY")
+            self.edit_bg_mask_btn.setMinimumHeight(60)
+            self.edit_bg_mask_btn.setStyleSheet("background-color: #311b92; color: white; font-weight: bold;")
+            self.edit_bg_mask_btn.clicked.connect(self.start_setup_bg_mask_dialog)
+            self.setup_group_layout.addWidget(self.edit_bg_mask_btn)
 
             self.test_pattern_check = QCheckBox("Show Test Pattern (Manual Alignment Check)")
             self.test_pattern_check.toggled.connect(self.toggle_test_pattern)
@@ -915,6 +923,11 @@ class ProjectionMappingApp(QMainWindow):
             marker_btn.setMinimumHeight(60)
             marker_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(marker_btn)
+
+            self.baseline_btn = QPushButton("SET BASELINE DEPTH (Hold guitar at normal playing distance)")
+            self.baseline_btn.clicked.connect(self.worker.calibrate_depth)
+            self.baseline_btn.setMinimumHeight(50)
+            self.setup_group_layout.addWidget(self.baseline_btn)
 
         elif self.setup_step == 3: # Guitar Mask
             self.setup_group.setTitle("Step 4: Guitar Mask (DYNAMIC)")
@@ -971,32 +984,37 @@ class ProjectionMappingApp(QMainWindow):
         finish_btn.clicked.connect(lambda: finish_btn.setText("Mask Saved!"))
         self.setup_group_layout.addWidget(finish_btn)
 
-    def start_setup_bg_mask(self):
-        self.video_display.clear_mask_points()
-        self.video_display.set_snap_to_markers(False)
-        if hasattr(self, 'snap_check'):
-            self.snap_check.setChecked(False)
-        self.video_display.set_mask_color(Qt.blue)
+    def start_setup_bg_mask_dialog(self):
         # Ensure a background cue exists
         bg_mask = None
         for m in self.masks:
-            if m.tag == 'background':
+            if m.tag == 'background' or m.name == 'Background':
                 bg_mask = m
                 break
 
         if not bg_mask:
-            bg_mask = Mask("Background", [], None, tag="background", mask_type="static")
+            bg_mask = Mask("Background", [], "generator:grid", tag="background", mask_type="static")
             self.masks.append(bg_mask)
+
+        self.mask_drawing_dialog.setWindowTitle("Edit Background Boundary")
+        self.mask_drawing_dialog.video_display.set_mask_color(Qt.blue)
+        self.mask_drawing_dialog.set_points([QPointF(p[0], p[1]) for p in bg_mask.source_points])
+
+        try: self.mask_drawing_dialog.take_picture_button.clicked.disconnect()
+        except: pass
+        self.mask_drawing_dialog.take_picture_button.clicked.connect(self.worker.capture_still_frame)
+
+        self.worker.capture_still_frame()
+
+        if self.mask_drawing_dialog.exec_():
+            points = self.mask_drawing_dialog.get_points()
+            bg_mask.source_points = [(p.x(), p.y()) for p in points]
+            bg_mask.tag = 'background'
+            bg_mask.type = 'static'
+            self.worker.set_masks(self.masks)
             self.update_cue_table()
             self.update_mask_combos()
-
-        idx = self.masks.index(bg_mask)
-        self.cue_list_widget.setCurrentRow(idx)
-        # Sync workspace UI so saving works correctly
-        self.mask_tag_combo.setCurrentText("background")
-        self.mask_type_combo.setCurrentText("static")
-        self.add_wizard_finish_button()
-        self.enter_mask_creation_mode()
+            self.maybe_auto_save()
 
     def start_guided_guitar_setup(self):
         if self.open_marker_selection_dialog():
