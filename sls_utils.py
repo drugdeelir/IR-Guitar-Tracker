@@ -38,7 +38,7 @@ def generate_gray_code_patterns(width, height, max_bits=11):
 
     return patterns_x, patterns_y
 
-def decode_gray_code(captures, target_range, threshold=5):
+def decode_gray_code(captures, target_range, threshold=8):
     if not captures or len(captures) == 0:
         return np.zeros((1, 1), dtype=np.int32), np.zeros((1, 1), dtype=bool)
 

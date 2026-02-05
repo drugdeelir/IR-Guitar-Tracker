@@ -265,7 +265,7 @@ class Worker(QObject):
         self.smoothed_points = None
         self.smoothing_factor = 0.5 # Lowered for more direct response
         self.history_points = []
-        self.history_len = 3 # Reduced for more direct response
+        self.history_len = 5 # Increased for stability when guitar is still
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -338,7 +338,7 @@ class Worker(QObject):
         self._sls_patterns_y = []
         self._sls_captures_x = []
         self._sls_captures_y = []
-        self._sls_wait_frames = 5
+        self._sls_wait_frames = 12
         self._sls_curr_wait = 0
 
         # Projector Boundary Detection
@@ -910,7 +910,7 @@ class Worker(QObject):
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
 
-                if circularity < 0.3: continue # Reject non-circular blobs
+                if circularity < 0.5: continue # Reject non-circular blobs
 
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
@@ -1022,7 +1022,7 @@ class Worker(QObject):
                                     else:
                                         fp_err = 0.5 # Penalty for mismatch in length/missing FP
 
-                                    total_cost = err + fp_err * 3.0 # Increased weight on FP
+                                    total_cost = err + fp_err * 5.0 # Increased weight on FP
 
                                     if det > 0.1 and total_cost < best_overall_error:
                                         best_overall_error = total_cost
@@ -1067,7 +1067,7 @@ class Worker(QObject):
                         if best_match: break
                 if best_match: break
 
-            if best_match and best_overall_error < 0.1: # Final threshold for a valid lock
+            if best_match and best_overall_error < 0.05: # Final threshold for a valid lock (tightened)
                 # Sanity Check: Filter out sudden jumps (reflections)
                 if self.last_tracked_points is not None and self.confidence > 0.3:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
@@ -1270,14 +1270,17 @@ class Worker(QObject):
 
                 # Dynamically calculate render resolution based on projector dimensions
                 # For ultra-wide setups (like 4480px), we want higher internal res
-                target_w = int(w_proj * self.render_scale)
-                target_h = int(h_proj * self.render_scale)
+                if self._run_sls_flag or self._run_boundary_detection_flag or self._run_calibration_flag:
+                    # Bypassing render scale for calibration steps to ensure 1:1 pixel mapping
+                    w, h = w_proj, h_proj
+                else:
+                    target_w = int(w_proj * self.render_scale)
+                    target_h = int(h_proj * self.render_scale)
 
-                # Clamp to reasonable limits for performance
-                self.render_width = max(640, min(target_w, 2560))
-                self.render_height = max(360, min(target_h, 1440))
-
-                w, h = self.render_width, self.render_height
+                    # Clamp to reasonable limits for performance
+                    self.render_width = max(640, min(target_w, 2560))
+                    self.render_height = max(360, min(target_h, 1440))
+                    w, h = self.render_width, self.render_height
 
                 if self.camera_matrix is None:
                     # Estimate camera matrix based on FOV (approx 60 deg)
@@ -1404,9 +1407,11 @@ class Worker(QObject):
                     if self._sls_step < total_x:
                         self.status_update.emit(f"Room Scan: Capturing X pattern {self._sls_step+1}/{total_x}...")
                         pattern = self._sls_patterns_x[self._sls_step]
-                        # Resize pattern to internal render resolution for consistency
-                        pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
-                        self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
+                        # Patterns are already generated at projector resolution
+                        # We must ensure they are shown 1:1 to avoid aliasing
+                        if pattern.shape[1] != w or pattern.shape[0] != h:
+                            pattern = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
+                        self.projector_buffer = cv2.merge([pattern, pattern, pattern])
                         if self._sls_curr_wait >= self._sls_wait_frames:
                             if curr_frame_id > self._last_captured_frame_id:
                                 gray = self.boost_contrast(main_frame)
@@ -1420,9 +1425,9 @@ class Worker(QObject):
                         idx = self._sls_step - total_x
                         self.status_update.emit(f"Room Scan: Capturing Y pattern {idx+1}/{total_y}...")
                         pattern = self._sls_patterns_y[idx]
-                        # Resize pattern to internal render resolution for consistency
-                        pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
-                        self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
+                        if pattern.shape[1] != w or pattern.shape[0] != h:
+                            pattern = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
+                        self.projector_buffer = cv2.merge([pattern, pattern, pattern])
                         if self._sls_curr_wait >= self._sls_wait_frames:
                             if curr_frame_id > self._last_captured_frame_id:
                                 gray = self.boost_contrast(main_frame)
