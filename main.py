@@ -1781,6 +1781,7 @@ class ProjectionMappingApp(QMainWindow):
         self.warp_group.setTitle(f"Projector Warping ({res_str} Grid)")
 
     def save_project(self, filename=None):
+        print(f"[DEBUG] Attempting to save project. Filename: {filename}")
         if not filename:
             filename, _ = QFileDialog.getSaveFileName(self, "Save Project", self.current_project_path or "", "Project Files (*.json)")
 
@@ -1868,6 +1869,7 @@ class ProjectionMappingApp(QMainWindow):
             self.statusBar().showMessage("No setup reference frame found in this project.", 3000)
 
     def load_project(self, filename=None):
+        print(f"[DEBUG] Attempting to load project. Filename: {filename}")
         if not filename:
             filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
 
@@ -2161,6 +2163,7 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
 
     def add_new_mask_prompt(self):
+        print("[DEBUG] Prompting for new mask name...")
         mask_name, ok = QInputDialog.getText(self, "New Mask", "Enter Name for new mask:")
         if ok and mask_name:
             new_mask = Mask(mask_name, [], None)
