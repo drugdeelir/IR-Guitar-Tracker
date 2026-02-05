@@ -419,7 +419,7 @@ class Worker(QObject):
             self.kalman_filters.append(kf)
 
     def set_marker_points(self, points):
-        """Sets the reference marker configuration. Supports QPoint (pixels) or tuples (normalized)."""
+        """Sets the reference marker configuration. Expects a list of normalized (0.0-1.0) coordinates."""
         with QMutexLocker(self.tracking_mutex):
             # Reset tracking history when markers change
             self.history_points = []
@@ -427,18 +427,10 @@ class Worker(QObject):
             self.last_homography = None
             self.confidence = 0.0
 
-            w, h = self._current_camera_res
-            if w <= 0 or h <= 0: w, h = 1280, 720
-
             new_config = []
             for p in points:
-                if hasattr(p, 'x'): # QPoint or QPointF
-                    # If it's a QPoint and looks like it's in pixels (> 1.0), normalize it.
-                    # Otherwise, it might already be normalized QPointF.
-                    if p.x() > 1.0 or p.y() > 1.0:
-                        new_config.append((p.x() / w, p.y() / h))
-                    else:
-                        new_config.append((p.x(), p.y()))
+                if hasattr(p, 'x'): # QPoint or QPointF (normalized)
+                    new_config.append((p.x(), p.y()))
                 else: # Tuple or list (normalized)
                     new_config.append((p[0], p[1]))
 
@@ -907,7 +899,8 @@ class Worker(QObject):
 
         detected_points = []
         for contour in contours:
-            if cv2.contourArea(contour) > 3: # Lowered threshold for small IR dots
+            area = cv2.contourArea(contour)
+            if 2 < area < 500: # Filter out very large blobs which are likely reflections, not markers
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
                     cX = (M["m10"] / M["m00"] + roi_x) / w
@@ -1028,11 +1021,12 @@ class Worker(QObject):
 
             if best_match and best_overall_error < 0.1: # Final threshold for a valid lock
                 # Sanity Check: Filter out sudden jumps (reflections)
-                if self.last_tracked_points is not None and self.confidence > 0.6:
+                if self.last_tracked_points is not None and self.confidence > 0.4:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
                     curr_center = np.mean(best_match, axis=0)
-                    if np.linalg.norm(curr_center - prev_center) > 0.25:
-                        self.confidence = max(0.0, self.confidence - 0.2)
+                    if np.linalg.norm(curr_center - prev_center) > 0.2:
+                        self.confidence = max(0.0, self.confidence - 0.3)
+                        # If we keep seeing the jump, eventually we will drop confidence enough to snap
                         return self.last_tracked_points
 
                 self.last_homography = best_matrix
@@ -1043,13 +1037,23 @@ class Worker(QObject):
                     pred = self.kalman_filters[i].predict()
                     kalman_pts.append((pred[0, 0], pred[1, 0]))
 
+                new_points_arr = np.array(kalman_pts, dtype=np.float32)
+
+                # Decisive Reset: If current points are too far from the history,
+                # and history is stable, we might be seeing a ghost.
+                if self.smoothed_points is not None and self.confidence > 0.5:
+                    dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
+                    if dist > 0.15: # Significant jump detected
+                        self.confidence = max(0.0, self.confidence - 0.15)
+                        return self.last_tracked_points
+
                 # High-Distance Temporal Smoothing
                 if self.smoothed_points is None:
-                    self.smoothed_points = np.array(kalman_pts, dtype=np.float32)
+                    self.smoothed_points = new_points_arr
                 else:
                     # Adaptive smoothing based on confidence
-                    alpha = (1.0 - self.smoothing_factor) * (1.0 - self.confidence * 0.5)
-                    self.smoothed_points = self.smoothed_points * (1.0 - alpha) + np.array(kalman_pts, dtype=np.float32) * alpha
+                    alpha = (1.0 - self.smoothing_factor) * (0.5 + self.confidence * 0.5)
+                    self.smoothed_points = self.smoothed_points * (1.0 - alpha) + new_points_arr * alpha
 
                 # Moving Average over history
                 self.history_points.append(self.smoothed_points.copy())
@@ -1057,8 +1061,15 @@ class Worker(QObject):
                     self.history_points.pop(0)
 
                 avg_points = np.mean(self.history_points, axis=0)
+
+                # Decisive snap: if we just regained tracking, don't average with nothing/old data
+                if self.confidence < 0.3:
+                    avg_points = new_points_arr
+                    self.history_points = [new_points_arr.copy()]
+
                 if self.confidence < 0.5 and (self.confidence + self.confidence_gain) >= 0.5:
                     self.status_update.emit("Tracking Status: LOCKED")
+
                 self.confidence = min(1.0, self.confidence + self.confidence_gain)
                 self.last_tracked_points = [tuple(p) for p in avg_points]
                 return self.last_tracked_points
@@ -1070,14 +1081,16 @@ class Worker(QObject):
 
         if self.confidence > 0.1 and (self.confidence - self.confidence_decay) <= 0.1:
             self.status_update.emit("Tracking Status: LOST")
-        self.confidence = max(0.0, self.confidence - self.confidence_decay)
+
+        # Drop confidence faster if we don't see anything
+        self.confidence = max(0.0, self.confidence - self.confidence_decay * 1.5)
 
         # If tracking is completely lost, clear history to avoid "jumps" when regained
         if self.confidence <= 0:
             self.history_points = []
             self.smoothed_points = None
             self.last_homography = None
-            # Reset Kalman filters
+            # Decisive Reset of Kalman filters to prevent old state from polluting new lock
             if self.marker_config:
                 self.init_kalman(len(self.marker_config))
 
@@ -1252,6 +1265,14 @@ class Worker(QObject):
                         black = self._boundary_captures[0]
                         white = self._boundary_captures[1]
                         diff = cv2.absdiff(white, black)
+
+                        # Mask out persistent bright spots (like IR markers) from the diff
+                        # They should be bright in both black and white frames.
+                        _, marker_mask = cv2.threshold(black, self.ir_threshold, 255, cv2.THRESH_BINARY)
+                        kernel_small = np.ones((3,3), np.uint8)
+                        marker_mask = cv2.dilate(marker_mask, kernel_small, iterations=3)
+                        diff[marker_mask > 0] = 0
+
                         # Use Otsu's thresholding for IR cameras
                         _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         # Fallback if Otsu results in near-zero coverage
@@ -1274,14 +1295,15 @@ class Worker(QObject):
                                 msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
                                 self.system_warning.emit(msg)
 
-                            # Simplify for boundary - User wants a "big rectangle"
-                            # Use convex hull for a clean outer boundary
+                            # Use Convex Hull to ignore internal details and just get the footprint
                             hull = cv2.convexHull(main_contour)
+
+                            # Simplification
                             peri = cv2.arcLength(hull, True)
-                            # More aggressive simplification to ensure a clean rectangle or simple polygon
                             approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
 
-                            # If still too complex or too many points, use minAreaRect for a perfect rectangle
+                            # If the detected boundary is still complex, force a 4-point rectangle
+                            # because the user likely wants the full wall/projector screen area.
                             if len(approx) > 6:
                                 rect = cv2.minAreaRect(hull)
                                 approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
@@ -1346,9 +1368,9 @@ class Worker(QObject):
                         proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
                         valid = valid_x & valid_y
 
-                        # Store dense LUT and apply median filter to remove noise-induced "spikes"
-                        self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5)
-                        self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5)
+                        # Store dense LUT as normalized [0-1] and apply median filter to remove noise-induced "spikes"
+                        self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5) / self.projector_width
+                        self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5) / self.projector_height
                         self.sls_valid_mask = valid.astype(np.uint8)
 
                         # Automatically derive Projector Boundary from SLS valid mask
@@ -1361,12 +1383,12 @@ class Worker(QObject):
                         contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         if contours:
                             main_contour = max(contours, key=cv2.contourArea)
-                            # Simplify for boundary - User wants a "big rectangle"
+                            # Use convex hull and force a simple polygon or rectangle
                             hull = cv2.convexHull(main_contour)
                             peri = cv2.arcLength(hull, True)
-                            approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
+                            approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
 
-                            if len(approx) > 8:
+                            if len(approx) > 6:
                                 rect = cv2.minAreaRect(hull)
                                 approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
@@ -1384,12 +1406,14 @@ class Worker(QObject):
                         for r in range(0, h_idx, step):
                             for c in range(0, w_idx, step):
                                 if valid[r, c]:
-                                    calib_data.append([float(c), float(r),
-                                                       float(proj_x[r, c]), float(proj_y[r, c])])
+                                    # Normalize proj_x/y to [0, 1] based on full native projector res
+                                    nx = float(proj_x[r, c]) / self.projector_width
+                                    ny = float(proj_y[r, c]) / self.projector_height
+                                    calib_data.append([float(c), float(r), nx, ny])
 
                         if len(calib_data) > 10:
                             self.init_rbf_from_points(calib_data)
-                            # Estimate homography from sample points for fallback
+                            # Estimate homography from sample points for fallback (maps to norm space)
                             pts_arr = np.array(calib_data)
                             self.h_c2p, _ = cv2.findHomography(pts_arr[:100, :2], pts_arr[:100, 2:])
                             self.calibration_camera_res = (w_cam, h_cam)
@@ -1526,23 +1550,23 @@ class Worker(QObject):
                         start_x = margin_x + (grid_w % 10) // 2
                         start_y = margin_y + (grid_h % 7) // 2
 
-                        proj_pts = []
+                        proj_pts_norm = []
                         for r in range(1, 7):
                             for c in range(1, 10):
-                                proj_pts.append([start_x + c * sq_w, start_y + r * sq_h])
+                                proj_pts_norm.append([(start_x + c * sq_w) / w, (start_y + r * sq_h) / h])
 
-                        proj_pts = np.array(proj_pts, dtype=np.float32)
+                        proj_pts_norm = np.array(proj_pts_norm, dtype=np.float32)
                         cam_pts = avg_corners.reshape(-1, 2)
 
-                        # Store as point list for RBF
+                        # Store as point list for RBF (cam_pixels to norm_projector)
                         calib_data = []
                         for i in range(len(cam_pts)):
                             calib_data.append([float(cam_pts[i, 0]), float(cam_pts[i, 1]),
-                                               float(proj_pts[i, 0]), float(proj_pts[i, 1])])
+                                               float(proj_pts_norm[i, 0]), float(proj_pts_norm[i, 1])])
 
                         self.init_rbf_from_points(calib_data)
-                        # Also keep homography as a robust fallback
-                        self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
+                        # Also keep homography as a robust fallback (maps cam_pixels to norm_projector)
+                        self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts_norm)
                         self.calibration_camera_res = (w_cam, h_cam)
 
                         self._run_calibration_flag = False
@@ -2337,9 +2361,6 @@ class Worker(QObject):
         if target_w is None: target_w = self.projector_width
         if target_h is None: target_h = self.projector_height
 
-        scale_w = target_w / self.projector_width
-        scale_h = target_h / self.projector_height
-
         pts_arr = np.array(pts, dtype=np.float32).reshape(-1, 2)
 
         # Map to Calibration Resolution space for internal math
@@ -2359,12 +2380,14 @@ class Worker(QObject):
                 for p in pts_cal:
                     ix, iy = int(round(p[0])), int(round(p[1]))
                     if 0 <= ix < cal_w and 0 <= iy < cal_h and self.sls_valid_mask[iy, ix]:
-                        res.append([self.sls_lut_x[iy, ix] * scale_w, self.sls_lut_y[iy, ix] * scale_h])
+                        # SLS LUT stores normalized [0-1] projector coords
+                        res.append([self.sls_lut_x[iy, ix] * target_w, self.sls_lut_y[iy, ix] * target_h])
                     else:
                         # Fallback to RBF for out-of-bounds or invalid pixels
                         if self.rbf_x:
-                            rx = self.rbf_x(p.reshape(1, 2))[0] * scale_w
-                            ry = self.rbf_y(p.reshape(1, 2))[0] * scale_h
+                            # RBF outputs normalized [0-1] projector coords
+                            rx = self.rbf_x(p.reshape(1, 2))[0] * target_w
+                            ry = self.rbf_y(p.reshape(1, 2))[0] * target_h
                             res.append([rx, ry])
                         else:
                             # Proportional fallback
@@ -2375,8 +2398,9 @@ class Worker(QObject):
 
         if self.rbf_x is not None:
             try:
-                tx = self.rbf_x(pts_cal) * scale_w
-                ty = self.rbf_y(pts_cal) * scale_h
+                # RBF outputs normalized [0-1] projector coords
+                tx = self.rbf_x(pts_cal) * target_w
+                ty = self.rbf_y(pts_cal) * target_h
                 return np.stack([tx, ty], axis=1).reshape(-1, 2)
             except:
                 pass
@@ -2386,8 +2410,9 @@ class Worker(QObject):
                 pts_reshaped = np.float32(pts_cal).reshape(-1, 1, 2)
                 transformed = cv2.perspectiveTransform(pts_reshaped, self.h_c2p)
                 res = transformed.reshape(-1, 2)
-                res[:, 0] *= scale_w
-                res[:, 1] *= scale_h
+                # Homography outputs normalized [0-1] projector coords
+                res[:, 0] *= target_w
+                res[:, 1] *= target_h
                 return res
             except:
                 pass

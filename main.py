@@ -241,7 +241,7 @@ class ProjectionMappingApp(QMainWindow):
         self.main_container.addWidget(self.log_area)
 
         self.video_display = VideoDisplay()
-        self.video_display.setMinimumWidth(800)
+        self.video_display.setMinimumWidth(600) # Reduced to prevent UI cut-off on narrow screens
         self.projector_window = ProjectorWindow()
 
         self.available_cameras = get_available_cameras()
@@ -550,7 +550,12 @@ class ProjectionMappingApp(QMainWindow):
 
                     self.statusBar().showMessage("Adjusted static masks to new camera perspective.", 3000)
 
-            self.selected_markers = new_markers
+            # Normalize markers before sending to worker to ensure resolution independence
+            w_still = self.marker_selection_dialog.image_label.pix.width()
+            h_still = self.marker_selection_dialog.image_label.pix.height()
+            norm_markers = [(p.x() / w_still, p.y() / h_still) for p in new_markers]
+
+            self.selected_markers = norm_markers
             print(f"Selected {len(self.selected_markers)} markers.")
             self.worker.set_marker_points(self.selected_markers)
             self.maybe_auto_save()
@@ -855,8 +860,17 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.stop_calibration()
 
         self.setup_step += 1
+
+        # Reset Navigation Buttons state
         if hasattr(self, 'setup_back_btn'):
             self.setup_back_btn.setEnabled(self.setup_step > 0)
+        if hasattr(self, 'setup_next_btn'):
+            try:
+                self.setup_next_btn.clicked.disconnect()
+            except TypeError: pass
+            self.setup_next_btn.clicked.connect(self.next_setup_step)
+            self.setup_next_btn.setText("Next Step")
+            self.setup_next_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
 
         self.clear_setup_layout()
 
@@ -1038,7 +1052,8 @@ class ProjectionMappingApp(QMainWindow):
         # or we could hide the tabs entirely and just show the video.
         # Let's try hiding the sidebar (tabs)
         self.tabs.hide()
-        self.video_display.setMinimumWidth(1200) # Take more space
+        # In performance mode, we want as much space as possible
+        self.video_display.setMinimumWidth(1000)
 
         # Add a floating button or status bar button to exit
         self.exit_perf_btn = QPushButton("EXIT PERFORMANCE MODE")
@@ -1340,7 +1355,12 @@ class ProjectionMappingApp(QMainWindow):
         self.tabs.addTab(self.workspace_scroll, "Stage")
 
     def create_media_tab(self):
+        self.media_scroll = QScrollArea()
+        self.media_scroll.setWidgetResizable(True)
+        self.media_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.media_scroll.setWidget(tab)
+
         layout = QHBoxLayout(tab)
 
         # Left: Media Library
@@ -1423,10 +1443,15 @@ class ProjectionMappingApp(QMainWindow):
         cue_group.setLayout(cue_layout)
         layout.addWidget(cue_group, 2)
 
-        self.tabs.addTab(tab, "Media & Cues")
+        self.tabs.addTab(self.media_scroll, "Media & Cues")
 
     def create_boundary_tab(self):
+        self.boundary_scroll = QScrollArea()
+        self.boundary_scroll.setWidgetResizable(True)
+        self.boundary_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.boundary_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
 
         group = QGroupBox("Projector Usable Area (Camera View)")
@@ -1459,7 +1484,7 @@ class ProjectionMappingApp(QMainWindow):
         group.setLayout(glayout)
         layout.addWidget(group)
         layout.addStretch()
-        self.tabs.addTab(tab, "Boundary")
+        self.tabs.addTab(self.boundary_scroll, "Boundary")
 
     def reset_boundary_to_count(self, count_str):
         if not self.edit_bounds_btn.isChecked(): return
@@ -1665,7 +1690,12 @@ class ProjectionMappingApp(QMainWindow):
         self.tabs.addTab(self.system_scroll, "System")
 
     def create_diagnostics_tab(self):
+        self.diag_scroll = QScrollArea()
+        self.diag_scroll.setWidgetResizable(True)
+        self.diag_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.diag_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
 
         self.audio_monitor = AudioMonitor()
@@ -1680,7 +1710,7 @@ class ProjectionMappingApp(QMainWindow):
         clear_btn.clicked.connect(self.diag_log.clear)
         layout.addWidget(clear_btn)
 
-        self.tabs.addTab(tab, "Connectivity")
+        self.tabs.addTab(self.diag_scroll, "Connectivity")
 
     def log_message(self, msg):
         try:
