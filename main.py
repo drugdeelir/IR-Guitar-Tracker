@@ -45,7 +45,7 @@ class MIDIMappingDialog(QDialog):
 
         # Define actions
         self.actions = []
-        for tag_label, tag in [('Amp', 'amp'), ('BG', 'background'), ('Master', 'master')]:
+        for tag_label, tag in [('Guitar', 'instrument'), ('Amp', 'amp'), ('BG', 'background'), ('Master', 'master')]:
             self.actions += [
                 (f'Toggle {tag_label} Visibility', f'toggle_{tag}'),
                 (f'{tag_label} Strobe', f'fx_{tag}_strobe'),
@@ -102,6 +102,7 @@ class MIDIMappingDialog(QDialog):
             self.actions.append((f'Load Snapshot {i+1}', f'snap_load_{i}'))
 
         for i in range(8):
+            self.actions.append((f'Switch Guitar to Cue {i+1}', f'cue_instrument_{i}'))
             self.actions.append((f'Switch Amp to Cue {i+1}', f'cue_amp_{i}'))
             self.actions.append((f'Switch BG to Cue {i+1}', f'cue_background_{i}'))
 
@@ -206,9 +207,11 @@ class ProjectionMappingApp(QMainWindow):
 
         # Default MIDI Mappings
         self.midi_mappings = {
+            'cue_instrument_0': ('note', 52), 'cue_instrument_1': ('note', 53), 'cue_instrument_2': ('note', 54), 'cue_instrument_3': ('note', 55),
             'cue_amp_0': ('note', 60), 'cue_amp_1': ('note', 61), 'cue_amp_2': ('note', 62), 'cue_amp_3': ('note', 63),
             'cue_background_0': ('note', 72), 'cue_background_1': ('note', 73), 'cue_background_2': ('note', 74), 'cue_background_3': ('note', 75),
-            'toggle_amp': ('note', 48), 'toggle_background': ('note', 50),
+            'toggle_instrument': ('note', 46), 'toggle_amp': ('note', 48), 'toggle_background': ('note', 50),
+            'fx_instrument_strobe': ('cc', 10), 'fx_instrument_blur': ('cc', 11), 'fx_instrument_invert': ('cc', 12), 'fx_instrument_edges': ('cc', 13), 'fx_instrument_tint': ('cc', 14),
             'fx_amp_strobe': ('cc', 20), 'fx_amp_blur': ('cc', 21), 'fx_amp_invert': ('cc', 22), 'fx_amp_edges': ('cc', 23), 'fx_amp_tint': ('cc', 24),
             'fx_background_strobe': ('cc', 30), 'fx_background_blur': ('cc', 31), 'fx_background_invert': ('cc', 32), 'fx_background_edges': ('cc', 33), 'fx_background_tint': ('cc', 34),
         }
@@ -477,7 +480,11 @@ class ProjectionMappingApp(QMainWindow):
             color = Qt.magenta
             if mask.tag == 'background': color = Qt.blue
             elif mask.tag == 'amp': color = Qt.green
+            elif mask.tag == 'instrument': color = Qt.magenta
             self.video_display.set_mask_color(color)
+
+            # Load points for editing/visibility
+            self.video_display.set_mask_points([QPointF(p[0], p[1]) for p in mask.source_points])
 
             # Update LFO UI
             self.lfo_enable_check.setChecked(mask.fx_params.get('lfo_enabled', False))
@@ -846,6 +853,8 @@ class ProjectionMappingApp(QMainWindow):
             self.log(f"Updated existing '{bg_mask.name}' mask with new boundary.")
 
         self.update_cue_table()
+        idx = self.masks.index(bg_mask)
+        self.cue_list_widget.setCurrentRow(idx)
         self.update_mask_combos()
         self.worker.set_masks(self.masks)
 
@@ -1013,6 +1022,8 @@ class ProjectionMappingApp(QMainWindow):
             bg_mask.type = 'static'
             self.worker.set_masks(self.masks)
             self.update_cue_table()
+            idx = self.masks.index(bg_mask)
+            self.cue_list_widget.setCurrentRow(idx)
             self.update_mask_combos()
             self.maybe_auto_save()
 
@@ -1023,11 +1034,11 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_guitar_mask(self):
         mask = None
         for m in self.masks:
-            if m.name == 'Guitar':
+            if m.name == 'Guitar' or m.tag == 'instrument':
                 mask = m
                 break
         if not mask:
-            mask = Mask("Guitar", [], None, tag="amp", mask_type="dynamic")
+            mask = Mask("Guitar", [], None, tag="instrument", mask_type="dynamic")
             self.masks.append(mask)
 
         self.mask_drawing_dialog.setWindowTitle("Draw Detailed Guitar Mask")
@@ -1049,6 +1060,9 @@ class ProjectionMappingApp(QMainWindow):
                 self.link_mask_to_markers(mask)
 
             self.update_cue_table()
+            # Select this mask in the list so Stage tab is ready
+            idx = self.masks.index(mask)
+            self.cue_list_widget.setCurrentRow(idx)
             self.update_mask_combos()
             self.worker.set_masks(self.masks)
             self.maybe_auto_save()
@@ -1056,11 +1070,11 @@ class ProjectionMappingApp(QMainWindow):
     def start_setup_amp_mask(self):
         mask = None
         for m in self.masks:
-            if m.name == 'Amp':
+            if m.name == 'Amp' or m.tag == 'amp':
                 mask = m
                 break
         if not mask:
-            mask = Mask("Amp", [], None, tag="background", mask_type="static")
+            mask = Mask("Amp", [], None, tag="amp", mask_type="static")
             self.masks.append(mask)
 
         self.mask_drawing_dialog.setWindowTitle("Draw Detailed Amp Mask")
@@ -1080,6 +1094,9 @@ class ProjectionMappingApp(QMainWindow):
             mask.type = 'static'
 
             self.update_cue_table()
+            # Select this mask in the list so Stage tab is ready
+            idx = self.masks.index(mask)
+            self.cue_list_widget.setCurrentRow(idx)
             self.update_mask_combos()
             self.worker.set_masks(self.masks)
             self.maybe_auto_save()
@@ -1771,6 +1788,7 @@ class ProjectionMappingApp(QMainWindow):
         if parts[0] == 'mask' and len(parts) >= 3:
             tag = parts[1]
             if tag == 'bg': tag = 'background' # Standardize
+            if tag == 'gt': tag = 'instrument' # Standardize
             action = parts[2]
             val = args[0] if args else 0
 
@@ -2100,7 +2118,11 @@ class ProjectionMappingApp(QMainWindow):
             self.send_midi_feedback(f"{prefix}{i}", val)
 
     def execute_midi_action(self, key, value):
-        if key.startswith('cue_amp_'):
+        if key.startswith('cue_instrument_'):
+            idx = int(key.split('_')[-1])
+            self.worker.switch_cue('instrument', idx)
+            self.send_midi_feedback_for_group('cue_instrument_', idx, 8)
+        elif key.startswith('cue_amp_'):
             idx = int(key.split('_')[-1])
             self.worker.switch_cue('amp', idx)
             self.send_midi_feedback_for_group('cue_amp_', idx, 8)
@@ -2108,6 +2130,9 @@ class ProjectionMappingApp(QMainWindow):
             idx = int(key.split('_')[-1])
             self.worker.switch_cue('background', idx)
             self.send_midi_feedback_for_group('cue_background_', idx, 8)
+        elif key == 'toggle_instrument':
+            self.worker.toggle_mask('instrument', value > 0)
+            self.send_midi_feedback('toggle_instrument', 127 if value > 0 else 0)
         elif key == 'toggle_amp':
             self.worker.toggle_mask('amp', value > 0)
             self.send_midi_feedback('toggle_amp', 127 if value > 0 else 0)
@@ -2274,10 +2299,25 @@ class ProjectionMappingApp(QMainWindow):
             return
 
         current_item = self.cue_list_widget.currentItem()
+        mask = None
         if current_item:
             row = self.cue_list_widget.row(current_item)
             mask = self.masks[row]
-        else:
+
+        # If in Wizard, try to find the specific mask for the current step
+        if not mask and self.tabs.currentIndex() == 0:
+            target_name = None
+            if self.setup_step == 1: target_name = "Background"
+            elif self.setup_step == 3: target_name = "Guitar"
+            elif self.setup_step == 4: target_name = "Amp"
+
+            if target_name:
+                for m in self.masks:
+                    if m.name == target_name:
+                        mask = m
+                        break
+
+        if not mask:
             # Creation mode was entered without a selection, or selection was cleared
             new_name = f"Mask {len(self.masks) + 1}"
             mask = Mask(new_name, [], None)
@@ -2305,7 +2345,7 @@ class ProjectionMappingApp(QMainWindow):
                 if not mask.name or mask.name.startswith("Mask"):
                     mask.name = 'Background'
             elif self.setup_step == 3: # Guitar Mask step
-                mask.tag = 'amp'
+                mask.tag = 'instrument'
                 mask.type = 'dynamic'
                 if not mask.name or mask.name.startswith("Mask"):
                     mask.name = 'Guitar'
@@ -2313,7 +2353,7 @@ class ProjectionMappingApp(QMainWindow):
                 if self.selected_markers and not mask.is_linked:
                      self.link_mask_to_markers(mask)
             elif self.setup_step == 4: # Amp Mask step
-                mask.tag = 'background'
+                mask.tag = 'amp'
                 mask.type = 'static'
                 if not mask.name or mask.name.startswith("Mask"):
                     mask.name = 'Amp'

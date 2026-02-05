@@ -313,9 +313,16 @@ class VideoDisplay(QWidget):
             painter.drawRect(x, y, sw, sh)
             painter.drawText(x + 10, y + 20, "Waiting for Camera...")
 
-        if self.mask_creation_mode and self.mask_points:
-            painter.setPen(QPen(self.current_mask_color, 2))
-            painter.setBrush(QBrush(self.current_mask_color, Qt.Dense6Pattern))
+        if self.mask_points:
+            is_editing = self.mask_creation_mode
+            pen_width = 3 if is_editing else 1
+            alpha = 150 if is_editing else 80
+
+            color = QColor(self.current_mask_color)
+            color.setAlpha(alpha)
+
+            painter.setPen(QPen(color, pen_width))
+            painter.setBrush(QBrush(color, Qt.Dense6Pattern if is_editing else Qt.NoBrush))
 
             # Denormalize mask points for drawing
             draw_pts = []
@@ -325,13 +332,16 @@ class VideoDisplay(QWidget):
                 dy = y + (p.y() * sh)
                 draw_pts.append(QPoint(int(dx), int(dy)))
 
-            poly = QPolygon(draw_pts)
-            painter.drawPolygon(poly)
+            if len(draw_pts) >= 2:
+                poly = QPolygon(draw_pts)
+                painter.drawPolygon(poly)
 
-            # Draw handles
-            painter.setBrush(Qt.white)
-            for pt in draw_pts:
-                painter.drawEllipse(pt, 5, 5)
+            # Draw handles only when editing
+            if is_editing:
+                painter.setBrush(Qt.white)
+                painter.setPen(QPen(Qt.black, 1))
+                for pt in draw_pts:
+                    painter.drawEllipse(pt, 6, 6)
     
     def mousePressEvent(self, event):
         if self.mask_creation_mode:

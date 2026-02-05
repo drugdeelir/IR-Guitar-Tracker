@@ -118,6 +118,12 @@ class TrackingThread(QThread):
                         w_req, h_req = self.worker.requested_camera_res
                         main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                         main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
+
+                        # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
+                        # Note: behavior is backend dependent. 1/0.25 usually means manual.
+                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                        main_cap.set(cv2.CAP_PROP_GAIN, 0)
+
                         # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -911,7 +917,12 @@ class Worker(QObject):
                     T_roi = np.array([[1, 0, roi_x], [0, 1, roi_y], [0, 0, 1]], dtype=np.float32)
                     M_roi_to_proj = M_cam_to_proj @ T_roi
                     try:
-                        proj_mask = cv2.warpPerspective(self.last_projected_frame_for_masking, M_roi_to_proj, (roi_w, roi_h))
+                        # Performance: warp at lower resolution for interference masking
+                        mask_w, mask_h = max(32, roi_w // 4), max(32, roi_h // 4)
+                        T_scale = np.array([[mask_w/roi_w, 0, 0], [0, mask_h/roi_h, 0], [0, 0, 1]], dtype=np.float32)
+                        proj_mask_small = cv2.warpPerspective(self.last_projected_frame_for_masking, T_scale @ M_roi_to_proj, (mask_w, mask_h))
+                        proj_mask = cv2.resize(proj_mask_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
+
                         # Aggressive suppression (0.6) because user is not using an IR-pass filter
                         gray = cv2.subtract(gray, (proj_mask.astype(np.float32) * 0.6).astype(np.uint8))
                     except: pass
@@ -1031,8 +1042,8 @@ class Worker(QObject):
                 detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
 
             num_markers = len(marker_cfg)
-            # Increased limit to 25 to ensure real markers aren't crowded out by projector noise
-            limit = 25
+            # Limit search to top candidates to keep CPU usage low
+            limit = 15
             points_to_check = detected_points[:limit]
 
             best_match = None
@@ -1104,6 +1115,7 @@ class Worker(QObject):
 
                                     # Geometric sanity check: Check determinant to avoid mirrors/flips
                                     det = np.linalg.det(m[:2, :2])
+                                    if det <= 0.1: continue # Quick prune
 
                                     # Fingerprint check: internal distances should match
                                     combo_distances = []
@@ -1129,7 +1141,7 @@ class Worker(QObject):
                                     # Increased stickiness weight to prioritize temporal continuity over visual exactness
                                     total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0)
 
-                                    if det > 0.1 and total_cost < best_overall_error:
+                                    if total_cost < best_overall_error:
                                         best_overall_error = total_cost
                                         best_match = list(p)
                                         best_matrix = m
@@ -1185,7 +1197,7 @@ class Worker(QObject):
                     # For a guitar, moving > 8% of screen width in one frame is unlikely
                     if np.linalg.norm(curr_center - prev_center) > 0.08:
                         self.confidence = max(0.0, self.confidence - 0.2)
-                        return self.last_tracked_points
+                        return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
                 # Kalman Correction
                 kalman_pts = []
@@ -1198,7 +1210,8 @@ class Worker(QObject):
                     kalman_pts.append((state[0, 0], state[1, 0]))
 
                 if len(kalman_pts) < len(marker_cfg):
-                    return self.last_tracked_points if self.last_tracked_points else detected_points
+                    pts = self.last_tracked_points if self.last_tracked_points else detected_points
+                    return (pts, []) if return_rejected else pts
 
                 new_points_arr = np.array(kalman_pts, dtype=np.float32)
 
@@ -1207,7 +1220,7 @@ class Worker(QObject):
                     dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
                     if dist > 0.06: # Significant jump detected (lowered for better stability)
                         self.confidence = max(0.0, self.confidence - 0.15)
-                        return self.last_tracked_points
+                        return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
                 # High-Distance Temporal Smoothing with Adaptive Alpha & Deadband
                 if self.smoothed_points is None:
@@ -1220,7 +1233,7 @@ class Worker(QObject):
                     # Deadband: if movement is microscopic, ignore it to prevent static jitter
                     # Increased for high-res stability
                     if move_dist < 0.0035:
-                        return self.last_tracked_points
+                        return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
                     # Adaptive Alpha: lower when still, higher when moving
                     # base_alpha for stillness
@@ -1261,7 +1274,7 @@ class Worker(QObject):
 
                 self.confidence = min(1.0, self.confidence + self.confidence_gain)
                 self.last_tracked_points = [tuple(p) for p in avg_points]
-                return self.last_tracked_points
+                return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
         if self.last_tracked_points is not None:
             if roi_x != 0 or roi_y != 0 or roi_w != w or roi_h != h:
@@ -1924,10 +1937,21 @@ class Worker(QObject):
                             design_m_3ch = cv2.merge([design_m, design_m, design_m])
                             frame_cue = cv2.bitwise_and(frame_cue, design_m_3ch)
 
+                        # Safety Fallback
+                        is_safe = True
+                        if mask.type == 'dynamic' and curr_confidence < 0.2 and self.safety_mode_enabled:
+                            is_safe = False
+                            # Override frame with fallback generator
+                            frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
+
                         effective_frame_cue = frame_cue
-                        if mask.type == 'dynamic':
+                        if mask.type == 'dynamic' and mask.is_linked:
+                            # Only fade out tracked masks when tracking is shaky
                             if curr_confidence < 1.0:
-                                effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=curr_confidence)
+                                # Ensure it doesn't go totally black if safety fallback is active
+                                min_vis = 0.4 if not is_safe else 0.0
+                                alpha = max(min_vis, curr_confidence)
+                                effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=alpha)
 
                         effective_opacity = mask.opacity * curr_fade
                         if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
@@ -1935,13 +1959,6 @@ class Worker(QObject):
 
                         if effective_opacity < 1.0:
                             effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
-
-                        # Safety Fallback
-                        is_safe = True
-                        if mask.type == 'dynamic' and curr_confidence < 0.2 and self.safety_mode_enabled:
-                            is_safe = False
-                            # Override frame with fallback generator
-                            frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
 
                         # Static Caching Check
                         cache_key = (mask_id, tuple(map(tuple, mask.source_points)))
