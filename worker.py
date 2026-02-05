@@ -256,18 +256,18 @@ class Worker(QObject):
         self.last_homography_internal = None
         self.confidence_internal = 0.0
         self.marker_fingerprint = []
-        self.roi_padding = 50
+        self.roi_padding = 100 # Increased for high-res FOV
         self.tracking_mutex = QMutex()
 
         # Smoothing and Confidence
         self.kalman_filters = []
         self.smoothed_points = None
-        self.smoothing_factor = 0.5 # Lowered for more direct response
+        self.smoothing_factor = 0.8 # Increased for better stability/smoothing as requested
         self.history_points = []
-        self.history_len = 8 # Balanced stability and responsiveness for live performance
+        self.history_len = 20 # Increased for maximum stability as requested
         self.confidence = 0.0
-        self.confidence_gain = 0.2
-        self.confidence_decay = 0.1
+        self.confidence_gain = 0.25
+        self.confidence_decay = 0.05
 
         # Crossfade management
         self.fades = {}
@@ -417,9 +417,9 @@ class Worker(QObject):
             kf = cv2.KalmanFilter(4, 2)
             kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
             kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
-            # Even higher stability: trust the model more for stationary objects
-            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.001
-            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.05
+            # Maximum stability: trust the model heavily to avoid jitter
+            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.0001
+            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
             kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
             self.kalman_filters.append(kf)
 
@@ -883,16 +883,19 @@ class Worker(QObject):
             marker_fp = self.marker_fingerprint if self.marker_fingerprint is not None else []
 
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
+        # Scale padding with resolution for wide setups
+        dynamic_padding = max(self.roi_padding, int(w * 0.03))
+
         if not force_full and self.last_tracked_points is not None:
             # pts are normalized
             pts = np.array(self.last_tracked_points)
             min_x, min_y = np.min(pts, axis=0)
             max_x, max_y = np.max(pts, axis=0)
             # Convert to pixels for ROI calculation
-            roi_x = max(0, int(min_x * w - self.roi_padding))
-            roi_y = max(0, int(min_y * h - self.roi_padding))
-            roi_w = min(w - roi_x, int((max_x - min_x) * w + 2 * self.roi_padding))
-            roi_h = min(h - roi_y, int((max_y - min_y) * h + 2 * self.roi_padding))
+            roi_x = max(0, int(min_x * w - dynamic_padding))
+            roi_y = max(0, int(min_y * h - dynamic_padding))
+            roi_w = min(w - roi_x, int((max_x - min_x) * w + 2 * dynamic_padding))
+            roi_h = min(h - roi_y, int((max_y - min_y) * h + 2 * dynamic_padding))
 
         roi_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
@@ -909,13 +912,14 @@ class Worker(QObject):
                     M_roi_to_proj = M_cam_to_proj @ T_roi
                     try:
                         proj_mask = cv2.warpPerspective(self.last_projected_frame_for_masking, M_roi_to_proj, (roi_w, roi_h))
-                        # Suppress projector light. We use a conservative factor (0.4) to avoid over-masking markers.
-                        gray = cv2.subtract(gray, (proj_mask.astype(np.float32) * 0.4).astype(np.uint8))
+                        # Aggressive suppression (0.6) because user is not using an IR-pass filter
+                        gray = cv2.subtract(gray, (proj_mask.astype(np.float32) * 0.6).astype(np.uint8))
                     except: pass
 
         # 2. Advanced Pre-processing to fight projector washout
-        # Top-Hat transform extracts small bright spots (markers) while ignoring large areas of projector light
-        th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+        # Scale Top-Hat kernel with resolution to avoid hollowing out large markers
+        th_size = max(25, int(w / 120))
+        th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_size, th_size))
         tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, th_kernel)
 
         # Combine Top-Hat with original gray to maintain peak intensity
@@ -945,11 +949,12 @@ class Worker(QObject):
         rejected_points_raw = []
 
         # Min circularity: more lenient for still capture, strict for live tracking
-        min_circ = 0.40 if force_full else 0.75
+        min_circ = 0.45 if force_full else 0.85
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if 1 <= area < 800:
+            # Increased max_area to 15000 for high-res 4K+ camera feeds
+            if 1 <= area < 15000:
                 # Calculate circularity
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
@@ -1118,7 +1123,8 @@ class Worker(QObject):
                                         for i in range(num_markers):
                                             stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(self.last_tracked_points[i]))
 
-                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 2.0)
+                                    # Increased stickiness weight to prioritize temporal continuity over visual exactness
+                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 5.0)
 
                                     if det > 0.1 and total_cost < best_overall_error:
                                         best_overall_error = total_cost
@@ -1209,7 +1215,8 @@ class Worker(QObject):
                     move_dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
 
                     # Deadband: if movement is microscopic, ignore it to prevent static jitter
-                    if move_dist < 0.0025:
+                    # Increased for high-res stability
+                    if move_dist < 0.0035:
                         return self.last_tracked_points
 
                     # Adaptive Alpha: lower when still, higher when moving
