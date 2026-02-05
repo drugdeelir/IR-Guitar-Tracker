@@ -187,10 +187,12 @@ class VideoDisplay(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMouseTracking(True)
         self.mask_creation_mode = False
         self.snap_to_markers = False # Default to False for better drawing experience
         self.mask_points = []
         self.detected_markers = []
+        self.hover_pos = None
         self.current_pixmap = None
         self.current_mask_color = Qt.magenta
         self.dragging_idx = -1
@@ -229,6 +231,36 @@ class VideoDisplay(QWidget):
 
         if self.current_pixmap:
             painter.drawPixmap(x, y, scaled_pixmap)
+
+            # Draw detected IR markers as subtle hints
+            painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
+            painter.setBrush(QBrush(QColor(0, 255, 0, 40)))
+            for marker in self.detected_markers:
+                mx = x + marker[0] * sw
+                my = y + marker[1] * sh
+                painter.drawEllipse(QPointF(mx, my), 8, 8)
+
+            # Draw snap preview
+            if self.mask_creation_mode and self.snap_to_markers and self.hover_pos:
+                px, py = self.map_to_pixmap(self.hover_pos)
+                if 0 <= px < pix_w and 0 <= py < pix_h:
+                    snap_radius = max(20, int(pix_w * 0.04))
+                    best_m = None
+                    min_d = snap_radius
+                    for marker in self.detected_markers:
+                        m_pt = QPoint(int(marker[0] * pix_w), int(marker[1] * pix_h))
+                        dist = (QPoint(int(px), int(py)) - m_pt).manhattanLength()
+                        if dist < min_d:
+                            min_d = dist
+                            best_m = marker
+
+                    if best_m:
+                        smx = x + best_m[0] * sw
+                        smy = y + best_m[1] * sh
+                        painter.setPen(QPen(Qt.yellow, 2, Qt.DotLine))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawEllipse(QPointF(smx, smy), 15, 15)
+
         else:
             # Draw a dark gray rectangle to represent the camera FOV
             painter.fillRect(x, y, sw, sh, QColor(30, 30, 30))
@@ -298,11 +330,13 @@ class VideoDisplay(QWidget):
                 self.update()
 
     def mouseMoveEvent(self, event):
-        if self.mask_creation_mode and self.dragging_idx != -1:
-            if not self.current_pixmap: return
-            pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
-            px, py = self.map_to_pixmap(event.pos())
-            self.mask_points[self.dragging_idx] = QPointF(px / pix_w, py / pix_h)
+        self.hover_pos = event.pos()
+        if self.mask_creation_mode:
+            if self.dragging_idx != -1:
+                if not self.current_pixmap: return
+                pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
+                px, py = self.map_to_pixmap(event.pos())
+                self.mask_points[self.dragging_idx] = QPointF(px / pix_w, py / pix_h)
             self.update()
 
     def mouseReleaseEvent(self, event):

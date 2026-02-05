@@ -656,6 +656,9 @@ class Worker(QObject):
         processed = frame
         h, w = processed.shape[:2]
 
+        # Calculate resolution scale factor (based on 1280x720 reference)
+        res_scale = np.sqrt((w * h) / (1280 * 720))
+
         # 1. Transform/Mirror FX
         if not live_only:
             if 'mirror_h' in mask.active_fx:
@@ -685,7 +688,7 @@ class Worker(QObject):
             if self.proximity_mode == 'rgb_shift': mod = self.proximity_val
             if 'rgb_shift' in self.audio_param_mappings:
                 mod *= (self.audio_bands[self.audio_param_mappings['rgb_shift']] * 5)
-            shift = int(10 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
+            shift = int(10 * res_scale * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
             if shift != 0:
                 b, g, r = cv2.split(processed)
                 b = np.roll(b, shift, axis=1)
@@ -697,9 +700,10 @@ class Worker(QObject):
             if self.proximity_mode == 'glitch': mod = self.proximity_val
             if self.audio_reactive_target == 'glitch': mod *= (self.audio_bands[0] * 2)
             for _ in range(int(3 * mod)):
-                gy = np.random.randint(0, max(1, h-10))
-                gsh = np.random.randint(-20, 20)
-                processed[gy:gy+10, :] = np.roll(processed[gy:gy+10, :], gsh, axis=1)
+                g_h = int(10 * res_scale)
+                gy = np.random.randint(0, max(1, h - g_h))
+                gsh = int(np.random.randint(-20, 20) * res_scale)
+                processed[gy:gy+g_h, :] = np.roll(processed[gy:gy+g_h, :], gsh, axis=1)
 
         if 'trails' in mask.active_fx:
             if mask_id in self.trail_buffers:
@@ -727,7 +731,7 @@ class Worker(QObject):
                 mod = 1.0
                 if 'blur' in self.audio_param_mappings:
                     mod *= (self.audio_bands[self.audio_param_mappings['blur']] * 3)
-                base_size = 15 * (1.0 - self.throttle_level * 0.8)
+                base_size = 15 * res_scale * (1.0 - self.throttle_level * 0.8)
                 ksize = int(base_size * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'blur' else 1.0))
                 if ksize % 2 == 0: ksize += 1
                 if ksize > 1:
@@ -764,7 +768,7 @@ class Worker(QObject):
                 processed = cv2.LUT(cv2.merge([gray, gray, gray]), lut)
 
             if 'pixelate' in mask.active_fx:
-                div = 16
+                div = max(2, int(16 * res_scale))
                 small = cv2.resize(processed, (max(1, w // div), max(1, h // div)), interpolation=cv2.INTER_NEAREST)
                 processed = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
@@ -783,22 +787,26 @@ class Worker(QObject):
 
             if 'matrix' in mask.active_fx:
                 t = time.time()
-                for x in range(0, w, 15):
+                m_step = int(15 * res_scale)
+                m_font = 0.4 * res_scale
+                for x in range(0, w, m_step):
                     speed = 1.0 + (np.sin(x) * 0.5 + 0.5)
-                    y = int((t * 200 * speed) % (h + 100)) - 100
+                    y = int((t * 200 * res_scale * speed) % (h + 100 * res_scale)) - int(100 * res_scale)
                     for i in range(10):
                         alpha = (10 - i) / 10.0
                         color = (0, int(255 * alpha), 0)
-                        cv2.putText(processed, chr(np.random.randint(33, 126)), (x, y - i*15),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                        cv2.putText(processed, chr(np.random.randint(33, 126)), (x, int(y - i*15*res_scale)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, m_font, color, 1)
 
             if 'vhs' in mask.active_fx:
-                jitter = np.random.randint(-5, 5)
+                jitter = int(np.random.randint(-5, 5) * res_scale)
                 processed = np.roll(processed, jitter, axis=1)
                 y = np.random.randint(0, h)
-                processed[y:y+2, :] = cv2.add(processed[y:y+2, :], (50, 50, 50, 0))
+                v_h = max(1, int(2 * res_scale))
+                processed[y:y+v_h, :] = cv2.add(processed[y:y+v_h, :], (50, 50, 50, 0))
                 b, g, r = cv2.split(processed)
-                r = np.roll(r, 3, axis=1)
+                v_shift = max(1, int(3 * res_scale))
+                r = np.roll(r, v_shift, axis=1)
                 processed = cv2.merge([b, g, r])
 
             if 'scanline' in mask.active_fx:
@@ -2033,11 +2041,14 @@ class Worker(QObject):
 
     def draw_particles(self, frame):
         if self.particle_preset == 'none': return
+        h, w = frame.shape[:2]
+        res_scale = np.sqrt((w * h) / (1280 * 720))
         for p in self.particles:
             color = (0, 255, 0) if self.particle_preset == 'rain' else (255, 255, 200)
             alpha = int(p['life'] * 255)
+            p_size = max(1, int(2 * res_scale))
             # Use anti-aliasing for smoother particles
-            cv2.circle(frame, (int(p['x']), int(p['y'])), 2, color, -1, cv2.LINE_AA)
+            cv2.circle(frame, (int(p['x']), int(p['y'])), p_size, color, -1, cv2.LINE_AA)
 
     def get_vj_generator(self, pattern, h, w):
         # Performance: Render generators at lower resolution if throttled

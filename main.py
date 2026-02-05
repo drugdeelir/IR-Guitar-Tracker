@@ -7,7 +7,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
                              QDialog, QFormLayout, QInputDialog, QTabWidget, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea)
+                             QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea,
+                             QProgressBar)
 from PyQt5.QtGui import QPixmap, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor
@@ -268,6 +269,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.status_update.connect(lambda msg: self.statusBar().showMessage(msg, 0))
         self.worker.calibration_complete.connect(self.handle_calibration_complete)
         self.worker.boundary_detected.connect(self.handle_boundary_detected)
+        self.worker.trackers_ready.connect(self.update_confidence_ui)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
@@ -623,19 +625,37 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_status_label.setStyleSheet("color: #ff5252; font-weight: bold;")
         self.setup_group_layout.addWidget(self.setup_status_label)
 
+        # Confidence Bar for setup
+        self.setup_conf_label = QLabel("Tracking Confidence:")
+        self.setup_group_layout.addWidget(self.setup_conf_label)
+        self.setup_conf_bar = QProgressBar()
+        self.setup_conf_bar.setRange(0, 100)
+        self.setup_conf_bar.setTextVisible(False)
+        self.setup_conf_bar.setStyleSheet("QProgressBar::chunk { background-color: #d500f9; }")
+        self.setup_group_layout.addWidget(self.setup_conf_bar)
+
         self.load_template_btn = QPushButton("OR: Load Existing Template / Project")
         self.load_template_btn.clicked.connect(self.load_project)
         self.load_template_btn.setStyleSheet("background-color: #311b92; color: white; margin-top: 40px;")
         self.setup_group_layout.addWidget(self.load_template_btn)
+
+        nav_layout = QHBoxLayout()
+        self.setup_back_btn = QPushButton("Previous Step")
+        self.setup_back_btn.setMinimumHeight(80)
+        self.setup_back_btn.clicked.connect(self.prev_setup_step)
+        self.setup_back_btn.setEnabled(False)
 
         self.setup_next_btn = QPushButton("Next Step")
         self.setup_next_btn.setMinimumHeight(80)
         self.setup_next_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
         self.setup_next_btn.clicked.connect(self.next_setup_step)
 
+        nav_layout.addWidget(self.setup_back_btn)
+        nav_layout.addWidget(self.setup_next_btn)
+
         self.setup_group.setLayout(self.setup_group_layout)
         self.setup_layout.addWidget(self.setup_group)
-        self.setup_layout.addWidget(self.setup_next_btn)
+        self.setup_layout.addLayout(nav_layout)
 
         self.setup_layout.addStretch()
         self.tabs.insertTab(0, self.setup_scroll, "Setup Wizard")
@@ -747,6 +767,14 @@ class ProjectionMappingApp(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
 
+    def update_confidence_ui(self, points):
+        conf = getattr(self.worker, 'confidence', 0.0)
+        val = int(conf * 100)
+        if hasattr(self, 'setup_conf_bar'):
+            self.setup_conf_bar.setValue(val)
+        if hasattr(self, 'workspace_conf_bar'):
+            self.workspace_conf_bar.setValue(val)
+
     def handle_boundary_detected(self, points):
         if not points:
             self.statusBar().showMessage("Boundary Detection Failed! Ensure camera sees projector.", 5000)
@@ -780,11 +808,19 @@ class ProjectionMappingApp(QMainWindow):
                     self.setup_status_label.setStyleSheet("color: #00c853; font-weight: bold;")
             except RuntimeError: pass
 
+    def prev_setup_step(self):
+        if self.setup_step > 0:
+            self.setup_step -= 2 # Decrement by 2 because next_setup_step will increment by 1
+            self.next_setup_step()
+
     def next_setup_step(self):
         # Ensure any active calibration is stopped before moving to next step
         self.worker.stop_calibration()
 
         self.setup_step += 1
+        if hasattr(self, 'setup_back_btn'):
+            self.setup_back_btn.setEnabled(self.setup_step > 0)
+
         self.clear_setup_layout()
 
         # Add common instruction label back
@@ -1076,6 +1112,15 @@ class ProjectionMappingApp(QMainWindow):
         # Tracking & Link in Workspace
         self.tracking_section = QGroupBox("Tracking && Link")
         link_layout = QVBoxLayout()
+
+        # Workspace Confidence
+        link_layout.addWidget(QLabel("Tracking Confidence:"))
+        self.workspace_conf_bar = QProgressBar()
+        self.workspace_conf_bar.setRange(0, 100)
+        self.workspace_conf_bar.setTextVisible(False)
+        self.workspace_conf_bar.setFixedHeight(10)
+        self.workspace_conf_bar.setStyleSheet("QProgressBar::chunk { background-color: #d500f9; }")
+        link_layout.addWidget(self.workspace_conf_bar)
 
         self.workspace_link_mask_combo = QComboBox()
         self.workspace_link_mask_combo.setMinimumHeight(30)
@@ -1656,6 +1701,14 @@ class ProjectionMappingApp(QMainWindow):
 
         if filename:
             import base64
+            import os
+            import shutil
+            # Create a backup of the existing project file
+            if os.path.exists(filename):
+                try:
+                    shutil.copy2(filename, filename + ".bak")
+                except Exception as e:
+                    print(f"Backup failed: {e}")
             self.current_project_path = filename
 
             ref_frame_b64 = None
@@ -2314,6 +2367,12 @@ class ProjectionMappingApp(QMainWindow):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.showNormal()
+        elif event.key() == Qt.Key_B:
+            self.toggle_blackout()
+        elif event.key() == Qt.Key_S:
+            self.splash_check.setChecked(not self.splash_check.isChecked())
+        elif event.key() == Qt.Key_Space:
+            self.toggle_selected_cue()
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
