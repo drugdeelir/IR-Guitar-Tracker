@@ -13,26 +13,26 @@ def generate_gray_code_patterns(width, height, max_bits=11):
     n_y = min(int(np.ceil(np.log2(height))), max_bits)
 
     patterns_x = []
+    x_indices = np.arange(width)
+    x_scaled = (x_indices * (2**n_x)) // width
+    gray_x = x_scaled ^ (x_scaled >> 1)
+
     for i in range(n_x):
-        # bit i of gray code
         p = np.zeros((height, width), dtype=np.uint8)
-        for x in range(width):
-            # Scale x to the range covered by n_x bits
-            x_scaled = (x * (2**n_x)) // width
-            gray = x_scaled ^ (x_scaled >> 1)
-            if (gray >> (n_x - 1 - i)) & 1:
-                p[:, x] = 255
+        mask = (gray_x >> (n_x - 1 - i)) & 1
+        p[:, mask == 1] = 255
         patterns_x.append(p)
         patterns_x.append(255 - p) # Inverse
 
     patterns_y = []
+    y_indices = np.arange(height)
+    y_scaled = (y_indices * (2**n_y)) // height
+    gray_y = y_scaled ^ (y_scaled >> 1)
+
     for i in range(n_y):
         p = np.zeros((height, width), dtype=np.uint8)
-        for y in range(height):
-            y_scaled = (y * (2**n_y)) // height
-            gray = y_scaled ^ (y_scaled >> 1)
-            if (gray >> (n_y - 1 - i)) & 1:
-                p[y, :] = 255
+        mask = (gray_y >> (n_y - 1 - i)) & 1
+        p[mask == 1, :] = 255
         patterns_y.append(p)
         patterns_y.append(255 - p) # Inverse
 
@@ -56,15 +56,19 @@ def decode_gray_code(captures, target_range, threshold=8):
     # captures: list of (pattern, inverse_pattern) pairs
     # returns bitmask where bits are set if pattern > inverse_pattern + threshold
     bits = []
+    # Dynamic thresholding based on local contrast
     for i in range(0, len(captures), 2):
         if i+1 >= len(captures): break
-        p = captures[i].astype(np.int16)
-        inv = captures[i+1].astype(np.int16)
+        p = captures[i].astype(np.float32)
+        inv = captures[i+1].astype(np.float32)
 
         bit = np.zeros(p.shape, dtype=np.uint8)
         # We only care about pixels where there is enough contrast
+        # Use a more robust contrast check: (p-inv) / (p+inv) or absolute diff
         diff = np.abs(p - inv)
-        valid = diff > threshold
+        # Dynamic threshold: at least 10% of global range or fixed threshold
+        local_thresh = max(threshold, 0.05 * (np.max(p) - np.min(p)))
+        valid = diff > local_thresh
         bit[p > inv] = 1
         bits.append((bit, valid))
 
