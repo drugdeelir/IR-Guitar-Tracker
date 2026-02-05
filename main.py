@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QProgressBar, QPlainTextEdit, QGridLayout)
 from PyQt5.QtGui import QPixmap, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl, QDateTime
-from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor
+from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor, MaskDrawingDialog
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
@@ -289,7 +289,8 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.boundary_detected.connect(self.handle_boundary_detected)
         self.worker.trackers_ready.connect(self.update_confidence_ui)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
-        self.worker.still_frame_ready.connect(self.set_marker_selection_image)
+        self.mask_drawing_dialog = MaskDrawingDialog(self)
+        self.worker.still_frame_ready.connect(self.handle_still_frame_ready)
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
@@ -579,9 +580,12 @@ class ProjectionMappingApp(QMainWindow):
             self.marker_selection_dialog.take_picture_button.setEnabled(True)
             self.worker.capture_still_frame()
 
-    def set_marker_selection_image(self, image, points):
-        guide_pts = self.worker.marker_config if hasattr(self.worker, 'marker_config') else None
-        self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points, guide_pts)
+    def handle_still_frame_ready(self, image, points):
+        if self.marker_selection_dialog.isVisible():
+            guide_pts = self.worker.marker_config if hasattr(self.worker, 'marker_config') else None
+            self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points, guide_pts)
+        elif self.mask_drawing_dialog.isVisible():
+            self.mask_drawing_dialog.set_image(image)
 
     def clear_marker_selection(self):
         self.selected_markers = []
@@ -811,9 +815,10 @@ class ProjectionMappingApp(QMainWindow):
 
     def handle_boundary_detected(self, points):
         if not points:
-            self.statusBar().showMessage("Boundary Detection Failed! Ensure camera sees projector.", 5000)
-            self.log("Error: Projector boundary detection failed. Is the camera seeing the projection?")
-            return
+            self.statusBar().showMessage("Boundary Detection Rough/Failed. Using full frame fallback.", 5000)
+            self.log("Warning: Projector boundary detection failed or was very small. Using full FOV as fallback.")
+            # Fallback to full normalized screen
+            points = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 
         self.statusBar().showMessage(f"Detected Projector Boundary with {len(points)} points.", 3000)
         self.log(f"Auto-Scan: Detected projector usable area ({len(points)} points). Creating background mask...")
@@ -998,54 +1003,68 @@ class ProjectionMappingApp(QMainWindow):
             self.start_setup_amp_mask()
 
     def start_setup_guitar_mask(self):
-        self.video_display.clear_mask_points()
-        self.video_display.set_snap_to_markers(False)
-        if hasattr(self, 'snap_check'):
-            self.snap_check.setChecked(False)
-        self.video_display.set_mask_color(Qt.green)
         mask = None
         for m in self.masks:
             if m.name == 'Guitar':
                 mask = m
                 break
-
         if not mask:
             mask = Mask("Guitar", [], None, tag="amp", mask_type="dynamic")
             self.masks.append(mask)
+
+        self.mask_drawing_dialog.setWindowTitle("Draw Detailed Guitar Mask")
+        self.mask_drawing_dialog.video_display.set_mask_color(Qt.green)
+        self.mask_drawing_dialog.set_points([QPointF(p[0], p[1]) for p in mask.source_points])
+
+        try: self.mask_drawing_dialog.take_picture_button.clicked.disconnect()
+        except: pass
+        self.mask_drawing_dialog.take_picture_button.clicked.connect(self.worker.capture_still_frame)
+
+        self.worker.capture_still_frame()
+
+        if self.mask_drawing_dialog.exec_():
+            points = self.mask_drawing_dialog.get_points()
+            mask.source_points = [(p.x(), p.y()) for p in points]
+            mask.tag = 'amp'
+            mask.type = 'dynamic'
+            if self.selected_markers and not mask.is_linked:
+                self.link_mask_to_markers(mask)
+
             self.update_cue_table()
             self.update_mask_combos()
-
-        idx = self.masks.index(mask)
-        self.cue_list_widget.setCurrentRow(idx)
-        self.mask_tag_combo.setCurrentText("amp")
-        self.mask_type_combo.setCurrentText("dynamic")
-        self.add_wizard_finish_button()
-        self.enter_mask_creation_mode()
+            self.worker.set_masks(self.masks)
+            self.maybe_auto_save()
 
     def start_setup_amp_mask(self):
-        self.video_display.clear_mask_points()
-        self.video_display.set_snap_to_markers(False)
-        if hasattr(self, 'snap_check'):
-            self.snap_check.setChecked(False)
-        self.video_display.set_mask_color(Qt.cyan)
         mask = None
         for m in self.masks:
             if m.name == 'Amp':
                 mask = m
                 break
-
         if not mask:
             mask = Mask("Amp", [], None, tag="background", mask_type="static")
             self.masks.append(mask)
+
+        self.mask_drawing_dialog.setWindowTitle("Draw Detailed Amp Mask")
+        self.mask_drawing_dialog.video_display.set_mask_color(Qt.cyan)
+        self.mask_drawing_dialog.set_points([QPointF(p[0], p[1]) for p in mask.source_points])
+
+        try: self.mask_drawing_dialog.take_picture_button.clicked.disconnect()
+        except: pass
+        self.mask_drawing_dialog.take_picture_button.clicked.connect(self.worker.capture_still_frame)
+
+        self.worker.capture_still_frame()
+
+        if self.mask_drawing_dialog.exec_():
+            points = self.mask_drawing_dialog.get_points()
+            mask.source_points = [(p.x(), p.y()) for p in points]
+            mask.tag = 'background'
+            mask.type = 'static'
+
             self.update_cue_table()
             self.update_mask_combos()
-
-        idx = self.masks.index(mask)
-        self.cue_list_widget.setCurrentRow(idx)
-        self.mask_tag_combo.setCurrentText("background")
-        self.mask_type_combo.setCurrentText("static")
-        self.add_wizard_finish_button()
-        self.enter_mask_creation_mode()
+            self.worker.set_masks(self.masks)
+            self.maybe_auto_save()
 
     def enter_performance_mode(self):
         # Switch to the Stage tab (which has basic performance controls)

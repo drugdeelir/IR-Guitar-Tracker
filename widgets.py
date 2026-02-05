@@ -182,6 +182,41 @@ class MarkerSelectionDialog(QDialog):
         self.image_label.selected_points = []
         self.image_label.update()
 
+class MaskDrawingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Draw Detailed Mask")
+        self.setMinimumSize(1000, 800)
+
+        self.layout = QVBoxLayout(self)
+        self.video_display = VideoDisplay()
+        self.video_display.set_mask_creation_mode(True)
+
+        self.take_picture_button = QPushButton("Capture High-Res Frame")
+
+        self.btn_layout = QHBoxLayout()
+        self.clear_btn = QPushButton("Clear Points")
+        self.clear_btn.clicked.connect(self.video_display.clear_mask_points)
+        self.confirm_btn = QPushButton("Save & Finish")
+        self.confirm_btn.clicked.connect(self.accept)
+        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold;")
+
+        self.btn_layout.addWidget(self.clear_btn)
+        self.btn_layout.addWidget(self.confirm_btn)
+
+        self.layout.addWidget(self.video_display)
+        self.layout.addWidget(self.take_picture_button)
+        self.layout.addLayout(self.btn_layout)
+
+    def set_image(self, qimage):
+        self.video_display.set_image(qimage)
+
+    def get_points(self):
+        return self.video_display.get_mask_points()
+
+    def set_points(self, points):
+        self.video_display.set_mask_points(points)
+
 class VideoDisplay(QWidget):
     mask_point_added = pyqtSignal(QPointF)
 

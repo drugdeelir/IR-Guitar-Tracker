@@ -263,9 +263,9 @@ class Worker(QObject):
         # Smoothing and Confidence
         self.kalman_filters = []
         self.smoothed_points = None
-        self.smoothing_factor = 0.8 # Increased smoothing for stage distance
+        self.smoothing_factor = 0.5 # Lowered for more direct response
         self.history_points = []
-        self.history_len = 5
+        self.history_len = 3 # Reduced for more direct response
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -420,6 +420,10 @@ class Worker(QObject):
 
     def set_marker_points(self, points):
         """Sets the reference marker configuration. Expects a list of normalized (0.0-1.0) coordinates."""
+        if points is None:
+            self.clear_marker_config()
+            return
+
         with QMutexLocker(self.tracking_mutex):
             # Reset tracking history when markers change
             self.history_points = []
@@ -435,7 +439,7 @@ class Worker(QObject):
                     new_config.append((p[0], p[1]))
 
             self.marker_config = new_config
-            if len(self.marker_config) > 1:
+            if self.marker_config and len(self.marker_config) > 1:
                 self.init_kalman(len(self.marker_config))
                 distances = []
                 for p1, p2 in combinations(self.marker_config, 2):
@@ -867,10 +871,11 @@ class Worker(QObject):
 
     def get_tracked_points(self, frame, force_full=False):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
+        if frame is None: return []
         h, w = frame.shape[:2]
         with QMutexLocker(self.tracking_mutex):
             marker_cfg = self.marker_config
-            marker_fp = self.marker_fingerprint
+            marker_fp = self.marker_fingerprint if self.marker_fingerprint is not None else []
 
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
         if not force_full and self.last_tracked_points is not None:
@@ -897,20 +902,31 @@ class Worker(QObject):
 
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        detected_points = []
+        detected_points_raw = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if 2 < area < 500: # Filter out very large blobs which are likely reflections, not markers
+            if 2 < area < 800:
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
-                    cX = (M["m10"] / M["m00"] + roi_x) / w
-                    cY = (M["m01"] / M["m00"] + roi_y) / h
-                    detected_points.append((cX, cY))
+                    cx_px = int(M["m10"] / M["m00"])
+                    cy_px = int(M["m01"] / M["m00"])
 
-        if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= len(marker_cfg) - 1:
+                    # Sample brightness at centroid
+                    intensity = gray[cy_px, cx_px]
+
+                    cX = (cx_px + roi_x) / w
+                    cY = (cy_px + roi_y) / h
+                    detected_points_raw.append({'pos': (cX, cY), 'intensity': intensity, 'area': area})
+
+        # Sort by intensity (brightest first) then area
+        detected_points_raw.sort(key=lambda x: (x['intensity'], x['area']), reverse=True)
+        detected_points = [x['pos'] for x in detected_points_raw]
+
+        if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= (len(marker_cfg) - 1):
             # OC-TOLERANCE: If we see at least 3 markers (and 1 is missing), we can estimate the guitar pose
+            num_markers = len(marker_cfg)
             # If we were tracking, prioritize points near last known location
-            if self.confidence > 0.2 and self.last_tracked_points:
+            if self.confidence > 0.2 and self.last_tracked_points and len(self.last_tracked_points) > 0:
                 center = np.mean(self.last_tracked_points, axis=0)
                 detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
 
@@ -920,14 +936,17 @@ class Worker(QObject):
 
             best_match = None
             best_matrix = None
-            best_overall_error = float('inf')
+            best_overall_error = 1000.0 # High initial cost
 
             # Try to find a match with N markers first, then N-1
+            # We use list to avoid search_count being a generator or None
             for search_count in [num_markers, num_markers - 1]:
+                if search_count < 3: continue
                 if len(points_to_check) < search_count: continue
 
                 for indices in combinations(range(len(points_to_check)), search_count):
                     point_combo = [points_to_check[i] for i in indices]
+                    if not point_combo: continue
 
                     # If we found all N markers
                     if search_count == num_markers:
@@ -978,11 +997,27 @@ class Worker(QObject):
 
                                     # Geometric sanity check: Check determinant to avoid mirrors/flips
                                     det = np.linalg.det(m[:2, :2])
-                                    if det > 0 and err < best_overall_error:
-                                        best_overall_error = err
+
+                                    # Fingerprint check: internal distances should match
+                                    combo_distances = []
+                                    for p1, p2 in combinations(p, 2):
+                                        combo_distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+                                    combo_fp = sorted(combo_distances)
+
+                                    # Normalized cost: err + fingerprint_mismatch
+                                    # marker_fp check to avoid zip issues
+                                    if marker_fp and len(combo_fp) == len(marker_fp):
+                                        fp_err = np.mean([abs(a - b) for a, b in zip(combo_fp, marker_fp)])
+                                    else:
+                                        fp_err = 0.5 # Penalty for mismatch in length/missing FP
+
+                                    total_cost = err + fp_err * 3.0 # Increased weight on FP
+
+                                    if det > 0.1 and total_cost < best_overall_error:
+                                        best_overall_error = total_cost
                                         best_match = list(p)
                                         best_matrix = m
-                            if best_match and best_overall_error < 0.05: break
+                            if best_match and best_overall_error < 0.04: break
 
                     # If we found N-1 markers
                     elif search_count == num_markers - 1 and self.last_homography is not None:
@@ -1051,8 +1086,13 @@ class Worker(QObject):
                 if self.smoothed_points is None:
                     self.smoothed_points = new_points_arr
                 else:
-                    # Adaptive smoothing based on confidence
-                    alpha = (1.0 - self.smoothing_factor) * (0.5 + self.confidence * 0.5)
+                    # Stricter Alpha: prioritizing new points when confidence is high
+                    # If moving fast, reduce smoothing even more
+                    vel = np.linalg.norm(new_points_arr - self.smoothed_points)
+                    motion_boost = min(0.4, vel * 5.0)
+
+                    alpha = (1.0 - self.smoothing_factor) * (0.4 + self.confidence * 0.6 + motion_boost)
+                    alpha = min(1.0, alpha)
                     self.smoothed_points = self.smoothed_points * (1.0 - alpha) + new_points_arr * alpha
 
                 # Moving Average over history
@@ -1264,36 +1304,39 @@ class Worker(QObject):
                         print("Processing Projector Boundary...")
                         black = self._boundary_captures[0]
                         white = self._boundary_captures[1]
-                        diff = cv2.absdiff(white, black)
 
-                        # Mask out persistent bright spots (like IR markers) from the diff
-                        # They should be bright in both black and white frames.
-                        _, marker_mask = cv2.threshold(black, self.ir_threshold, 255, cv2.THRESH_BINARY)
+                        # Use a more robust diff: max(0, white - black) to ignore things that get DARKER when white is projected
+                        diff = cv2.subtract(white, black)
+
+                        # Mask out persistent bright spots (like IR markers)
+                        # Markers are usually near-saturated in both frames
+                        _, marker_mask = cv2.threshold(black, 230, 255, cv2.THRESH_BINARY)
                         kernel_small = np.ones((3,3), np.uint8)
-                        marker_mask = cv2.dilate(marker_mask, kernel_small, iterations=3)
+                        marker_mask = cv2.dilate(marker_mask, kernel_small, iterations=5)
                         diff[marker_mask > 0] = 0
 
-                        # Use Otsu's thresholding for IR cameras
-                        _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                        # Fallback if Otsu results in near-zero coverage
-                        if np.mean(thresh) < 1.0:
-                             _, thresh = cv2.threshold(diff, 5, 255, cv2.THRESH_BINARY)
+                        # Try adaptive thresholding first for better detail in uneven lighting
+                        thresh = cv2.adaptiveThreshold(diff, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                       cv2.THRESH_BINARY, 21, -5)
+
+                        # Combined with Otsu for global structure
+                        _, otsu = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        thresh = cv2.bitwise_or(thresh, otsu)
 
                         # Clean up
-                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
                         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-                        thresh = cv2.dilate(thresh, kernel, iterations=2)
+                        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+                        thresh = cv2.dilate(thresh, kernel, iterations=3)
 
                         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        if contours:
-                            # Find largest contour
-                            main_contour = max(contours, key=cv2.contourArea)
-                            area_ratio = cv2.contourArea(main_contour) / (w_cam * h_cam)
+                        # Filter contours by size - significantly lowered threshold (0.5% of FOV)
+                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.005)]
 
-                            if area_ratio < 0.05:
-                                msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
-                                self.system_warning.emit(msg)
+                        if valid_contours:
+                            # Find largest contour
+                            main_contour = max(valid_contours, key=cv2.contourArea)
+                            area_ratio = cv2.contourArea(main_contour) / (w_cam * h_cam)
 
                             # Use Convex Hull to ignore internal details and just get the footprint
                             hull = cv2.convexHull(main_contour)
@@ -1375,14 +1418,17 @@ class Worker(QObject):
 
                         # Automatically derive Projector Boundary from SLS valid mask
                         # Clean up the mask aggressively to fill holes and smooth edges
-                        kernel = np.ones((15, 15), np.uint8)
-                        mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_OPEN, kernel)
-                        mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_CLOSE, kernel)
+                        kernel = np.ones((21, 21), np.uint8)
+                        mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
+                        mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
                         mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
 
                         contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        if contours:
-                            main_contour = max(contours, key=cv2.contourArea)
+                        # Filter contours by size
+                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.1)]
+
+                        if valid_contours:
+                            main_contour = max(valid_contours, key=cv2.contourArea)
                             # Use convex hull and force a simple polygon or rectangle
                             hull = cv2.convexHull(main_contour)
                             peri = cv2.arcLength(hull, True)
@@ -1831,15 +1877,15 @@ class Worker(QObject):
                                     mask_img = curr_mask_img
 
                             elif mask.type == 'static' or (mask.type == 'dynamic' and not mask.is_linked):
-                                effective_frame_cue = frame_cue
-
+                                effective_frame_cue = frame_cue.copy()
                                 effective_opacity = mask.opacity
-                            if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
-                                lfo_val = self.get_lfo_value(mask)
-                                effective_opacity *= lfo_val
 
-                            if effective_opacity < 1.0:
-                                effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=effective_opacity)
+                                if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
+                                    lfo_val = self.get_lfo_value(mask)
+                                    effective_opacity *= lfo_val
+
+                                if effective_opacity < 1.0:
+                                    effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
 
                                 if not mask.source_points:
                                     warped_cue = cv2.resize(effective_frame_cue, (w, h))
@@ -1851,19 +1897,22 @@ class Worker(QObject):
 
                                     if len(dst_pts) == 4:
                                         matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-                                    else:
+                                    elif len(dst_pts) >= 3:
                                         min_x, min_y = np.min(dst_pts, axis=0)
                                         max_x, max_y = np.max(dst_pts, axis=0)
                                         bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
                                         matrix = cv2.getPerspectiveTransform(src_pts, bbox_pts)
+                                    else:
+                                        matrix = None
 
-                                    warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
-                                    curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
-                                    cv2.fillPoly(curr_mask_img, [np.int32(dst_pts)], (255, 255, 255))
-                                    if mask.feather > 0:
-                                        k = int(mask.feather) | 1
-                                        cv2.boxFilter(curr_mask_img, -1, (k, k), dst=curr_mask_img)
-                                    mask_img = curr_mask_img
+                                    if matrix is not None:
+                                        warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
+                                        curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
+                                        cv2.fillPoly(curr_mask_img, [np.int32(dst_pts)], (255, 255, 255))
+                                        if mask.feather > 0:
+                                            k = int(mask.feather) | 1
+                                            cv2.boxFilter(curr_mask_img, -1, (k, k), dst=curr_mask_img)
+                                        mask_img = curr_mask_img
 
                             # Store in cache if static
                             if mask.type == 'static' and warped_cue is not None:
@@ -2314,7 +2363,9 @@ class Worker(QObject):
     def stop(self): self._running = False
 
     def run_boundary_detection(self):
-        self.requested_camera_res = (9999, 9999) # Request max FOV
+        # We MUST keep resolution consistent across all setup steps
+        # Use (9999,9999) as a trigger for max available res in TrackingThread
+        self.requested_camera_res = (9999, 9999)
         self._boundary_step = 0
         self._boundary_captures = []
         self._sls_curr_wait = 0
@@ -2327,9 +2378,10 @@ class Worker(QObject):
         self.show_calibration_pattern = False
         self.show_calibration_verify = False
         # Do NOT revert resolution to avoid FOV shift/crop
+        # FOV stability is paramount for projection mapping
 
     def run_auto_calibration(self):
-        self.requested_camera_res = (9999, 9999) # Request max FOV
+        self.requested_camera_res = (9999, 9999)
         self._run_calibration_flag = True
 
     def run_one_click_sync(self):
