@@ -902,8 +902,12 @@ class Worker(QObject):
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
             # Foolproof thresholding: ensure we don't zero out everything if slider is at max
-            effective_threshold = min(self.ir_threshold, 245)
+            effective_threshold = min(self.ir_threshold, 248)
             _, thresh = cv2.threshold(gray, effective_threshold, 255, cv2.THRESH_BINARY)
+
+        # Subtle dilation to ensure small markers are solid
+        kernel = np.ones((3,3), np.uint8)
+        thresh = cv2.dilate(thresh, kernel, iterations=1)
 
         # Using findContours for efficient blob finding
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -912,7 +916,7 @@ class Worker(QObject):
         rejected_points_raw = []
 
         # Min circularity: more lenient for still capture, strict for live tracking
-        min_circ = 0.55 if force_full else 0.82
+        min_circ = 0.40 if force_full else 0.75
 
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -1064,7 +1068,13 @@ class Worker(QObject):
                                     else:
                                         fp_err = 0.5 # Penalty for mismatch in length/missing FP
 
-                                    total_cost = err + fp_err * 5.0 # Increased weight on FP
+                                    # Marker Stickiness: favor points closer to their last known position
+                                    stickiness_err = 0
+                                    if self.last_tracked_points and len(self.last_tracked_points) == num_markers:
+                                        for i in range(num_markers):
+                                            stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(self.last_tracked_points[i]))
+
+                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 2.0)
 
                                     if det > 0.1 and total_cost < best_overall_error:
                                         best_overall_error = total_cost
@@ -1109,7 +1119,7 @@ class Worker(QObject):
                         if best_match: break
                 if best_match: break
 
-            if best_match and best_overall_error < 0.035: # Final threshold for a valid lock (highly tightened)
+            if best_match and best_overall_error < 0.1: # More relaxed to ensure capture in noisy environments
                 # Sanity Check: Filter out sudden jumps (reflections)
                 if self.last_tracked_points is not None and self.confidence > 0.3:
                     prev_center = np.mean(self.last_tracked_points, axis=0)

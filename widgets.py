@@ -32,7 +32,7 @@ class MarkerImageLabel(QLabel):
         px, py = self.map_pos_to_pixmap(event.pos())
         pix_w = self.pix.width()
 
-        snap_threshold = max(60, int(pix_w * 0.08)) # Increased threshold for small IR dots
+        snap_threshold = max(30, int(pix_w * 0.04))
         best_pt = None
         min_dist = snap_threshold
 
@@ -80,7 +80,7 @@ class MarkerImageLabel(QLabel):
             best_pt = click_pt
 
             # Snap logic
-            snap_threshold = max(60, int(pix_w * 0.08)) # Increased threshold for small IR dots
+            snap_threshold = max(30, int(pix_w * 0.04))
             for dp in self.detected_points:
                 dp_pt = QPoint(int(dp[0] * pix_w), int(dp[1] * pix_h))
                 dist = (click_pt - dp_pt).manhattanLength()
@@ -346,8 +346,8 @@ class VideoDisplay(QWidget):
                 click_pt = QPoint(int(px), int(py))
 
                 # Check if we are clicking an existing point to drag
-                # Handle radius relative to width
-                handle_radius = max(10, int(pix_w * 0.02))
+                # Reduced handle radius to allow closer points (1% of width)
+                handle_radius = max(8, int(pix_w * 0.01))
                 for i, p in enumerate(self.mask_points):
                     # Denormalize mask point to pixmap space for distance check
                     pt = QPoint(int(p.x() * pix_w), int(p.y() * pix_h))
@@ -359,7 +359,7 @@ class VideoDisplay(QWidget):
                 snapped_pt = click_pt
                 if self.snap_to_markers:
                     # Snapping radius relative to width
-                    min_dist = max(20, int(pix_w * 0.04))
+                    min_dist = max(15, int(pix_w * 0.02))
                     for marker in self.detected_markers:
                         # marker is normalized
                         m_pt = QPoint(int(marker[0] * pix_w), int(marker[1] * pix_h))
