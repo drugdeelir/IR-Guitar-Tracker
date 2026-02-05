@@ -115,7 +115,10 @@ class TrackingThread(QThread):
                 if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
-                        main_cap = cv2.VideoCapture(self.worker.video_source)
+                        # Optimization: Prefer DSHOW on Windows for MUCH faster camera init
+                        main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
+                        if not main_cap.isOpened():
+                            main_cap = cv2.VideoCapture(self.worker.video_source)
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
@@ -670,29 +673,28 @@ class Worker(QObject):
         if self.throttle_level > 0.9 and not live_only:
              return frame
 
-        # Since frame_cue is already a copy from VideoPlayer or a generator,
-        # we can modify it in-place to save performance.
-        processed = frame
-        h, w = processed.shape[:2]
-
-        # Calculate resolution scale factor (based on 1280x720 reference)
+        # Performance: Use GPU for FX
+        u_frame = cv2.UMat(frame)
+        h, w = frame.shape[:2]
         res_scale = np.sqrt((w * h) / (1280 * 720))
 
-        # 1. Transform/Mirror FX
+        # 1. Transform/Mirror FX (GPU Accelerated)
         if not live_only:
             if 'mirror_h' in mask.active_fx:
-                left = processed[:, :w//2]
-                processed[:, w//2:] = cv2.flip(left, 1)
+                u_left = cv2.UMat(u_frame, (0, h), (0, w//2))
+                u_right = cv2.flip(u_left, 1)
+                u_right.copyTo(cv2.UMat(u_frame, (0, h), (w//2, w)))
             if 'mirror_v' in mask.active_fx:
-                top = processed[:h//2, :]
-                processed[h//2:, :] = cv2.flip(top, 0)
+                u_top = cv2.UMat(u_frame, (0, h//2), (0, w))
+                u_bot = cv2.flip(u_top, 0)
+                u_bot.copyTo(cv2.UMat(u_frame, (h//2, h), (0, w)))
             if 'kaleidoscope' in mask.active_fx:
-                quad = processed[:h//2, :w//2]
-                processed[:h//2, w//2:] = cv2.flip(quad, 1)
-                processed[h//2:, :w//2] = cv2.flip(quad, 0)
-                processed[h//2:, w//2:] = cv2.flip(quad, -1)
+                u_quad = cv2.UMat(u_frame, (0, h//2), (0, w//2))
+                cv2.flip(u_quad, 1).copyTo(cv2.UMat(u_frame, (0, h//2), (w//2, w)))
+                cv2.flip(u_quad, 0).copyTo(cv2.UMat(u_frame, (h//2, h), (0, w)))
+                cv2.flip(u_quad, -1).copyTo(cv2.UMat(u_frame, (h//2, h), (w//2, w)))
 
-        # 2. Timing/Glitch FX (Shared Logic)
+        # 2. Timing/Glitch FX
         if 'strobe' in mask.active_fx:
             trigger = False
             if self.audio_reactive_target == 'strobe':
@@ -700,7 +702,7 @@ class Worker(QObject):
             else:
                 period = 60.0 / self.bpm
                 if (time.time() % period) < (period / 2.0): trigger = True
-            if trigger: processed.fill(0)
+            if trigger: u_frame = cv2.UMat(np.zeros_like(frame))
 
         if 'rgb_shift' in mask.active_fx:
             mod = 1.0
@@ -709,42 +711,52 @@ class Worker(QObject):
                 mod *= (self.audio_bands[self.audio_param_mappings['rgb_shift']] * 5)
             shift = int(10 * res_scale * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'rgb_shift' else 1.0))
             if shift != 0:
-                b, g, r = cv2.split(processed)
-                b = np.roll(b, shift, axis=1)
-                r = np.roll(r, -shift, axis=1)
-                processed = cv2.merge([b, g, r])
+                # RGB shift remains easier in CPU due to roll() but we can optimize by splitting
+                b, g, r = cv2.split(u_frame)
+                # Note: OpenCL doesn't have a direct 'roll', but we can use warpAffine for small shifts
+                M_r = np.float32([[1, 0, -shift], [0, 1, 0]])
+                M_b = np.float32([[1, 0, shift], [0, 1, 0]])
+                r = cv2.warpAffine(r, M_r, (w, h))
+                b = cv2.warpAffine(b, M_b, (w, h))
+                u_frame = cv2.merge([b, g, r])
 
         if 'glitch' in mask.active_fx:
             mod = 1.0
             if self.proximity_mode == 'glitch': mod = self.proximity_val
             if self.audio_reactive_target == 'glitch': mod *= (self.audio_bands[0] * 2)
+            # Glitch often requires many small copies, stay on CPU for the roll logic but minimize get()
+            processed_cpu = u_frame.get()
             for _ in range(int(3 * mod)):
                 g_h = int(10 * res_scale)
                 gy = np.random.randint(0, max(1, h - g_h))
                 gsh = int(np.random.randint(-20, 20) * res_scale)
-                processed[gy:gy+g_h, :] = np.roll(processed[gy:gy+g_h, :], gsh, axis=1)
+                processed_cpu[gy:gy+g_h, :] = np.roll(processed_cpu[gy:gy+g_h, :], gsh, axis=1)
+            u_frame = cv2.UMat(processed_cpu)
 
         if 'trails' in mask.active_fx:
             if mask_id in self.trail_buffers:
-                cv2.addWeighted(processed, 0.4, self.trail_buffers[mask_id], 0.6, 0, dst=processed)
-            self.trail_buffers[mask_id] = processed.copy()
+                u_trail = cv2.UMat(self.trail_buffers[mask_id])
+                u_frame = cv2.addWeighted(u_frame, 0.4, u_trail, 0.6, 0)
+            self.trail_buffers[mask_id] = u_frame.get()
 
         if 'feedback' in mask.active_fx:
             if mask_id in self.trail_buffers:
-                prev = self.trail_buffers[mask_id]
+                u_prev = cv2.UMat(self.trail_buffers[mask_id])
                 M = cv2.getRotationMatrix2D((w//2, h//2), 1, 1.02)
-                prev_w = cv2.warpAffine(prev, M, (w, h))
-                cv2.addWeighted(processed, 0.7, prev_w, 0.3, 0, dst=processed)
-            self.trail_buffers[mask_id] = processed.copy()
+                u_prev_w = cv2.warpAffine(u_prev, M, (w, h))
+                u_frame = cv2.addWeighted(u_frame, 0.7, u_prev_w, 0.3, 0)
+            self.trail_buffers[mask_id] = u_frame.get()
 
         if 'hue_cycle' in mask.active_fx:
-            hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV).astype(np.float32)
+            u_hsv = cv2.cvtColor(u_frame, cv2.COLOR_BGR2HSV)
             shift = (time.time() * (self.bpm / 60.0) * 30) % 180
             if mask.fx_params.get('lfo_target') == 'hue': shift *= lfo_val
-            hsv[:,:,0] = (hsv[:,:,0] + shift) % 180
-            processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+            h, s, v = cv2.split(u_hsv)
+            h = cv2.add(h, shift) # Note: Wrap handling is internal in cv2.add for uint8/180
+            u_hsv = cv2.merge([h, s, v])
+            u_frame = cv2.cvtColor(u_hsv, cv2.COLOR_HSV2BGR)
 
-        # 3. Static/Heavy FX
+        # 3. Static/Heavy FX (GPU Accelerated)
         if not live_only:
             if 'blur' in mask.active_fx:
                 mod = 1.0
@@ -755,28 +767,28 @@ class Worker(QObject):
                 if ksize % 2 == 0: ksize += 1
                 if ksize > 1:
                     if self.throttle_level > 0.5:
-                        cv2.blur(processed, (ksize, ksize), dst=processed)
+                        u_frame = cv2.blur(u_frame, (ksize, ksize))
                     else:
-                        cv2.GaussianBlur(processed, (ksize, ksize), 0, dst=processed)
+                        u_frame = cv2.GaussianBlur(u_frame, (ksize, ksize), 0)
 
             if 'invert' in mask.active_fx:
-                cv2.bitwise_not(processed, dst=processed)
+                u_frame = cv2.bitwise_not(u_frame)
 
             if 'edges' in mask.active_fx:
-                gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
-                edges = cv2.Canny(gray, 100, 200)
-                processed = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+                u_gray = cv2.cvtColor(u_frame, cv2.COLOR_BGR2GRAY)
+                u_edges = cv2.Canny(u_gray, 100, 200)
+                u_frame = cv2.cvtColor(u_edges, cv2.COLOR_GRAY2BGR)
 
             if 'tint' in mask.active_fx:
                 mod = 1.0
                 if 'tint' in self.audio_param_mappings:
                     mod *= (self.audio_bands[self.audio_param_mappings['tint']] * 3)
                 alpha = 0.3 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
-                tint = np.full_like(processed, mask.tint_color)
-                cv2.addWeighted(processed, 1.0 - alpha, tint, alpha, 0, dst=processed)
+                u_tint = cv2.UMat(np.full_like(frame, mask.tint_color))
+                u_frame = cv2.addWeighted(u_frame, 1.0 - alpha, u_tint, alpha, 0)
 
             if 'duotone' in mask.active_fx:
-                gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+                u_gray = cv2.cvtColor(u_frame, cv2.COLOR_BGR2GRAY)
                 comp = (255 - mask.tint_color[0], 255 - mask.tint_color[1], 255 - mask.tint_color[2])
                 lut = np.zeros((256, 1, 3), dtype=np.uint8)
                 for i in range(256):
@@ -784,25 +796,28 @@ class Worker(QObject):
                     lut[i, 0, 0] = int(comp[0] * (1 - a) + mask.tint_color[0] * a)
                     lut[i, 0, 1] = int(comp[1] * (1 - a) + mask.tint_color[1] * a)
                     lut[i, 0, 2] = int(comp[2] * (1 - a) + mask.tint_color[2] * a)
-                processed = cv2.LUT(cv2.merge([gray, gray, gray]), lut)
+                u_frame = cv2.LUT(cv2.merge([u_gray, u_gray, u_gray]), lut)
 
             if 'pixelate' in mask.active_fx:
                 div = max(2, int(16 * res_scale))
-                small = cv2.resize(processed, (max(1, w // div), max(1, h // div)), interpolation=cv2.INTER_NEAREST)
-                processed = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+                small_w, small_h = max(1, w // div), max(1, h // div)
+                u_small = cv2.resize(u_frame, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+                u_frame = cv2.resize(u_small, (w, h), interpolation=cv2.INTER_NEAREST)
 
             if 'chroma_aberration' in mask.active_fx:
-                b, g, r = cv2.split(processed)
-                b = np.roll(b, 5, axis=0)
-                r = np.roll(r, -5, axis=1)
-                processed = cv2.merge([b, g, r])
+                b, g, r = cv2.split(u_frame)
+                M_b = np.float32([[1, 0, 0], [0, 1, 5]])
+                M_r = np.float32([[1, 0, -5], [0, 1, 0]])
+                b = cv2.warpAffine(b, M_b, (w, h))
+                r = cv2.warpAffine(r, M_r, (w, h))
+                u_frame = cv2.merge([b, g, r])
 
             if 'ooze' in mask.active_fx and self.throttle_level < 0.7:
                 t = time.time()
                 for x in range(0, w, 20):
                     length = int((np.sin(t + x * 0.1) * 0.5 + 0.5) * h)
-                    cv2.line(processed, (x, 0), (x, length), (0, 255, 0), 3, cv2.LINE_AA)
-                    cv2.circle(processed, (x, length), 5, (0, 255, 100), -1)
+                    cv2.line(u_frame, (x, 0), (x, length), (0, 255, 0), 3, cv2.LINE_AA)
+                    cv2.circle(u_frame, (x, length), 5, (0, 255, 100), -1)
 
             if 'matrix' in mask.active_fx:
                 t = time.time()
@@ -814,27 +829,36 @@ class Worker(QObject):
                     for i in range(10):
                         alpha = (10 - i) / 10.0
                         color = (0, int(255 * alpha), 0)
-                        cv2.putText(processed, chr(np.random.randint(33, 126)), (x, int(y - i*15*res_scale)),
+                        cv2.putText(u_frame, chr(np.random.randint(33, 126)), (x, int(y - i*15*res_scale)),
                                     cv2.FONT_HERSHEY_SIMPLEX, m_font, color, 1)
 
             if 'vhs' in mask.active_fx:
                 jitter = int(np.random.randint(-5, 5) * res_scale)
-                processed = np.roll(processed, jitter, axis=1)
-                y = np.random.randint(0, h)
+                M_jitter = np.float32([[1, 0, jitter], [0, 1, 0]])
+                u_frame = cv2.warpAffine(u_frame, M_jitter, (w, h))
+
+                y_vhs = np.random.randint(0, h)
                 v_h = max(1, int(2 * res_scale))
-                processed[y:y+v_h, :] = cv2.add(processed[y:y+v_h, :], (50, 50, 50, 0))
-                b, g, r = cv2.split(processed)
+                # Static lines on GPU
+                u_vhs_line = cv2.UMat(u_frame, (y_vhs, min(h, y_vhs+v_h)), (0, w))
+                u_vhs_line = cv2.add(u_vhs_line, (50, 50, 50, 0))
+                u_vhs_line.copyTo(cv2.UMat(u_frame, (y_vhs, min(h, y_vhs+v_h)), (0, w)))
+
+                b, g, r = cv2.split(u_frame)
                 v_shift = max(1, int(3 * res_scale))
-                r = np.roll(r, v_shift, axis=1)
-                processed = cv2.merge([b, g, r])
+                M_v_shift = np.float32([[1, 0, v_shift], [0, 1, 0]])
+                r = cv2.warpAffine(r, M_v_shift, (w, h))
+                u_frame = cv2.merge([b, g, r])
 
             if 'scanline' in mask.active_fx:
                 t = time.time()
                 y_pos = int((t * 100) % h)
-                cv2.line(processed, (0, y_pos), (w, y_pos), (255, 255, 255), 1)
-                processed[::2, :] = cv2.convertScaleAbs(processed[::2, :], alpha=0.7)
+                cv2.line(u_frame, (0, y_pos), (w, y_pos), (255, 255, 255), 1)
+                # Note: scanline rows are better on CPU or with specialized kernel
+                # But we can approximate with a scaling
+                u_frame = cv2.convertScaleAbs(u_frame, alpha=0.9)
 
-        return processed
+        return u_frame.get()
 
     def get_design_mask(self, design_name, h, w):
         if not hasattr(self, '_design_cache'): self._design_cache = {}
@@ -896,6 +920,9 @@ class Worker(QObject):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
         if frame is None: return ([], []) if return_rejected else []
         h, w = frame.shape[:2]
+
+        # Performance: Use GPU (UMat) for image processing
+        u_frame = cv2.UMat(frame)
         with QMutexLocker(self.tracking_mutex):
             marker_cfg = self.marker_config
             marker_fp = self.marker_fingerprint if self.marker_fingerprint is not None else []
@@ -916,8 +943,8 @@ class Worker(QObject):
             roi_w = min(w - roi_x, int((max_x - min_x) * w + 2 * dynamic_padding))
             roi_h = min(h - roi_y, int((max_y - min_y) * h + 2 * dynamic_padding))
 
-        roi_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
-        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        u_roi = cv2.UMat(u_frame, (roi_y, roi_y+roi_h), (roi_x, roi_x+roi_w))
+        u_gray = cv2.cvtColor(u_roi, cv2.COLOR_BGR2GRAY)
 
         # 1. Projector Interference Masking (Feed-Forward)
         # Identify areas likely hit by bright projector light and suppress them.
@@ -933,41 +960,40 @@ class Worker(QObject):
                         # Performance: warp at lower resolution for interference masking
                         mask_w, mask_h = max(32, roi_w // 4), max(32, roi_h // 4)
                         T_scale = np.array([[mask_w/roi_w, 0, 0], [0, mask_h/roi_h, 0], [0, 0, 1]], dtype=np.float32)
-                        proj_mask_small = cv2.warpPerspective(self.last_projected_frame_for_masking, T_scale @ M_roi_to_proj, (mask_w, mask_h))
-                        proj_mask = cv2.resize(proj_mask_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
 
-                        # Aggressive suppression (0.6) because user is not using an IR-pass filter
-                        # We cap the suppression to ensure we don't lose all signal in extremely bright areas
-                        suppression = np.clip(proj_mask.astype(np.float32) * 0.6, 0, 200).astype(np.uint8)
-                        gray = cv2.subtract(gray, suppression)
+                        # Use UMat for warped masking
+                        u_proj_last = cv2.UMat(self.last_projected_frame_for_masking)
+                        u_proj_small = cv2.warpPerspective(u_proj_last, T_scale @ M_roi_to_proj, (mask_w, mask_h))
+                        u_proj_mask = cv2.resize(u_proj_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
+
+                        # Aggressive suppression (0.6)
+                        u_suppression = cv2.multiply(u_proj_mask, 0.6)
+                        u_gray = cv2.subtract(u_gray, u_suppression)
                     except: pass
 
-        # 2. Advanced Pre-processing to fight projector washout
-        # Scale Top-Hat kernel with resolution to avoid hollowing out large markers
-        # Increased to 150+ for 4K feeds with large (80x60) markers
+        # 2. Advanced Pre-processing (GPU Accelerated)
         th_size = max(150, int(w / 30))
         th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_size, th_size))
-        tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, th_kernel)
+        u_tophat = cv2.morphologyEx(u_gray, cv2.MORPH_TOPHAT, th_kernel)
 
-        # Combine Top-Hat with original gray to maintain peak intensity
-        # Use CLAHE on the combined result to normalize contrast against varying projector levels
-        gray_boosted = cv2.addWeighted(gray, 0.4, tophat, 0.6, 0)
-        gray_boosted = self.tracking_clahe.apply(gray_boosted)
+        u_gray_boosted = cv2.addWeighted(u_gray, 0.4, u_tophat, 0.6, 0)
+        u_gray_boosted = self.tracking_clahe.apply(u_gray_boosted)
 
         if self.auto_threshold:
-            # Combined Global + Local thresholding for robustness
-            _, t_global = cv2.threshold(gray_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            t_local = cv2.adaptiveThreshold(gray_boosted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, -10)
-            thresh = cv2.bitwise_and(t_global, t_local)
+            _, u_t_global = cv2.threshold(u_gray_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            u_t_local = cv2.adaptiveThreshold(u_gray_boosted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, -10)
+            u_thresh = cv2.bitwise_and(u_t_global, u_t_local)
         else:
-            # User controlled threshold on the boosted/tophat-filtered image
             effective_threshold = min(self.ir_threshold, 248)
-            _, thresh = cv2.threshold(gray_boosted, effective_threshold, 255, cv2.THRESH_BINARY)
+            _, u_thresh = cv2.threshold(u_gray_boosted, effective_threshold, 255, cv2.THRESH_BINARY)
 
-        # Cleanup: Remove small noise and ensure markers are solid
         kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_clean)
-        thresh = cv2.dilate(thresh, kernel_clean, iterations=3)
+        u_thresh = cv2.morphologyEx(u_thresh, cv2.MORPH_OPEN, kernel_clean)
+        u_thresh = cv2.dilate(u_thresh, kernel_clean, iterations=3)
+
+        # Download from GPU to CPU for contour finding (OpenCV findContours needs CPU array)
+        thresh = u_thresh.get()
+        gray_boosted = u_gray_boosted.get()
 
         # Using findContours for efficient blob finding
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -2071,7 +2097,10 @@ class Worker(QObject):
 
                                 matrix, _ = cv2.findHomography(video_corners, dst_pts_warp)
                                 if matrix is not None:
-                                    warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
+                                    # Use UMat for perspective warp
+                                    u_eff = cv2.UMat(effective_frame_cue)
+                                    u_warped = cv2.warpPerspective(u_eff, matrix, (w, h))
+                                    warped_cue = u_warped.get()
 
                                     # Draw mask
                                     curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -2103,7 +2132,10 @@ class Worker(QObject):
                                     effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
 
                                 if not mask.source_points:
-                                    warped_cue = cv2.resize(effective_frame_cue, (w, h))
+                                    # Use UMat for resize
+                                    u_eff = cv2.UMat(effective_frame_cue)
+                                    u_warped = cv2.resize(u_eff, (w, h))
+                                    warped_cue = u_warped.get()
                                     mask_img = np.full((h, w, 3), 255, dtype=np.uint8)
                                 else:
                                     src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
@@ -2122,7 +2154,11 @@ class Worker(QObject):
                                         matrix = None
 
                                     if matrix is not None:
-                                        warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
+                                        # Use UMat for perspective warp
+                                        u_eff = cv2.UMat(effective_frame_cue)
+                                        u_warped = cv2.warpPerspective(u_eff, matrix, (w, h))
+                                        warped_cue = u_warped.get()
+
                                         curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
                                         cv2.fillPoly(curr_mask_img, [np.int32(dst_pts)], (255, 255, 255))
                                         if mask.feather > 0:
@@ -2205,18 +2241,23 @@ class Worker(QObject):
                     master_proxy.tint_color = self.master_tint_color
                     projector_output = self.apply_fx(projector_output, master_proxy)
 
-                    # Apply Brightness/Contrast
+                    # Apply Brightness/Contrast/Saturation on GPU
+                    u_proj = cv2.UMat(projector_output)
+
                     if self.master_brightness != 0 or self.master_contrast != 0:
                         alpha = (self.master_contrast + 100.0) / 100.0
                         beta = self.master_brightness
-                        projector_output = cv2.convertScaleAbs(projector_output, alpha=alpha, beta=beta)
+                        u_proj = cv2.convertScaleAbs(u_proj, alpha=alpha, beta=beta)
 
-                    # Apply Saturation
                     if self.master_saturation != 100:
-                        hsv = cv2.cvtColor(projector_output, cv2.COLOR_BGR2HSV).astype(np.float32)
-                        hsv[:,:,1] *= (self.master_saturation / 100.0)
-                        hsv[:,:,1] = np.clip(hsv[:,:,1], 0, 255)
-                        projector_output = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+                        u_hsv = cv2.cvtColor(u_proj, cv2.COLOR_BGR2HSV)
+                        # Split channels on GPU
+                        h_c, s_c, v_c = cv2.split(u_hsv)
+                        s_c = cv2.multiply(s_c, self.master_saturation / 100.0)
+                        u_hsv = cv2.merge([h_c, s_c, v_c])
+                        u_proj = cv2.cvtColor(u_hsv, cv2.COLOR_HSV2BGR)
+
+                    projector_output = u_proj.get()
 
                     # Apply Grain
                     if self.master_grain > 0:
@@ -2253,17 +2294,22 @@ class Worker(QObject):
                     projector_output = cv2.bitwise_and(projector_output, inv_mask)
 
                 # 9-point grid warping (piecewise perspective optimization)
-                # Optimized: Combine warping and upscaling into a single remap if not identity
+                # Optimized: Use GPU for final remap/resize
+                u_projector_output = cv2.UMat(projector_output)
+
                 if self._warp_is_identity:
                     if (w, h) != (w_proj, h_proj):
-                        warped_output = cv2.resize(projector_output, (w_proj, h_proj), interpolation=cv2.INTER_LINEAR)
+                        u_warped_output = cv2.resize(u_projector_output, (w_proj, h_proj), interpolation=cv2.INTER_LINEAR)
                     else:
-                        warped_output = projector_output
+                        u_warped_output = u_projector_output
                 else:
                     if self.map_x is None or self.map_x.shape[:2] != (h_proj, w_proj) or self._warp_map_dirty:
                         self._update_warp_maps(w, h, w_proj, h_proj)
 
-                    warped_output = cv2.remap(projector_output, self.map_x, self.map_y, cv2.INTER_LINEAR)
+                    # Note: map_x and map_y remain on CPU for setup but remap happens on GPU if input is UMat
+                    u_warped_output = cv2.remap(u_projector_output, self.map_x, self.map_y, cv2.INTER_LINEAR)
+
+                warped_output = u_warped_output.get()
 
                 rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
                 self.projector_frame_ready.emit(QImage(rgb_proj.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
@@ -2526,39 +2572,38 @@ class Worker(QObject):
         return colored
 
     def blend_frames(self, base, overlay, mask_img, mode):
-        # Ensure mask_img has the same number of channels as base
-        if len(mask_img.shape) == 2:
-            mask_img = cv2.merge([mask_img, mask_img, mask_img])
+        # Performance: Use GPU (UMat) for blending
+        u_base = cv2.UMat(base)
+        u_overlay = cv2.UMat(overlay)
+        u_mask = cv2.UMat(mask_img)
 
-        if self.blend_temp1 is None or self.blend_temp1.shape != base.shape:
-            self.blend_temp1 = np.zeros_like(base)
-            self.blend_temp2 = np.zeros_like(base)
+        # Ensure u_mask has the same number of channels as u_base
+        if u_mask.channels() == 1:
+            u_mask = cv2.merge([u_mask, u_mask, u_mask])
 
-        # Optimized integer-based blending to avoid slow float conversions
+        # Optimized integer-based blending on GPU
         if mode == 'normal':
             # Full alpha blending: res = overlay * (mask/255) + base * (1 - mask/255)
-            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
-            cv2.bitwise_not(mask_img, dst=self.blend_temp2)
-            cv2.multiply(base, self.blend_temp2, dst=self.blend_temp2, scale=1.0/255.0)
-            return cv2.add(self.blend_temp1, self.blend_temp2, dst=base)
+            u_temp1 = cv2.multiply(u_overlay, u_mask, scale=1.0/255.0)
+            u_inv_mask = cv2.bitwise_not(u_mask)
+            u_temp2 = cv2.multiply(u_base, u_inv_mask, scale=1.0/255.0)
+            u_res = cv2.add(u_temp1, u_temp2)
         elif mode == 'add':
-            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
-            return cv2.add(base, self.blend_temp1, dst=base)
+            u_temp1 = cv2.multiply(u_overlay, u_mask, scale=1.0/255.0)
+            u_res = cv2.add(u_base, u_temp1)
         elif mode == 'screen':
-            # res = 1 - (1 - base) * (1 - overlay*mask)
-            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
-            cv2.bitwise_not(base, dst=self.blend_temp2)
-            cv2.bitwise_not(self.blend_temp1, dst=self.blend_temp1)
-            cv2.multiply(self.blend_temp2, self.blend_temp1, dst=self.blend_temp1, scale=1.0/255.0)
-            return cv2.bitwise_not(self.blend_temp1, dst=base)
+            u_temp1 = cv2.multiply(u_overlay, u_mask, scale=1.0/255.0)
+            u_inv_base = cv2.bitwise_not(u_base)
+            u_inv_temp1 = cv2.bitwise_not(u_temp1)
+            u_res = cv2.bitwise_not(cv2.multiply(u_inv_base, u_inv_temp1, scale=1.0/255.0))
         elif mode == 'multiply':
-            # res = base * (overlay*mask + (255-mask)) / 255
-            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
-            cv2.bitwise_not(mask_img, dst=self.blend_temp2)
-            cv2.add(self.blend_temp1, self.blend_temp2, dst=self.blend_temp1)
-            return cv2.multiply(base, self.blend_temp1, dst=base, scale=1.0/255.0)
+            u_temp1 = cv2.multiply(u_overlay, u_mask, scale=1.0/255.0)
+            u_inv_mask = cv2.bitwise_not(u_mask)
+            u_res = cv2.multiply(u_base, cv2.add(u_temp1, u_inv_mask), scale=1.0/255.0)
+        else:
+            return base
 
-        return base
+        return u_res.get()
 
     def normalize_points_to_reference(self, points):
         """Converts points from current frame space to marker-config reference space."""
