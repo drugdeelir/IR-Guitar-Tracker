@@ -265,7 +265,7 @@ class Worker(QObject):
         self.smoothed_points = None
         self.smoothing_factor = 0.5 # Lowered for more direct response
         self.history_points = []
-        self.history_len = 7 # Increased for even more stability when guitar is still
+        self.history_len = 12 # Increased for even more stability when guitar is still
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -383,6 +383,7 @@ class Worker(QObject):
         self.latest_tracked_points_for_ui = []
         self.camera_matrix = None
         self.dist_coeffs = np.zeros((4, 1))
+        self.last_raw_detections = []
         self.cached_plasma_grid = None
         self.cached_nebula_grid = None
         self.generator_buffer = None
@@ -415,10 +416,10 @@ class Worker(QObject):
             kf = cv2.KalmanFilter(4, 2)
             kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
             kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
-            # Higher stability: reduced process noise
-            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.005
-            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.01
-            kf.errorCovPost = np.eye(4, dtype=np.float32)
+            # Even higher stability: trust the model more for stationary objects
+            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.001
+            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.05
+            kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
             self.kalman_filters.append(kf)
 
     def set_marker_points(self, points):
@@ -908,21 +909,28 @@ class Worker(QObject):
         detected_points_raw = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if 2 < area < 800:
+            if 1 < area < 800:
                 # Circularity Check to filter out streaks/reflections
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
 
-                if circularity < 0.55: continue # Reject non-circular blobs (slightly stricter)
+                if circularity < 0.65: continue # Reject non-circular blobs (stricter)
 
                 # Use intensity-weighted moments for sub-pixel centroid stability
-                x, y, w_b, h_b = cv2.boundingRect(contour)
-                dot_roi = gray[y:y+h_b, x:x+w_b]
+                # Expand ROI to capture the full Gaussian spot for better sub-pixel accuracy
+                x_b, y_b, w_b, h_b = cv2.boundingRect(contour)
+                pad = 4
+                x1 = max(0, x_b - pad)
+                y1 = max(0, y_b - pad)
+                x2 = min(roi_w, x_b + w_b + pad)
+                y2 = min(roi_h, y_b + h_b + pad)
+
+                dot_roi = gray[y1:y2, x1:x2]
                 M = cv2.moments(dot_roi)
 
                 if M["m00"] != 0:
-                    cx_px = (M["m10"] / M["m00"]) + x
-                    cy_px = (M["m01"] / M["m00"]) + y
+                    cx_px = (M["m10"] / M["m00"]) + x1
+                    cy_px = (M["m01"] / M["m00"]) + y1
 
                     # Sample brightness at centroid
                     ix, iy = int(round(cx_px)), int(round(cy_px))
@@ -930,13 +938,28 @@ class Worker(QObject):
                     ix = max(0, min(roi_w-1, ix))
                     intensity = gray[iy, ix]
 
+                    if intensity < self.ir_threshold: continue # Double check brightness
+
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
                     detected_points_raw.append({'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity})
 
         # Sort by intensity (brightest first) then area/circularity
         detected_points_raw.sort(key=lambda x: (x['intensity'], x['area'], x['circ']), reverse=True)
-        detected_points = [x['pos'] for x in detected_points_raw]
+        detected_points_all = [x['pos'] for x in detected_points_raw]
+
+        # Dot Persistence: only keep dots that were present in the last frame (or if searching)
+        detected_points = []
+        if self.confidence > 0.5:
+            for p in detected_points_all:
+                if any(np.linalg.norm(np.array(p) - np.array(prev_p)) < 0.005 for prev_p in self.last_raw_detections):
+                    detected_points.append(p)
+                elif any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.02 for lp in (self.last_tracked_points or [])):
+                    detected_points.append(p)
+        else:
+            detected_points = detected_points_all
+
+        self.last_raw_detections = detected_points_all # Store all for next frame's comparison
 
         if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= (len(marker_cfg) - 1):
             # OC-TOLERANCE: If we see at least 3 markers (and 1 is missing), we can estimate the guitar pose
@@ -1108,7 +1131,7 @@ class Worker(QObject):
                         self.confidence = max(0.0, self.confidence - 0.15)
                         return self.last_tracked_points
 
-                # High-Distance Temporal Smoothing with Adaptive Alpha
+                # High-Distance Temporal Smoothing with Adaptive Alpha & Deadband
                 if self.smoothed_points is None:
                     self.smoothed_points = new_points_arr
                     alpha = 1.0
@@ -1116,11 +1139,15 @@ class Worker(QObject):
                     # Calculate movement magnitude
                     move_dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
 
+                    # Deadband: if movement is microscopic, ignore it to prevent static jitter
+                    if move_dist < 0.0015:
+                        return self.last_tracked_points
+
                     # Adaptive Alpha: lower when still, higher when moving
                     # base_alpha for stillness
-                    base_alpha = (1.0 - self.smoothing_factor) * 0.1
+                    base_alpha = (1.0 - self.smoothing_factor) * 0.08
                     # sensitivity to motion
-                    motion_scale = 3.0
+                    motion_scale = 2.0
                     alpha = np.clip(base_alpha + move_dist * motion_scale, base_alpha, 0.9)
 
                     self.smoothed_points = self.smoothed_points * (1.0 - alpha) + new_points_arr * alpha
