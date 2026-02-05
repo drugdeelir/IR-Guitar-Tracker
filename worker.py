@@ -1057,6 +1057,8 @@ class Worker(QObject):
                     self.history_points.pop(0)
 
                 avg_points = np.mean(self.history_points, axis=0)
+                if self.confidence < 0.5 and (self.confidence + self.confidence_gain) >= 0.5:
+                    self.status_update.emit("Tracking Status: LOCKED")
                 self.confidence = min(1.0, self.confidence + self.confidence_gain)
                 self.last_tracked_points = [tuple(p) for p in avg_points]
                 return self.last_tracked_points
@@ -1066,6 +1068,8 @@ class Worker(QObject):
                 self.last_tracked_points = None
                 return self.get_tracked_points(frame)
 
+        if self.confidence > 0.1 and (self.confidence - self.confidence_decay) <= 0.1:
+            self.status_update.emit("Tracking Status: LOST")
         self.confidence = max(0.0, self.confidence - self.confidence_decay)
 
         # If tracking is completely lost, clear history to avoid "jumps" when regained

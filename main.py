@@ -8,9 +8,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
                              QDialog, QFormLayout, QInputDialog, QTabWidget, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea,
-                             QProgressBar)
+                             QProgressBar, QPlainTextEdit, QGridLayout)
 from PyQt5.QtGui import QPixmap, QDesktopServices
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl, QDateTime
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor
 from worker import Worker
 from mask import Mask
@@ -218,9 +218,27 @@ class ProjectionMappingApp(QMainWindow):
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.layout = QHBoxLayout(self.central_widget)
-        self.layout.setSpacing(35)
-        self.layout.setContentsMargins(30, 30, 30, 30)
+        self.main_container = QVBoxLayout(self.central_widget)
+        self.main_container.setContentsMargins(10, 10, 10, 10)
+        self.main_container.setSpacing(10)
+
+        self.layout = QHBoxLayout()
+        self.layout.setSpacing(25)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        self.main_container.addLayout(self.layout)
+
+        # Live Log at Bottom
+        self.log_area = QPlainTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setMaximumHeight(180)
+        self.log_area.setStyleSheet("""
+            background-color: #0d0d0d;
+            color: #00e676;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 16px;
+            border: 1px solid #333;
+        """)
+        self.main_container.addWidget(self.log_area)
 
         self.video_display = VideoDisplay()
         self.video_display.setMinimumWidth(800)
@@ -266,7 +284,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
         self.worker.system_warning.connect(lambda msg: self.statusBar().showMessage(msg, 10000))
-        self.worker.status_update.connect(lambda msg: self.statusBar().showMessage(msg, 0))
+        self.worker.status_update.connect(self.log)
         self.worker.calibration_complete.connect(self.handle_calibration_complete)
         self.worker.boundary_detected.connect(self.handle_boundary_detected)
         self.worker.trackers_ready.connect(self.update_confidence_ui)
@@ -768,12 +786,23 @@ class ProjectionMappingApp(QMainWindow):
                 widget.deleteLater()
 
     def update_confidence_ui(self, points):
-        conf = getattr(self.worker, 'confidence', 0.0)
-        val = int(conf * 100)
-        if hasattr(self, 'setup_conf_bar'):
-            self.setup_conf_bar.setValue(val)
-        if hasattr(self, 'workspace_conf_bar'):
-            self.workspace_conf_bar.setValue(val)
+        try:
+            conf = getattr(self.worker, 'confidence', 0.0)
+            val = int(conf * 100)
+            if hasattr(self, 'setup_conf_bar'):
+                self.setup_conf_bar.setValue(val)
+            if hasattr(self, 'workspace_conf_bar'):
+                self.workspace_conf_bar.setValue(val)
+
+            if hasattr(self, 'stage_conf_bar'):
+                self.stage_conf_bar.setValue(val)
+            if hasattr(self, 'stage_status_label'):
+                status = "LOCKED" if conf > 0.5 else "TRACKING..." if conf > 0.1 else "LOST / SEARCHING"
+                color = "#00e676" if conf > 0.5 else "#ffeb3b" if conf > 0.1 else "#ff1744"
+                self.stage_status_label.setText(f"STATUS: {status}")
+                self.stage_status_label.setStyleSheet(f"font-size: 28px; color: {color}; font-weight: bold; margin-top: 10px;")
+        except (RuntimeError, AttributeError):
+            pass
 
     def handle_boundary_detected(self, points):
         if not points:
@@ -1270,6 +1299,35 @@ class ProjectionMappingApp(QMainWindow):
         master_group.setLayout(master_layout)
         layout.addWidget(master_group)
 
+        # Tracking Status Group
+        tracking_group = QGroupBox("Live Tracking Status")
+        tracking_layout = QVBoxLayout()
+        self.stage_conf_bar = QProgressBar()
+        self.stage_conf_bar.setRange(0, 100)
+        self.stage_conf_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid grey;
+                border-radius: 5px;
+                text-align: center;
+                height: 45px;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #00e676;
+                width: 20px;
+            }
+        """)
+        tracking_layout.addWidget(QLabel("Confidence Score:"))
+        tracking_layout.addWidget(self.stage_conf_bar)
+
+        self.stage_status_label = QLabel("STATUS: STANDBY")
+        self.stage_status_label.setStyleSheet("font-size: 28px; color: #ffeb3b; font-weight: bold; margin-top: 10px;")
+        tracking_layout.addWidget(self.stage_status_label)
+
+        tracking_group.setLayout(tracking_layout)
+        layout.addWidget(tracking_group)
+
         layout.addStretch()
         self.tabs.addTab(self.workspace_scroll, "Stage")
 
@@ -1326,6 +1384,33 @@ class ProjectionMappingApp(QMainWindow):
         self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
         self.play_cue_btn.clicked.connect(self.toggle_selected_cue)
         cue_layout.addWidget(self.play_cue_btn)
+
+        # Nudge Tool
+        nudge_group = QGroupBox("Fine-Tune Position (Nudge)")
+        nudge_layout = QVBoxLayout()
+        n_btns = QGridLayout()
+
+        btn_up = QPushButton("▲ UP")
+        btn_down = QPushButton("▼ DOWN")
+        btn_left = QPushButton("◀ LEFT")
+        btn_right = QPushButton("▶ RIGHT")
+
+        for b in [btn_up, btn_down, btn_left, btn_right]:
+            b.setStyleSheet("height: 45px; font-weight: bold; background-color: #455a64;")
+
+        btn_up.clicked.connect(lambda: self.nudge_mask("up"))
+        btn_down.clicked.connect(lambda: self.nudge_mask("down"))
+        btn_left.clicked.connect(lambda: self.nudge_mask("left"))
+        btn_right.clicked.connect(lambda: self.nudge_mask("right"))
+
+        n_btns.addWidget(btn_up, 0, 1)
+        n_btns.addWidget(btn_left, 1, 0)
+        n_btns.addWidget(btn_right, 1, 2)
+        n_btns.addWidget(btn_down, 2, 1)
+
+        nudge_layout.addLayout(n_btns)
+        nudge_group.setLayout(nudge_layout)
+        cue_layout.addWidget(nudge_group)
 
         cue_group.setLayout(cue_layout)
         layout.addWidget(cue_group, 2)
@@ -2168,6 +2253,31 @@ class ProjectionMappingApp(QMainWindow):
                 self.statusBar().showMessage("No video assigned to this mask.", 3000)
         else:
             self.statusBar().showMessage("Select a mask in the table first.", 3000)
+
+    def log(self, message):
+        if not hasattr(self, 'log_area'): return
+        timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
+        self.log_area.appendPlainText(f"[{timestamp}] {message}")
+        self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
+
+    def nudge_mask(self, direction):
+        row = self.cue_table.currentRow()
+        if row < 0 or row >= len(self.masks):
+            self.log("Nudge failed: Select a mask from the Cue Table first.")
+            return
+
+        mask = self.masks[row]
+        step = 0.002
+        dx, dy = 0, 0
+        if direction == "up": dy = -step
+        elif direction == "down": dy = step
+        elif direction == "left": dx = -step
+        elif direction == "right": dx = step
+
+        mask.source_points = [(p[0]+dx, p[1]+dy) for p in mask.source_points]
+        self.log(f"Nudged mask '{mask.name}' {direction}")
+        self.worker.set_masks(self.masks)
+        self.maybe_auto_save()
 
     def open_playlist_editor(self):
         selected_mask_row = self.cue_table.currentRow()
