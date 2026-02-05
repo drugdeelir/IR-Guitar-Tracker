@@ -265,7 +265,7 @@ class Worker(QObject):
         self.smoothed_points = None
         self.smoothing_factor = 0.5 # Lowered for more direct response
         self.history_points = []
-        self.history_len = 5 # Increased for stability when guitar is still
+        self.history_len = 7 # Increased for even more stability when guitar is still
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -415,7 +415,10 @@ class Worker(QObject):
             kf = cv2.KalmanFilter(4, 2)
             kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
             kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
-            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+            # Higher stability: reduced process noise
+            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.005
+            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.01
+            kf.errorCovPost = np.eye(4, dtype=np.float32)
             self.kalman_filters.append(kf)
 
     def set_marker_points(self, points):
@@ -910,15 +913,22 @@ class Worker(QObject):
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
 
-                if circularity < 0.5: continue # Reject non-circular blobs
+                if circularity < 0.55: continue # Reject non-circular blobs (slightly stricter)
 
-                M = cv2.moments(contour)
+                # Use intensity-weighted moments for sub-pixel centroid stability
+                x, y, w_b, h_b = cv2.boundingRect(contour)
+                dot_roi = gray[y:y+h_b, x:x+w_b]
+                M = cv2.moments(dot_roi)
+
                 if M["m00"] != 0:
-                    cx_px = int(M["m10"] / M["m00"])
-                    cy_px = int(M["m01"] / M["m00"])
+                    cx_px = (M["m10"] / M["m00"]) + x
+                    cy_px = (M["m01"] / M["m00"]) + y
 
                     # Sample brightness at centroid
-                    intensity = gray[cy_px, cx_px]
+                    ix, iy = int(round(cx_px)), int(round(cy_px))
+                    iy = max(0, min(roi_h-1, iy))
+                    ix = max(0, min(roi_w-1, ix))
+                    intensity = gray[iy, ix]
 
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
@@ -1098,12 +1108,21 @@ class Worker(QObject):
                         self.confidence = max(0.0, self.confidence - 0.15)
                         return self.last_tracked_points
 
-                # High-Distance Temporal Smoothing
+                # High-Distance Temporal Smoothing with Adaptive Alpha
                 if self.smoothed_points is None:
                     self.smoothed_points = new_points_arr
+                    alpha = 1.0
                 else:
-                    # Stricter Alpha for stability
-                    alpha = (1.0 - self.smoothing_factor) * 0.3 # Even more strict
+                    # Calculate movement magnitude
+                    move_dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
+
+                    # Adaptive Alpha: lower when still, higher when moving
+                    # base_alpha for stillness
+                    base_alpha = (1.0 - self.smoothing_factor) * 0.1
+                    # sensitivity to motion
+                    motion_scale = 3.0
+                    alpha = np.clip(base_alpha + move_dist * motion_scale, base_alpha, 0.9)
+
                     self.smoothed_points = self.smoothed_points * (1.0 - alpha) + new_points_arr * alpha
 
                 # Moving Average over history
