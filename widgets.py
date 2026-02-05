@@ -11,14 +11,16 @@ class MarkerImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMouseTracking(True)
         self.detected_points = []
+        self.rejected_points = []
         self.selected_points = []
         self.guide_points = []
         self.hover_snap_pt = None
         self.pix = None
 
-    def set_data(self, pixmap, detected_points, guide_points=None):
+    def set_data(self, pixmap, detected_points, rejected_points=[], guide_points=None):
         self.pix = pixmap
         self.detected_points = detected_points
+        self.rejected_points = rejected_points
         self.guide_points = guide_points or []
         self.selected_points = []
         self.hover_snap_pt = None
@@ -113,6 +115,14 @@ class MarkerImageLabel(QLabel):
 
         painter.drawPixmap(offset_x, offset_y, sw, sh, self.pix)
 
+        # Draw rejected dots (subtle)
+        for rp in self.rejected_points:
+            sx = offset_x + rp[0] * sw
+            sy = offset_y + rp[1] * sh
+            painter.setPen(QPen(QColor(255, 255, 255, 50), 1))
+            painter.setBrush(QBrush(QColor(100, 100, 100, 30)))
+            painter.drawEllipse(QPointF(sx, sy), 5, 5)
+
         # Draw detected dots (more visible)
         for dp in self.detected_points:
             sx = offset_x + dp[0] * sw
@@ -172,8 +182,8 @@ class MarkerSelectionDialog(QDialog):
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.confirm_button)
 
-    def set_pixmap(self, pixmap, detected_points, guide_points=None):
-        self.image_label.set_data(pixmap, detected_points, guide_points)
+    def set_pixmap(self, pixmap, detected_points, rejected_points=[], guide_points=None):
+        self.image_label.set_data(pixmap, detected_points, rejected_points, guide_points)
 
     def get_selected_points(self):
         return self.image_label.selected_points

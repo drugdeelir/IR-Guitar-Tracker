@@ -580,10 +580,10 @@ class ProjectionMappingApp(QMainWindow):
             self.marker_selection_dialog.take_picture_button.setEnabled(True)
             self.worker.capture_still_frame()
 
-    def handle_still_frame_ready(self, image, points):
+    def handle_still_frame_ready(self, image, points, rejected_points=[]):
         if self.marker_selection_dialog.isVisible():
             guide_pts = self.worker.marker_config if hasattr(self.worker, 'marker_config') else None
-            self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points, guide_pts)
+            self.marker_selection_dialog.set_pixmap(QPixmap.fromImage(image), points, rejected_points, guide_pts)
         elif self.mask_drawing_dialog.isVisible():
             self.mask_drawing_dialog.set_image(image)
 

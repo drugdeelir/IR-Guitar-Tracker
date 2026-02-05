@@ -209,7 +209,7 @@ class TrackingThread(QThread):
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
     projector_frame_ready = pyqtSignal(QImage)
-    still_frame_ready = pyqtSignal(QImage, list)
+    still_frame_ready = pyqtSignal(QImage, list, list) # rgb, detected, rejected
     trackers_detected = pyqtSignal(int)
     trackers_ready = pyqtSignal(list)
     camera_error = pyqtSignal(int)
@@ -265,7 +265,7 @@ class Worker(QObject):
         self.smoothed_points = None
         self.smoothing_factor = 0.5 # Lowered for more direct response
         self.history_points = []
-        self.history_len = 12 # Increased for even more stability when guitar is still
+        self.history_len = 20 # Max stability for stage performance
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -873,9 +873,9 @@ class Worker(QObject):
         self._design_cache[cache_key] = mask
         return mask
 
-    def get_tracked_points(self, frame, force_full=False):
+    def get_tracked_points(self, frame, force_full=False, return_rejected=False):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
-        if frame is None: return []
+        if frame is None: return ([], []) if return_rejected else []
         h, w = frame.shape[:2]
         with QMutexLocker(self.tracking_mutex):
             marker_cfg = self.marker_config
@@ -902,19 +902,30 @@ class Worker(QObject):
         if self.auto_threshold:
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
-            _, thresh = cv2.threshold(gray, self.ir_threshold, 255, cv2.THRESH_BINARY)
+            # Foolproof thresholding: ensure we don't zero out everything if slider is at max
+            effective_threshold = min(self.ir_threshold, 245)
+            _, thresh = cv2.threshold(gray, effective_threshold, 255, cv2.THRESH_BINARY)
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Using Connected Components for more reliable detection of small dots
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
 
         detected_points_raw = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if 1 < area < 800:
-                # Circularity Check to filter out streaks/reflections
+        rejected_points_raw = []
+
+        # Min circularity: more lenient for still capture, strict for live tracking
+        min_circ = 0.45 if force_full else 0.70
+
+        for i in range(1, num_labels): # Skip background label 0
+            area = stats[i, cv2.CC_STAT_AREA]
+            if 1 <= area < 1000:
+                # Calculate circularity
+                mask = (labels == i).astype(np.uint8)
+                contours_lbl, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours_lbl: continue
+                contour = contours_lbl[0]
+
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
-
-                if circularity < 0.65: continue # Reject non-circular blobs (stricter)
 
                 # Use intensity-weighted moments for sub-pixel centroid stability
                 # Expand ROI to capture the full Gaussian spot for better sub-pixel accuracy
@@ -932,17 +943,17 @@ class Worker(QObject):
                     cx_px = (M["m10"] / M["m00"]) + x1
                     cy_px = (M["m01"] / M["m00"]) + y1
 
-                    # Sample brightness at centroid
-                    ix, iy = int(round(cx_px)), int(round(cy_px))
-                    iy = max(0, min(roi_h-1, iy))
-                    ix = max(0, min(roi_w-1, ix))
-                    intensity = gray[iy, ix]
-
-                    if intensity < self.ir_threshold: continue # Double check brightness
+                    # Sample peak intensity in the dot area
+                    intensity = np.max(dot_roi)
 
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
-                    detected_points_raw.append({'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity})
+                    candidate = {'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity}
+
+                    if circularity >= min_circ and intensity >= (self.ir_threshold * 0.8):
+                        detected_points_raw.append(candidate)
+                    else:
+                        rejected_points_raw.append(candidate)
 
         # Sort by intensity (brightest first) then area/circularity
         detected_points_raw.sort(key=lambda x: (x['intensity'], x['area'], x['circ']), reverse=True)
@@ -960,6 +971,11 @@ class Worker(QObject):
             detected_points = detected_points_all
 
         self.last_raw_detections = detected_points_all # Store all for next frame's comparison
+        rejected_points = [x['pos'] for x in rejected_points_raw]
+
+        if return_rejected:
+            # We skip the tracking logic and return raw dots for calibration dialog
+            return detected_points, rejected_points
 
         if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= (len(marker_cfg) - 1):
             # OC-TOLERANCE: If we see at least 3 markers (and 1 is missing), we can estimate the guitar pose
@@ -1140,7 +1156,7 @@ class Worker(QObject):
                     move_dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
 
                     # Deadband: if movement is microscopic, ignore it to prevent static jitter
-                    if move_dist < 0.0015:
+                    if move_dist < 0.0025:
                         return self.last_tracked_points
 
                     # Adaptive Alpha: lower when still, higher when moving
@@ -1187,7 +1203,7 @@ class Worker(QObject):
         if self.last_tracked_points is not None:
             if roi_x != 0 or roi_y != 0 or roi_w != w or roi_h != h:
                 self.last_tracked_points = None
-                return self.get_tracked_points(frame)
+                return self.get_tracked_points(frame, return_rejected=return_rejected)
 
         if self.confidence > 0.1 and (self.confidence - self.confidence_decay) <= 0.1:
             self.status_update.emit("Tracking Status: LOST")
@@ -1205,9 +1221,9 @@ class Worker(QObject):
                 self.init_kalman(len(self.marker_config))
 
         if (self.confidence > 0.1 or self.tracking_freeze_enabled) and self.last_tracked_points:
-            return self.last_tracked_points
+            return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
-        return detected_points
+        return (detected_points, rejected_points) if return_rejected else detected_points
 
     def _update_warp_maps(self, w_render, h_render, w_proj, h_proj):
         if w_render <= 0 or h_render <= 0 or w_proj <= 0 or h_proj <= 0: return
