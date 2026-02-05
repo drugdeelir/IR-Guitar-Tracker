@@ -264,7 +264,7 @@ class Worker(QObject):
         self.smoothed_points = None
         self.smoothing_factor = 0.5 # Lowered for more direct response
         self.history_points = []
-        self.history_len = 20 # Max stability for stage performance
+        self.history_len = 8 # Balanced stability and responsiveness for live performance
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -378,6 +378,8 @@ class Worker(QObject):
         self.latest_main_frame = None
         self.latest_main_frame_mutex = QMutex()
         self.latest_main_frame_id = 0
+        self.last_projected_frame_for_masking = None
+        self.last_projected_frame_mutex = QMutex()
         self._last_captured_frame_id = -1
         self.latest_tracked_points_for_ui = []
         self.camera_matrix = None
@@ -895,19 +897,46 @@ class Worker(QObject):
         roi_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
 
-        # Boost contrast for IR markers using dedicated tracking CLAHE
-        gray = self.tracking_clahe.apply(gray)
+        # 1. Projector Interference Masking (Feed-Forward)
+        # Identify areas likely hit by bright projector light and suppress them.
+        if self.h_c2p is not None:
+            with QMutexLocker(self.last_projected_frame_mutex):
+                if self.last_projected_frame_for_masking is not None:
+                    ph, pw = self.last_projected_frame_for_masking.shape[:2]
+                    S = np.array([[float(pw), 0, 0], [0, float(ph), 0], [0, 0, 1]], dtype=np.float32)
+                    M_cam_to_proj = S @ self.h_c2p
+                    T_roi = np.array([[1, 0, roi_x], [0, 1, roi_y], [0, 0, 1]], dtype=np.float32)
+                    M_roi_to_proj = M_cam_to_proj @ T_roi
+                    try:
+                        proj_mask = cv2.warpPerspective(self.last_projected_frame_for_masking, M_roi_to_proj, (roi_w, roi_h))
+                        # Suppress projector light. We use a conservative factor (0.4) to avoid over-masking markers.
+                        gray = cv2.subtract(gray, (proj_mask.astype(np.float32) * 0.4).astype(np.uint8))
+                    except: pass
+
+        # 2. Advanced Pre-processing to fight projector washout
+        # Top-Hat transform extracts small bright spots (markers) while ignoring large areas of projector light
+        th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+        tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, th_kernel)
+
+        # Combine Top-Hat with original gray to maintain peak intensity
+        # Use CLAHE on the combined result to normalize contrast against varying projector levels
+        gray_boosted = cv2.addWeighted(gray, 0.4, tophat, 0.6, 0)
+        gray_boosted = self.tracking_clahe.apply(gray_boosted)
 
         if self.auto_threshold:
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Combined Global + Local thresholding for robustness
+            _, t_global = cv2.threshold(gray_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            t_local = cv2.adaptiveThreshold(gray_boosted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, -10)
+            thresh = cv2.bitwise_and(t_global, t_local)
         else:
-            # Foolproof thresholding: ensure we don't zero out everything if slider is at max
+            # User controlled threshold on the boosted/tophat-filtered image
             effective_threshold = min(self.ir_threshold, 248)
-            _, thresh = cv2.threshold(gray, effective_threshold, 255, cv2.THRESH_BINARY)
+            _, thresh = cv2.threshold(gray_boosted, effective_threshold, 255, cv2.THRESH_BINARY)
 
-        # Subtle dilation to ensure small markers are solid
-        kernel = np.ones((3,3), np.uint8)
-        thresh = cv2.dilate(thresh, kernel, iterations=1)
+        # Cleanup: Remove small noise and ensure markers are solid
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_clean)
+        thresh = cv2.dilate(thresh, kernel_clean, iterations=1)
 
         # Using findContours for efficient blob finding
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -933,8 +962,12 @@ class Worker(QObject):
                 x2 = min(roi_w, x_b + w_b + pad)
                 y2 = min(roi_h, y_b + h_b + pad)
 
-                dot_roi = gray[y1:y2, x1:x2]
-                M = cv2.moments(dot_roi)
+                dot_roi = gray_boosted[y1:y2, x1:x2]
+                mask_roi = thresh[y1:y2, x1:x2]
+                # Mask the grayscale ROI with the binary blob to ignore nearby noise/projector light
+                # while preserving intensity weighting for sub-pixel precision.
+                weighted_roi = cv2.bitwise_and(dot_roi, mask_roi)
+                M = cv2.moments(weighted_roi)
 
                 if M["m00"] != 0:
                     cx_px = (M["m10"] / M["m00"]) + x1
@@ -977,6 +1010,14 @@ class Worker(QObject):
         if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= (len(marker_cfg) - 1):
             # OC-TOLERANCE: If we see at least 3 markers (and 1 is missing), we can estimate the guitar pose
             num_markers = len(marker_cfg)
+
+            # Pre-calculate Kalman predictions for stickiness cost (helps handle "swallowed" markers)
+            predictions = []
+            if self.confidence > 0.3 and len(self.kalman_filters) == num_markers:
+                for kf in self.kalman_filters:
+                    pred = kf.predict()
+                    predictions.append((pred[0, 0], pred[1, 0]))
+
             # If we were tracking, prioritize points near last known location
             if self.confidence > 0.2 and self.last_tracked_points and len(self.last_tracked_points) > 0:
                 center = np.mean(self.last_tracked_points, axis=0)
@@ -1068,9 +1109,12 @@ class Worker(QObject):
                                     else:
                                         fp_err = 0.5 # Penalty for mismatch in length/missing FP
 
-                                    # Marker Stickiness: favor points closer to their last known position
+                                    # Marker Stickiness: favor points closer to their predicted positions
                                     stickiness_err = 0
-                                    if self.last_tracked_points and len(self.last_tracked_points) == num_markers:
+                                    if predictions and len(predictions) == num_markers:
+                                        for i in range(num_markers):
+                                            stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(predictions[i]))
+                                    elif self.last_tracked_points and len(self.last_tracked_points) == num_markers:
                                         for i in range(num_markers):
                                             stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(self.last_tracked_points[i]))
 
@@ -1083,12 +1127,17 @@ class Worker(QObject):
                             if best_match and best_overall_error < 0.04: break
 
                     # If we found N-1 markers
-                    elif search_count == num_markers - 1 and self.last_homography is not None:
+                    elif search_count == num_markers - 1 and (self.last_homography is not None or predictions):
                         for missing_idx in range(num_markers):
                             subset_cfg = [marker_cfg[i] for i in range(num_markers) if i != missing_idx]
                             src_pts = np.float32(subset_cfg).reshape(-1, 1, 2)
 
-                            transformed_src = cv2.perspectiveTransform(src_pts, self.last_homography)
+                            # Use Kalman predictions if available for better alignment of the subset
+                            if predictions and len(predictions) == num_markers:
+                                subset_preds = [predictions[i] for i in range(num_markers) if i != missing_idx]
+                                transformed_src = np.float32(subset_preds).reshape(-1, 1, 2)
+                            else:
+                                transformed_src = cv2.perspectiveTransform(src_pts, self.last_homography)
                             ordered_dst = []
                             temp_dst = list(point_combo)
                             for i in range(search_count):
@@ -1133,10 +1182,11 @@ class Worker(QObject):
                 kalman_pts = []
                 for i, pt in enumerate(best_match):
                     if i >= len(self.kalman_filters): break
-                    # Clamp input to avoid extreme Kalman state changes
+                    # Correct state with new observation
                     self.kalman_filters[i].correct(np.array([[np.float32(pt[0])], [np.float32(pt[1])]]))
-                    pred = self.kalman_filters[i].predict()
-                    kalman_pts.append((pred[0, 0], pred[1, 0]))
+                    # statePost is the state after correction
+                    state = self.kalman_filters[i].statePost
+                    kalman_pts.append((state[0, 0], state[1, 0]))
 
                 if len(kalman_pts) < len(marker_cfg):
                     return self.last_tracked_points if self.last_tracked_points else detected_points
@@ -2150,6 +2200,12 @@ class Worker(QObject):
 
                 rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
                 self.projector_frame_ready.emit(QImage(rgb_proj.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
+
+                # 10. Update feedback mask for tracking (Projector Feed-Forward)
+                # We save the grayscale version of what was just projected to help the tracker
+                # ignore areas that are bright due to the projector.
+                with QMutexLocker(self.last_projected_frame_mutex):
+                    self.last_projected_frame_for_masking = cv2.cvtColor(warped_output, cv2.COLOR_BGR2GRAY)
 
                 elapsed = time.time() - start_time
 
