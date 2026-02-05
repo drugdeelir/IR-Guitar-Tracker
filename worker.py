@@ -418,8 +418,8 @@ class Worker(QObject):
             kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
             kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
             # Maximum stability: trust the model heavily to avoid jitter
-            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.0001
-            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
+            kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.00005
+            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.2
             kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
             self.kalman_filters.append(kf)
 
@@ -918,7 +918,8 @@ class Worker(QObject):
 
         # 2. Advanced Pre-processing to fight projector washout
         # Scale Top-Hat kernel with resolution to avoid hollowing out large markers
-        th_size = max(25, int(w / 120))
+        # Increased to 150+ for 4K feeds with large (80x60) markers
+        th_size = max(150, int(w / 30))
         th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_size, th_size))
         tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, th_kernel)
 
@@ -938,9 +939,9 @@ class Worker(QObject):
             _, thresh = cv2.threshold(gray_boosted, effective_threshold, 255, cv2.THRESH_BINARY)
 
         # Cleanup: Remove small noise and ensure markers are solid
-        kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_clean)
-        thresh = cv2.dilate(thresh, kernel_clean, iterations=1)
+        thresh = cv2.dilate(thresh, kernel_clean, iterations=3)
 
         # Using findContours for efficient blob finding
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -949,7 +950,8 @@ class Worker(QObject):
         rejected_points_raw = []
 
         # Min circularity: more lenient for still capture, strict for live tracking
-        min_circ = 0.45 if force_full else 0.85
+        # Lowered to 0.60 to handle perspective distortion on large markers
+        min_circ = 0.40 if force_full else 0.60
 
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -1029,7 +1031,8 @@ class Worker(QObject):
                 detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
 
             num_markers = len(marker_cfg)
-            limit = 12
+            # Increased limit to 25 to ensure real markers aren't crowded out by projector noise
+            limit = 25
             points_to_check = detected_points[:limit]
 
             best_match = None
@@ -1124,7 +1127,7 @@ class Worker(QObject):
                                             stickiness_err += np.linalg.norm(np.array(p[i]) - np.array(self.last_tracked_points[i]))
 
                                     # Increased stickiness weight to prioritize temporal continuity over visual exactness
-                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 5.0)
+                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0)
 
                                     if det > 0.1 and total_cost < best_overall_error:
                                         best_overall_error = total_cost
