@@ -66,8 +66,8 @@ def decode_gray_code(captures, target_range, threshold=8):
         # We only care about pixels where there is enough contrast
         # Use a more robust contrast check: (p-inv) / (p+inv) or absolute diff
         diff = np.abs(p - inv)
-        # Dynamic threshold: at least 10% of global range or fixed threshold
-        local_thresh = max(threshold, 0.05 * (np.max(p) - np.min(p)))
+        # Dynamic threshold: lowered to 2% to be more sensitive to dim projectors/low gain
+        local_thresh = max(threshold, 0.02 * (np.max(p) - np.min(p)))
         valid = diff > local_thresh
         bit[p > inv] = 1
         bits.append((bit, valid))
