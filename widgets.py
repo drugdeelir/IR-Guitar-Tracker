@@ -1,5 +1,5 @@
 
-from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QDialog
+from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer, QPointF
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon, QPolygonF, QColor
 
