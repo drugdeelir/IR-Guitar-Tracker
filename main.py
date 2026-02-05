@@ -20,15 +20,14 @@ from osc_handler import OSCHandler
 from utils import resource_path
 
 def get_available_cameras():
-    """Returns a list of available camera indices."""
+    """Returns a list of available camera indices quickly."""
     arr = []
-    # Optimization: Probe fewer indices (4 instead of 8) to reduce startup latency.
-    # 15+ second hangs are often caused by the OS timeout for non-existent or busy USB cameras.
-    for index in range(4):
-        # Use DSHOW on Windows as it's generally faster to probe
+    # Optimization: Probe fewer indices by default to speed up startup.
+    # Most users have 1-2 cameras. Probing 8 can take 10+ seconds.
+    for index in range(3):
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(index)
+            cap = cv2.VideoCapture(index) # Fallback
 
         if cap.isOpened():
             arr.append(index)
@@ -2559,15 +2558,23 @@ class ProjectionMappingApp(QMainWindow):
         if index < len(self.screens):
             screen = self.screens[index]
             geom = screen.geometry()
+
+            # Optimization: Ensure we are using physical pixels if possible,
+            # but Qt logical pixels are usually what setGeometry expects.
             self.worker.projector_width = geom.width()
             self.worker.projector_height = geom.height()
             self.worker._warp_map_dirty = True
 
             self.projector_window.hide()
-            self.projector_window.show() # Ensure window handle is created
+            # On Windows, Frameless + FullScreen works best if flags are set before show()
+            self.projector_window.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+
+            self.projector_window.show()
             handle = self.projector_window.windowHandle()
             if handle:
                 handle.setScreen(screen)
+
+            # Use geometry of the selected screen
             self.projector_window.setGeometry(geom)
             self.projector_window.showFullScreen()
 

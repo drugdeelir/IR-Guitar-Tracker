@@ -119,16 +119,10 @@ class TrackingThread(QThread):
             try:
                 start_time = time.time()
 
-                # Optimization: captured requested res in local scope to avoid scope errors
-                w_req, h_req = self.worker.requested_camera_res
-
-                # Logic refinement: Only switch if resolution ACTUALLY changed or camera source changed
-                # Also ensure we don't repeatedly try to set resolutions the camera doesn't support
-                if self.worker._camera_changed or ((w_req, h_req) != self.worker._current_camera_res and w_req <= 5000):
+                if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
                         # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
-                        # Logitech Brio and other 4K cameras benefit from DSHOW for resolution control
                         main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
                         if not main_cap.isOpened():
                             main_cap = cv2.VideoCapture(self.worker.video_source)
@@ -137,9 +131,9 @@ class TrackingThread(QThread):
                             # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-                            if w_req <= 5000:
-                                main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
-                                main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
+                            w_req, h_req = self.worker.requested_camera_res
+                            main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
+                            main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
                             # Buffering: Minimize latency
                             main_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -147,38 +141,30 @@ class TrackingThread(QThread):
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
-                        # CAMERA DIAGNOSTICS & SETUP
-                        # Note: property values are backend-dependent (DSHOW vs MSMF vs V4L2)
-                        # We try to set reasonable defaults but prioritize stability
-                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) # Manual (usually)
-                        main_cap.set(cv2.CAP_PROP_GAIN, 0)
 
-                        # Log camera properties for diagnostics as requested
-                        print(f"[CAM DIAG] Backend: {main_cap.getBackendName()}")
-                        print(f"[CAM DIAG] Format: {main_cap.get(cv2.CAP_PROP_FOURCC)}")
-                        print(f"[CAM DIAG] FPS: {main_cap.get(cv2.CAP_PROP_FPS)}")
+                        # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
+                        # Note: behavior is backend dependent. 1/0.25 usually means manual.
+                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                        main_cap.set(cv2.CAP_PROP_GAIN, 0)
 
                         # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        self.worker._current_camera_res = (act_w, act_h)
 
-                        # Only proceed if we have a valid resolution read-back
-                        if act_w > 0 and act_h > 0:
-                            self.worker._current_camera_res = (act_w, act_h)
+                        # Clear frame buffer to avoid resolution mismatch
+                        with QMutexLocker(self.worker.latest_main_frame_mutex):
+                             self.worker.latest_main_frame = None
 
-                            # Clear frame buffer to avoid resolution mismatch
-                            with QMutexLocker(self.worker.latest_main_frame_mutex):
-                                 self.worker.latest_main_frame = None
+                        # Update requested res to match reality to prevent infinite re-initialization
+                        # if the camera doesn't support the requested resolution.
+                        self.worker.requested_camera_res = (act_w, act_h)
 
-                            # If we requested max res, update the request to match reality
-                            # to prevent constant re-initialization
-                            if w_req > 5000:
-                                self.worker.requested_camera_res = (act_w, act_h)
-
-                            self.worker.camera_matrix = None # Reset estimation
-                            print(f"Camera Resolution Switched to: {act_w}x{act_h}")
+                        self.worker.camera_matrix = None # Reset estimation
+                        print(f"Camera Resolution Switched to: {act_w}x{act_h}")
                     else:
-                        self.worker.camera_error.emit(self.worker.video_source)
+                        if self.worker._camera_changed:
+                            self.worker.camera_error.emit(self.worker.video_source)
                         main_cap = None
 
                 if main_cap is None:
@@ -752,9 +738,7 @@ class Worker(QObject):
             else:
                 period = 60.0 / self.bpm
                 if (time.time() % period) < (period / 2.0): trigger = True
-            if trigger:
-                # Defensive: use explicit shape/type for strobe clear
-                u_frame = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
+            if trigger: u_frame = cv2.UMat(np.zeros_like(frame))
 
         if 'rgb_shift' in mask.active_fx:
             mod = 1.0
@@ -797,7 +781,7 @@ class Worker(QObject):
                     u_frame = cv2.addWeighted(u_frame, 0.4, u_trail, 0.6, 0)
 
             # Store copy on GPU to avoid download/upload
-            u_copy = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
+            u_copy = cv2.UMat(h, w, cv2.CV_8UC3)
             u_frame.copyTo(u_copy)
             self.trail_buffers[mask_id] = (u_copy, h, w)
 
@@ -815,7 +799,7 @@ class Worker(QObject):
                     u_prev_w = cv2.warpAffine(u_prev, M, (w, h))
                     u_frame = cv2.addWeighted(u_frame, 0.7, u_prev_w, 0.3, 0)
 
-            u_copy = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
+            u_copy = cv2.UMat(h, w, cv2.CV_8UC3)
             u_frame.copyTo(u_copy)
             self.trail_buffers[mask_id] = (u_copy, h, w)
 
@@ -856,8 +840,8 @@ class Worker(QObject):
                 if 'tint' in self.audio_param_mappings:
                     mod *= (self.audio_bands[self.audio_param_mappings['tint']] * 3)
                 alpha = 0.3 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
-                # Performance: filling on GPU with rectangle is faster than np.full_like
-                u_tint = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
+                # Performance: cv2.rectangle on UMat is used as fill
+                u_tint = cv2.UMat(h, w, cv2.CV_8UC3)
                 cv2.rectangle(u_tint, (0, 0), (w, h), mask.tint_color, -1)
                 u_frame = cv2.addWeighted(u_frame, 1.0 - alpha, u_tint, alpha, 0)
 
@@ -1594,8 +1578,6 @@ class Worker(QObject):
 
                 # Projector and Render Resolution
                 h_proj, w_proj = self.projector_height, self.projector_width
-                if w_proj <= 0 or h_proj <= 0:
-                    w_proj, h_proj = 1280, 720
 
                 # Dynamically calculate render resolution based on projector dimensions
                 # For ultra-wide setups (like 4480px), we want higher internal res
@@ -1603,20 +1585,12 @@ class Worker(QObject):
                     # Bypassing render scale for calibration steps to ensure 1:1 pixel mapping
                     w, h = w_proj, h_proj
                 else:
-                    # ASPECT RATIO PRESERVATION: Ensure render resolution matches projector aspect ratio
-                    proj_aspect = w_proj / h_proj
-
                     target_w = int(w_proj * self.render_scale)
                     target_h = int(h_proj * self.render_scale)
 
-                    # Clamp to reasonable limits for performance while preserving aspect
+                    # Clamp to reasonable limits for performance
                     self.render_width = max(640, min(target_w, 2560))
-                    self.render_height = int(self.render_width / proj_aspect)
-
-                    if self.render_height > 1440:
-                        self.render_height = 1440
-                        self.render_width = int(self.render_height * proj_aspect)
-
+                    self.render_height = max(360, min(target_h, 1440))
                     w, h = self.render_width, self.render_height
 
                 if self.camera_matrix is None:
@@ -1639,7 +1613,9 @@ class Worker(QObject):
 
                 if self._run_boundary_detection_flag:
                     # Ensure resolution is stable before capturing
-                    if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                    if self.requested_camera_res[0] > 5000 or \
+                       main_frame.shape[1] != self.requested_camera_res[0] or \
+                       main_frame.shape[0] != self.requested_camera_res[1]:
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
                         continue
@@ -1739,12 +1715,12 @@ class Worker(QObject):
                         self._boundary_captures = []
                 elif self._run_sls_flag:
                     # Ensure resolution is stable before capturing
-                    # Optimization: Use a slightly more lenient check or a timeout to avoid hangs
-                    if abs(main_frame.shape[1] - self.requested_camera_res[0]) > 10 or abs(main_frame.shape[0] - self.requested_camera_res[1]) > 10:
-                        # If we've been waiting too long, just proceed with what we have
-                        if self._sls_curr_wait < 60: # ~2 seconds
-                             self._sls_curr_wait += 1
-                             continue
+                    if self.requested_camera_res[0] > 5000 or \
+                       main_frame.shape[1] != self.requested_camera_res[0] or \
+                       main_frame.shape[0] != self.requested_camera_res[1]:
+                        # Still waiting for camera thread to catch up
+                        self._sls_curr_wait = 0
+                        continue
 
                     # Structured Light Scanning takes priority
                     total_x = len(self._sls_patterns_x)
@@ -1805,14 +1781,14 @@ class Worker(QObject):
 
                         # Automatically derive Projector Boundary from SLS valid mask
                         # Clean up the mask aggressively to fill holes and smooth edges
-                        kernel = np.ones((11, 11), np.uint8)
+                        kernel = np.ones((21, 21), np.uint8)
                         mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
                         mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
-                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=1)
+                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
 
                         contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        # Filter contours by size - significantly lowered threshold to 2% of FOV
-                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.02)]
+                        # Filter contours by size
+                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.1)]
 
                         if valid_contours:
                             main_contour = max(valid_contours, key=cv2.contourArea)
@@ -1944,14 +1920,17 @@ class Worker(QObject):
                 # Performance: Composition on GPU
                 u_projector_output = self.u_projector_output
 
-                # Sync CPU composition to GPU for calibration/setup modes
-                if self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag or self.show_camera_on_projector or self.show_calibration_pattern or self.show_calibration_verify:
+                # If we updated the CPU buffer (SLS/Calibration), upload it to GPU
+                if self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag or self.show_camera_on_projector or self.show_calibration_pattern or self.show_calibration_verify or self.show_splash:
                     u_projector_output = cv2.UMat(projector_output)
+                    self.u_projector_output = u_projector_output # Keep reference
 
                 # Handle Auto-Calibration logic (Multi-frame averaging)
                 if self._run_calibration_flag:
                     # Ensure resolution is stable before capturing
-                    if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                    if self.requested_camera_res[0] > 5000 or \
+                       main_frame.shape[1] != self.requested_camera_res[0] or \
+                       main_frame.shape[0] != self.requested_camera_res[1]:
                         continue
 
                     if curr_frame_id > self._last_captured_frame_id:
@@ -2302,8 +2281,8 @@ class Worker(QObject):
                                 if not mask.source_points:
                                     # Use UMat for resize
                                     u_warped_cue = cv2.resize(u_effective_frame_cue, (w, h))
-                                    # Use rectangle on GPU to fill
-                                    u_mask_img = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
+                                    # Use cv2.rectangle on GPU for fill
+                                    u_mask_img = cv2.UMat(h, w, cv2.CV_8UC3)
                                     cv2.rectangle(u_mask_img, (0, 0), (w, h), (255, 255, 255), -1)
                                 else:
                                     src_pts_static = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
@@ -2500,9 +2479,7 @@ class Worker(QObject):
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
                 QThread.msleep(sleep_time)
             except Exception as e:
-                import traceback
                 print(f"Critical Error in Rendering Loop: {e}")
-                traceback.print_exc()
                 QThread.msleep(500)
 
         self.tracking_thread.stop()
@@ -2777,11 +2754,6 @@ class Worker(QObject):
         u_overlay = overlay if isinstance(overlay, cv2.UMat) else cv2.UMat(overlay)
         u_mask = mask_img if isinstance(mask_img, cv2.UMat) else cv2.UMat(mask_img)
 
-        # Ensure u_mask has the same number of channels as u_base
-        # UMat doesn't expose channels() in Python easily, so we check via get().shape
-        if len(u_mask.get().shape) == 2:
-            u_mask = cv2.merge([u_mask, u_mask, u_mask])
-
         # Optimized integer-based blending on GPU
         if mode == 'normal':
             # Full alpha blending: res = overlay * (mask/255) + base * (1 - mask/255)
@@ -2927,18 +2899,8 @@ class Worker(QObject):
             except:
                 pass
 
-        # Fallback: Proportional scaling with aspect ratio correction if not calibrated
-        # We want to map the camera's central FOV to the projector's FOV while maintaining relative shape
-        if target_w > 0 and target_h > 0:
-            cal_w, cal_h = self.calibration_camera_res if self.calibration_camera_res else (w_cam, h_cam)
-            if cal_w > 0 and cal_h > 0:
-                cam_aspect = cal_w / cal_h
-                proj_aspect = target_w / target_h
-
-                # If aspects don't match, the mapping will be distorted without calibration.
-                # We default to stretching to fill the FOV as it's the most common 'setup' expectation.
-                return pts_arr * [target_w, target_h]
-
+        # Fallback: Simple proportional scaling if not calibrated
+        # Since pts_arr is normalized, we just scale by target dimensions
         return pts_arr * [target_w, target_h]
 
     def set_warp_points(self, points, res=None):

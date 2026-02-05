@@ -471,6 +471,7 @@ class ProjectorWindow(QOpenGLWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projector Output")
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setStyleSheet("background-color: black;")
         self.current_pixmap = None
 
