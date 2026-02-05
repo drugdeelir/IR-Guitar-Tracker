@@ -925,6 +925,10 @@ class Worker(QObject):
             limit = 12
             points_to_check = detected_points[:limit]
 
+            best_match = None
+            best_matrix = None
+            best_overall_error = float('inf')
+
             # Try to find a match with N markers first, then N-1
             for search_count in [num_markers, num_markers - 1]:
                 if len(points_to_check) < search_count: continue
@@ -932,20 +936,12 @@ class Worker(QObject):
                 for indices in combinations(range(len(points_to_check)), search_count):
                     point_combo = [points_to_check[i] for i in indices]
 
-                    # We need to find WHICH N-1 markers we found.
-                    # Try to match the combo to subsets of the config
-                    best_match = None
-                    best_matrix = None
-                    best_error = float('inf')
-
                     # If we found all N markers
                     if search_count == num_markers:
                         src_pts = np.float32(marker_cfg).reshape(-1, 1, 2)
-                        dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
-                        # We don't know the order yet. For N points, try a simpler approach if N is small
-                        # or use the last homography as a seed.
+
+                        # Case 1: Already tracking - Use distance-based ordering from last known transform
                         if self.last_homography is not None and self.confidence > 0.3:
-                            # Re-order point_combo to match marker_cfg based on last known transform
                             transformed_src = cv2.perspectiveTransform(src_pts, self.last_homography)
                             ordered_dst = []
                             temp_dst = list(point_combo)
@@ -954,50 +950,53 @@ class Worker(QObject):
                                 closest_idx = min(range(len(temp_dst)), key=lambda j: np.linalg.norm(np.array(temp_dst[j]) - pred))
                                 ordered_dst.append(temp_dst.pop(closest_idx))
 
+                            ordered_dst_arr = np.float32(ordered_dst).reshape(-1, 1, 2)
                             if len(src_pts) >= 4:
-                                m, mask = cv2.findHomography(src_pts, np.float32(ordered_dst).reshape(-1, 1, 2), cv2.RANSAC, 0.01)
+                                m, _ = cv2.findHomography(src_pts, ordered_dst_arr, 0)
                             else:
-                                # Fallback to Affine for 3 points
-                                m, mask = cv2.estimateAffinePartial2D(src_pts, np.float32(ordered_dst).reshape(-1, 1, 2))
+                                m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
                                 if m is not None:
-                                    h = np.eye(3, dtype=np.float32)
-                                    h[:2, :] = m
-                                    m = h
-                                    mask = np.ones(len(src_pts), dtype=np.uint8)
+                                    h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
 
-                            if m is not None and (len(src_pts) < 3 or np.sum(mask) >= 3):
-                                best_match = ordered_dst
-                                best_matrix = m
-                                break
-                        else:
-                            # Search for best permutation (only if N is small)
-                            if len(marker_cfg) <= 4: # Safety to avoid factorial explosion
-                                for p in permutations(point_combo):
-                                    if len(src_pts) >= 4:
-                                        m, mask = cv2.findHomography(src_pts, np.float32(p).reshape(-1, 1, 2), cv2.RANSAC, 0.01)
-                                    else:
-                                        m, mask = cv2.estimateAffinePartial2D(src_pts, np.float32(p).reshape(-1, 1, 2))
-                                        if m is not None:
-                                            h = np.eye(3, dtype=np.float32)
-                                            h[:2, :] = m
-                                            m = h
-                                            mask = np.ones(len(src_pts), dtype=np.uint8)
+                            if m is not None:
+                                proj = cv2.perspectiveTransform(src_pts, m)
+                                err = np.mean(np.linalg.norm(proj - ordered_dst_arr, axis=2))
+                                if err < 0.05: # Reasonable lock
+                                    best_match = ordered_dst
+                                    best_matrix = m
+                                    best_overall_error = err
+                                    break # Good enough
 
-                                    if m is not None and (len(src_pts) < 3 or np.sum(mask) >= 3):
-                                        err = 0 # Could calc projection error
+                        # Case 2: Searching - Try all permutations and find the most physically plausible one
+                        if best_match is None and len(marker_cfg) <= 4:
+                            for p in permutations(point_combo):
+                                p_arr = np.float32(p).reshape(-1, 1, 2)
+                                if len(src_pts) >= 4:
+                                    m, _ = cv2.findHomography(src_pts, p_arr, 0)
+                                else:
+                                    m, _ = cv2.estimateAffinePartial2D(src_pts, p_arr)
+                                    if m is not None:
+                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+
+                                if m is not None:
+                                    # Calculate reprojection error
+                                    proj = cv2.perspectiveTransform(src_pts, m)
+                                    err = np.mean(np.linalg.norm(proj - p_arr, axis=2))
+
+                                    # Geometric sanity check: Check determinant to avoid mirrors/flips
+                                    det = np.linalg.det(m[:2, :2])
+                                    if det > 0 and err < best_overall_error:
+                                        best_overall_error = err
                                         best_match = list(p)
                                         best_matrix = m
-                                        break
-                            if best_match: break
+                            if best_match and best_overall_error < 0.05: break
 
                     # If we found N-1 markers
                     elif search_count == num_markers - 1 and self.last_homography is not None:
-                        # Try each subset of the config
                         for missing_idx in range(num_markers):
                             subset_cfg = [marker_cfg[i] for i in range(num_markers) if i != missing_idx]
                             src_pts = np.float32(subset_cfg).reshape(-1, 1, 2)
 
-                            # Order points using last homography
                             transformed_src = cv2.perspectiveTransform(src_pts, self.last_homography)
                             ordered_dst = []
                             temp_dst = list(point_combo)
@@ -1006,27 +1005,28 @@ class Worker(QObject):
                                 closest_idx = min(range(len(temp_dst)), key=lambda j: np.linalg.norm(np.array(temp_dst[j]) - pred))
                                 ordered_dst.append(temp_dst.pop(closest_idx))
 
+                            ordered_dst_arr = np.float32(ordered_dst).reshape(-1, 1, 2)
                             if len(src_pts) >= 4:
-                                m, mask = cv2.findHomography(src_pts, np.float32(ordered_dst).reshape(-1, 1, 2), cv2.RANSAC, 0.01)
+                                m, _ = cv2.findHomography(src_pts, ordered_dst_arr, 0)
                             else:
-                                m, mask = cv2.estimateAffinePartial2D(src_pts, np.float32(ordered_dst).reshape(-1, 1, 2))
+                                m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
                                 if m is not None:
-                                    h = np.eye(3, dtype=np.float32)
-                                    h[:2, :] = m
-                                    m = h
-                                    mask = np.ones(len(src_pts), dtype=np.uint8)
+                                    h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
 
-                            if m is not None and (len(src_pts) < 3 or np.sum(mask) >= 3):
-                                # Re-predict the full set
-                                full_src = np.float32(marker_cfg).reshape(-1, 1, 2)
-                                predicted_full = cv2.perspectiveTransform(full_src, m).reshape(-1, 2)
-                                best_match = [tuple(p) for p in predicted_full]
-                                best_matrix = m
-                                break
+                            if m is not None:
+                                proj = cv2.perspectiveTransform(src_pts, m)
+                                err = np.mean(np.linalg.norm(proj - ordered_dst_arr, axis=2))
+                                if err < 0.05:
+                                    full_src = np.float32(marker_cfg).reshape(-1, 1, 2)
+                                    predicted_full = cv2.perspectiveTransform(full_src, m).reshape(-1, 2)
+                                    best_match = [tuple(p) for p in predicted_full]
+                                    best_matrix = m
+                                    best_overall_error = err
+                                    break
                         if best_match: break
                 if best_match: break
 
-            if best_match:
+            if best_match and best_overall_error < 0.1: # Final threshold for a valid lock
                 # Sanity Check: Filter out sudden jumps (reflections)
                 if self.last_tracked_points is not None and self.confidence > 0.6:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
@@ -1077,6 +1077,9 @@ class Worker(QObject):
             self.history_points = []
             self.smoothed_points = None
             self.last_homography = None
+            # Reset Kalman filters
+            if self.marker_config:
+                self.init_kalman(len(self.marker_config))
 
         if (self.confidence > 0.1 or self.tracking_freeze_enabled) and self.last_tracked_points:
             return self.last_tracked_points

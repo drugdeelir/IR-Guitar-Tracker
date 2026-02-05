@@ -807,23 +807,31 @@ class ProjectionMappingApp(QMainWindow):
     def handle_boundary_detected(self, points):
         if not points:
             self.statusBar().showMessage("Boundary Detection Failed! Ensure camera sees projector.", 5000)
+            self.log("Error: Projector boundary detection failed. Is the camera seeing the projection?")
             return
 
         self.statusBar().showMessage(f"Detected Projector Boundary with {len(points)} points.", 3000)
+        self.log(f"Auto-Scan: Detected projector usable area ({len(points)} points). Creating background mask...")
 
         # Create/Update Background Mask
         bg_mask = None
+        # Look for existing background or one named "Background"
         for m in self.masks:
-            if m.tag == 'background':
+            if m.tag == 'background' or m.name == "Background":
                 bg_mask = m
                 break
 
         if not bg_mask:
-            bg_mask = Mask("Background", points, None, tag="background", mask_type="static")
+            bg_mask = Mask("Background", points, "generator:grid", tag="background", mask_type="static")
             self.masks.append(bg_mask)
+            self.log("Created new 'Background' mask.")
         else:
             bg_mask.source_points = points
+            bg_mask.tag = 'background'
             bg_mask.visible = True
+            if not bg_mask.video_path:
+                bg_mask.video_path = "generator:grid"
+            self.log(f"Updated existing '{bg_mask.name}' mask with new boundary.")
 
         self.update_cue_table()
         self.update_mask_combos()
@@ -2222,22 +2230,23 @@ class ProjectionMappingApp(QMainWindow):
         if hasattr(self, 'mask_feather_slider'):
             mask.feather = self.mask_feather_slider.value()
 
-        # Specific handling for Setup Wizard tags
-        if self.setup_step == 1: # Background step
-            mask.tag = 'background'
-            mask.type = 'static'
-            mask.name = 'Background'
-        elif self.setup_step == 3: # Guitar Mask step
-            mask.tag = 'amp'
-            mask.type = 'dynamic'
-            mask.name = 'Guitar'
-            # Automatically link to markers if they exist
-            if self.selected_markers and not mask.is_linked:
-                 self.link_mask_to_markers(mask)
-        elif self.setup_step == 4: # Amp Mask step
-            mask.tag = 'background'
-            mask.type = 'static'
-            mask.name = 'Amp'
+        # Specific handling for Setup Wizard tags - only apply if currently in the wizard tab
+        if self.tabs.currentIndex() == 0:
+            if self.setup_step == 1: # Background step
+                mask.tag = 'background'
+                mask.type = 'static'
+                mask.name = 'Background'
+            elif self.setup_step == 3: # Guitar Mask step
+                mask.tag = 'amp'
+                mask.type = 'dynamic'
+                mask.name = 'Guitar'
+                # Automatically link to markers if they exist
+                if self.selected_markers and not mask.is_linked:
+                     self.link_mask_to_markers(mask)
+            elif self.setup_step == 4: # Amp Mask step
+                mask.tag = 'background'
+                mask.type = 'static'
+                mask.name = 'Amp'
 
         self.update_cue_table()
         self.update_mask_combos()
