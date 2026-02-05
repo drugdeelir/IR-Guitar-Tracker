@@ -7,7 +7,7 @@ def gray_to_binary(n):
         mask = mask >> 1
     return n
 
-def generate_gray_code_patterns(width, height, max_bits=8):
+def generate_gray_code_patterns(width, height, max_bits=11):
     # Limit bits to ensure stripes are resolvable by camera (min ~5px)
     n_x = min(int(np.ceil(np.log2(width))), max_bits)
     n_y = min(int(np.ceil(np.log2(height))), max_bits)
@@ -38,28 +38,31 @@ def generate_gray_code_patterns(width, height, max_bits=8):
 
     return patterns_x, patterns_y
 
-def decode_gray_code(captures, target_range, threshold=3):
-    if not captures:
-        return np.zeros((480, 640), dtype=np.int32), np.zeros((480, 640), dtype=bool)
+def decode_gray_code(captures, target_range, threshold=5):
+    if not captures or len(captures) == 0:
+        return np.zeros((1, 1), dtype=np.int32), np.zeros((1, 1), dtype=bool)
 
     # Shape validation: ensure all captures have the same dimensions
-    base_shape = captures[0].shape
+    try:
+        base_shape = captures[0].shape
+    except (AttributeError, IndexError):
+        return np.zeros((1, 1), dtype=np.int32), np.zeros((1, 1), dtype=bool)
+
     for i, cap in enumerate(captures):
-        if cap.shape != base_shape:
-            print(f"Error: Mismatched capture shape at index {i}. Expected {base_shape}, got {cap.shape}")
-            # Return empty result to avoid crash
+        if cap is None or not hasattr(cap, 'shape') or cap.shape != base_shape:
+            print(f"Error: Mismatched or invalid capture at index {i}. Expected {base_shape}")
             return np.zeros(base_shape, dtype=np.int32), np.zeros(base_shape, dtype=bool)
 
     # captures: list of (pattern, inverse_pattern) pairs
     # returns bitmask where bits are set if pattern > inverse_pattern + threshold
     bits = []
     for i in range(0, len(captures), 2):
+        if i+1 >= len(captures): break
         p = captures[i].astype(np.int16)
         inv = captures[i+1].astype(np.int16)
 
         bit = np.zeros(p.shape, dtype=np.uint8)
         # We only care about pixels where there is enough contrast
-        # Very low threshold for IR cameras
         diff = np.abs(p - inv)
         valid = diff > threshold
         bit[p > inv] = 1

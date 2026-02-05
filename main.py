@@ -2302,18 +2302,21 @@ class ProjectionMappingApp(QMainWindow):
             if self.setup_step == 1: # Background step
                 mask.tag = 'background'
                 mask.type = 'static'
-                mask.name = 'Background'
+                if not mask.name or mask.name.startswith("Mask"):
+                    mask.name = 'Background'
             elif self.setup_step == 3: # Guitar Mask step
                 mask.tag = 'amp'
                 mask.type = 'dynamic'
-                mask.name = 'Guitar'
+                if not mask.name or mask.name.startswith("Mask"):
+                    mask.name = 'Guitar'
                 # Automatically link to markers if they exist
                 if self.selected_markers and not mask.is_linked:
                      self.link_mask_to_markers(mask)
             elif self.setup_step == 4: # Amp Mask step
                 mask.tag = 'background'
                 mask.type = 'static'
-                mask.name = 'Amp'
+                if not mask.name or mask.name.startswith("Mask"):
+                    mask.name = 'Amp'
 
         self.update_cue_table()
         self.update_mask_combos()
@@ -2397,6 +2400,12 @@ class ProjectionMappingApp(QMainWindow):
 
     def link_mask_to_markers(self, mask=None):
         if isinstance(mask, bool): mask = None
+
+        # Ensure we have markers selected
+        if not self.selected_markers and (not hasattr(self.worker, 'marker_config') or not self.worker.marker_config):
+            self.statusBar().showMessage("Please select IR markers first.", 3000)
+            return
+
         # Determine which mask to link based on dropdown or selection
         target_mask_name = None
         if not mask:
@@ -2425,9 +2434,6 @@ class ProjectionMappingApp(QMainWindow):
             self.statusBar().showMessage("Please select a mask to link.", 3000)
             return
 
-        if not self.selected_markers:
-            self.statusBar().showMessage("Please select IR markers first.", 3000)
-            return
 
         if not mask.source_points:
             self.statusBar().showMessage("Please draw the mask points first.", 3000)

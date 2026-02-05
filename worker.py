@@ -946,13 +946,17 @@ class Worker(QObject):
 
             # Try to find a match with N markers first, then N-1
             # We use list to avoid search_count being a generator or None
+            # Defensive checks to avoid search crashes
+            if marker_fp is None: marker_fp = []
+            if points_to_check is None: points_to_check = []
+
             for search_count in [num_markers, num_markers - 1]:
                 if search_count < 3: continue
                 if len(points_to_check) < search_count: continue
 
                 for indices in combinations(range(len(points_to_check)), search_count):
                     point_combo = [points_to_check[i] for i in indices]
-                    if not point_combo: continue
+                    if not point_combo or len(point_combo) < search_count: continue
 
                     # If we found all N markers
                     if search_count == num_markers:
@@ -964,26 +968,28 @@ class Worker(QObject):
                             ordered_dst = []
                             temp_dst = list(point_combo)
                             for i in range(num_markers):
+                                if i >= len(transformed_src) or not temp_dst: break
                                 pred = transformed_src[i][0]
                                 closest_idx = min(range(len(temp_dst)), key=lambda j: np.linalg.norm(np.array(temp_dst[j]) - pred))
                                 ordered_dst.append(temp_dst.pop(closest_idx))
 
-                            ordered_dst_arr = np.float32(ordered_dst).reshape(-1, 1, 2)
-                            if len(src_pts) >= 4:
-                                m, _ = cv2.findHomography(src_pts, ordered_dst_arr, 0)
-                            else:
-                                m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
-                                if m is not None:
-                                    h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                            if len(ordered_dst) == num_markers:
+                                ordered_dst_arr = np.float32(ordered_dst).reshape(-1, 1, 2)
+                                if len(src_pts) >= 4:
+                                    m, _ = cv2.findHomography(src_pts, ordered_dst_arr, 0)
+                                else:
+                                    m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
+                                    if m is not None:
+                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
 
-                            if m is not None:
-                                proj = cv2.perspectiveTransform(src_pts, m)
-                                err = np.mean(np.linalg.norm(proj - ordered_dst_arr, axis=2))
-                                if err < 0.05: # Reasonable lock
-                                    best_match = ordered_dst
-                                    best_matrix = m
-                                    best_overall_error = err
-                                    break # Good enough
+                                if m is not None:
+                                    proj = cv2.perspectiveTransform(src_pts, m)
+                                    err = np.mean(np.linalg.norm(proj - ordered_dst_arr, axis=2))
+                                    if err < 0.05: # Reasonable lock
+                                        best_match = ordered_dst
+                                        best_matrix = m
+                                        best_overall_error = err
+                                        break # Good enough
 
                         # Case 2: Searching - Try all permutations and find the most physically plausible one
                         if best_match is None and len(marker_cfg) <= 4:
@@ -1011,7 +1017,6 @@ class Worker(QObject):
                                     combo_fp = sorted(combo_distances)
 
                                     # Normalized cost: err + fingerprint_mismatch
-                                    # marker_fp check to avoid zip issues
                                     if marker_fp and len(combo_fp) == len(marker_fp):
                                         fp_err = np.mean([abs(a - b) for a, b in zip(combo_fp, marker_fp)])
                                     else:
@@ -1035,28 +1040,30 @@ class Worker(QObject):
                             ordered_dst = []
                             temp_dst = list(point_combo)
                             for i in range(search_count):
+                                if i >= len(transformed_src) or not temp_dst: break
                                 pred = transformed_src[i][0]
                                 closest_idx = min(range(len(temp_dst)), key=lambda j: np.linalg.norm(np.array(temp_dst[j]) - pred))
                                 ordered_dst.append(temp_dst.pop(closest_idx))
 
-                            ordered_dst_arr = np.float32(ordered_dst).reshape(-1, 1, 2)
-                            if len(src_pts) >= 4:
-                                m, _ = cv2.findHomography(src_pts, ordered_dst_arr, 0)
-                            else:
-                                m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
-                                if m is not None:
-                                    h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                            if len(ordered_dst) == search_count:
+                                ordered_dst_arr = np.float32(ordered_dst).reshape(-1, 1, 2)
+                                if len(src_pts) >= 4:
+                                    m, _ = cv2.findHomography(src_pts, ordered_dst_arr, 0)
+                                else:
+                                    m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
+                                    if m is not None:
+                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
 
-                            if m is not None:
-                                proj = cv2.perspectiveTransform(src_pts, m)
-                                err = np.mean(np.linalg.norm(proj - ordered_dst_arr, axis=2))
-                                if err < 0.05:
-                                    full_src = np.float32(marker_cfg).reshape(-1, 1, 2)
-                                    predicted_full = cv2.perspectiveTransform(full_src, m).reshape(-1, 2)
-                                    best_match = [tuple(p) for p in predicted_full]
-                                    best_matrix = m
-                                    best_overall_error = err
-                                    break
+                                if m is not None:
+                                    proj = cv2.perspectiveTransform(src_pts, m)
+                                    err = np.mean(np.linalg.norm(proj - ordered_dst_arr, axis=2))
+                                    if err < 0.05:
+                                        full_src = np.float32(marker_cfg).reshape(-1, 1, 2)
+                                        predicted_full = cv2.perspectiveTransform(full_src, m).reshape(-1, 2)
+                                        best_match = [tuple(p) for p in predicted_full]
+                                        best_matrix = m
+                                        best_overall_error = err
+                                        break
                         if best_match: break
                 if best_match: break
 
@@ -1065,25 +1072,29 @@ class Worker(QObject):
                 if self.last_tracked_points is not None and self.confidence > 0.3:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
                     curr_center = np.mean(best_match, axis=0)
-                    # For a guitar, moving > 12% of screen width in one frame is unlikely
-                    if np.linalg.norm(curr_center - prev_center) > 0.12:
+                    # For a guitar, moving > 10% of screen width in one frame is unlikely
+                    if np.linalg.norm(curr_center - prev_center) > 0.10:
                         self.confidence = max(0.0, self.confidence - 0.2)
                         return self.last_tracked_points
 
                 # Kalman Correction
                 kalman_pts = []
                 for i, pt in enumerate(best_match):
+                    if i >= len(self.kalman_filters): break
                     # Clamp input to avoid extreme Kalman state changes
                     self.kalman_filters[i].correct(np.array([[np.float32(pt[0])], [np.float32(pt[1])]]))
                     pred = self.kalman_filters[i].predict()
                     kalman_pts.append((pred[0, 0], pred[1, 0]))
+
+                if len(kalman_pts) < len(marker_cfg):
+                    return self.last_tracked_points if self.last_tracked_points else detected_points
 
                 new_points_arr = np.array(kalman_pts, dtype=np.float32)
 
                 # Decisive Reset: If current points are too far from the history
                 if self.smoothed_points is not None and self.confidence > 0.5:
                     dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
-                    if dist > 0.1: # Significant jump detected
+                    if dist > 0.08: # Significant jump detected (lowered for better stability)
                         self.confidence = max(0.0, self.confidence - 0.15)
                         return self.last_tracked_points
 
@@ -1092,7 +1103,7 @@ class Worker(QObject):
                     self.smoothed_points = new_points_arr
                 else:
                     # Stricter Alpha for stability
-                    alpha = (1.0 - self.smoothing_factor) * 0.5
+                    alpha = (1.0 - self.smoothing_factor) * 0.3 # Even more strict
                     self.smoothed_points = self.smoothed_points * (1.0 - alpha) + new_points_arr * alpha
 
                 # Moving Average over history
@@ -1354,13 +1365,17 @@ class Worker(QObject):
                             # Use Convex Hull to ignore internal details and just get the footprint
                             hull = cv2.convexHull(main_contour)
 
-                            # Simplification
+                            # Simplification (use a smaller epsilon to avoid losing detail)
                             peri = cv2.arcLength(hull, True)
-                            approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
+                            approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
 
-                            # If the detected boundary is still complex, force a 4-point rectangle
-                            # because the user likely wants the full wall/projector screen area.
-                            if len(approx) > 6:
+                            # Ensure at least a quad if it's too simple
+                            if len(approx) < 4:
+                                rect = cv2.minAreaRect(hull)
+                                approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+                            # If the detected boundary is still very complex, use minAreaRect
+                            elif len(approx) > 12:
                                 rect = cv2.minAreaRect(hull)
                                 approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
@@ -1445,9 +1460,9 @@ class Worker(QObject):
                             # Use convex hull and force a simple polygon or rectangle
                             hull = cv2.convexHull(main_contour)
                             peri = cv2.arcLength(hull, True)
-                            approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+                            approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
 
-                            if len(approx) > 6:
+                            if len(approx) < 4 or len(approx) > 12:
                                 rect = cv2.minAreaRect(hull)
                                 approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
@@ -1856,7 +1871,7 @@ class Worker(QObject):
                                 video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
 
                                 if len(dst_pts) == 4:
-                                    dst_pts_warp = np.float32(dst_pts).reshape(-1, 2)
+                                    dst_pts_warp = np.float32(dst_pts).reshape(4, 2)
                                 elif len(dst_pts) >= 3:
                                     dst_pts_arr = np.array(dst_pts, dtype=np.float32)
                                     if not np.all(np.isfinite(dst_pts_arr)):
@@ -1909,10 +1924,11 @@ class Worker(QObject):
                                     dst_pts = self.transform_to_projector(mask.source_points, target_w=w, target_h=h)
 
                                     if len(dst_pts) == 4:
-                                        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                                        matrix = cv2.getPerspectiveTransform(src_pts, np.float32(dst_pts).reshape(4, 2))
                                     elif len(dst_pts) >= 3:
-                                        min_x, min_y = np.min(dst_pts, axis=0)
-                                        max_x, max_y = np.max(dst_pts, axis=0)
+                                        dst_pts_arr = np.array(dst_pts, dtype=np.float32)
+                                        min_x, min_y = np.min(dst_pts_arr, axis=0)
+                                        max_x, max_y = np.max(dst_pts_arr, axis=0)
                                         bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
                                         matrix = cv2.getPerspectiveTransform(src_pts, bbox_pts)
                                     else:
