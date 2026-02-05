@@ -28,7 +28,11 @@ class VideoPlayer(QThread):
                 self.latest_frame = img
                 self.frame_id = 1
         else:
-            self.cap = cv2.VideoCapture(video_path)
+            # Try to use FFmpeg backend for better hardware support
+            self.cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+            if not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(video_path)
+
             self.fps = self.cap.get(cv2.CAP_PROP_FPS)
             if self.fps <= 0 or self.fps > 240: self.fps = 30.0
 
@@ -399,11 +403,19 @@ class Worker(QObject):
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         self.tracking_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
 
-        # Global OpenCV Performance Optimizations
+        # Global OpenCV Performance Optimizations & GPU Acceleration
         try:
             cv2.setUseOptimized(True)
             cv2.setNumThreads(4)
-        except: pass
+            # Enable OpenCL (GPU acceleration)
+            cv2.ocl.setUseOpenCL(True)
+            if cv2.ocl.haveOpenCL():
+                self.status_update.emit(f"GPU Acceleration Enabled: {cv2.ocl.useOpenCL()}")
+                print(f"[DEBUG] OpenCL Available. Using GPU: {cv2.ocl.useOpenCL()}")
+            else:
+                print("[DEBUG] OpenCL NOT Available in this environment.")
+        except Exception as e:
+            print(f"[DEBUG] Failed to init GPU acceleration: {e}")
 
         # Start Tracking Thread
         self.tracking_thread = TrackingThread(self)
@@ -890,7 +902,8 @@ class Worker(QObject):
 
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
         # Scale padding with resolution for wide setups
-        dynamic_padding = max(self.roi_padding, int(w * 0.03))
+        # Increased to 6% for better high-velocity neck tracking
+        dynamic_padding = max(self.roi_padding, int(w * 0.06))
 
         if not force_full and self.last_tracked_points is not None:
             # pts are normalized
@@ -924,7 +937,9 @@ class Worker(QObject):
                         proj_mask = cv2.resize(proj_mask_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
 
                         # Aggressive suppression (0.6) because user is not using an IR-pass filter
-                        gray = cv2.subtract(gray, (proj_mask.astype(np.float32) * 0.6).astype(np.uint8))
+                        # We cap the suppression to ensure we don't lose all signal in extremely bright areas
+                        suppression = np.clip(proj_mask.astype(np.float32) * 0.6, 0, 200).astype(np.uint8)
+                        gray = cv2.subtract(gray, suppression)
                     except: pass
 
         # 2. Advanced Pre-processing to fight projector washout
@@ -985,6 +1000,11 @@ class Worker(QObject):
                 # Mask the grayscale ROI with the binary blob to ignore nearby noise/projector light
                 # while preserving intensity weighting for sub-pixel precision.
                 weighted_roi = cv2.bitwise_and(dot_roi, mask_roi)
+
+                # REFINEMENT: Localized contrast boost for the blob area
+                if np.max(weighted_roi) > 0:
+                    weighted_roi = cv2.normalize(weighted_roi, None, 0, 255, cv2.NORM_MINMAX)
+
                 M = cv2.moments(weighted_roi)
 
                 if M["m00"] != 0:
@@ -1011,9 +1031,10 @@ class Worker(QObject):
         detected_points = []
         if self.confidence > 0.5:
             for p in detected_points_all:
-                if any(np.linalg.norm(np.array(p) - np.array(prev_p)) < 0.005 for prev_p in self.last_raw_detections):
+                # Increased radii to account for high-velocity "neck" movement
+                if any(np.linalg.norm(np.array(p) - np.array(prev_p)) < 0.01 for prev_p in self.last_raw_detections):
                     detected_points.append(p)
-                elif any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.02 for lp in (self.last_tracked_points or [])):
+                elif any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.05 for lp in (self.last_tracked_points or [])):
                     detected_points.append(p)
         else:
             detected_points = detected_points_all
@@ -1182,7 +1203,26 @@ class Worker(QObject):
                                     if err < 0.05:
                                         full_src = np.float32(marker_cfg).reshape(-1, 1, 2)
                                         predicted_full = cv2.perspectiveTransform(full_src, m).reshape(-1, 2)
-                                        best_match = [tuple(p) for p in predicted_full]
+
+                                        # RECOVERY: Look for the missing marker in the rejected list
+                                        # This is crucial for the "tricky" neck marker
+                                        final_points = list(predicted_full)
+                                        missing_pred = predicted_full[missing_idx]
+
+                                        all_cands = detected_points_raw + rejected_points_raw
+                                        best_cand = None
+                                        min_d = 0.03 # Search radius
+
+                                        for cand in all_cands:
+                                            cdist = np.linalg.norm(np.array(cand['pos']) - missing_pred)
+                                            if cdist < min_d:
+                                                min_d = cdist
+                                                best_cand = cand['pos']
+
+                                        if best_cand:
+                                            final_points[missing_idx] = best_cand
+
+                                        best_match = [tuple(p) for p in final_points]
                                         best_matrix = m
                                         best_overall_error = err
                                         break

@@ -1,5 +1,5 @@
 
-from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog
+from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog, QOpenGLWidget
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer, QPointF
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon, QPolygonF, QColor
 
@@ -227,7 +227,7 @@ class MaskDrawingDialog(QDialog):
     def set_points(self, points):
         self.video_display.set_mask_points(points)
 
-class VideoDisplay(QWidget):
+class VideoDisplay(QOpenGLWidget):
     mask_point_added = pyqtSignal(QPointF)
 
     def __init__(self, parent=None):
@@ -465,7 +465,7 @@ class AudioMonitor(QWidget):
             painter.setPen(Qt.white)
             painter.drawText(x, h - 5, labels[i])
 
-class ProjectorWindow(QWidget):
+class ProjectorWindow(QOpenGLWidget):
     warp_points_changed = pyqtSignal(list, int) # points, resolution
 
     def __init__(self):
