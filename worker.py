@@ -115,16 +115,25 @@ class TrackingThread(QThread):
                 if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
-                        # Optimization: Prefer DSHOW on Windows for MUCH faster camera init
+                        # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
                         main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
                         if not main_cap.isOpened():
                             main_cap = cv2.VideoCapture(self.worker.video_source)
+
+                        if main_cap.isOpened():
+                            # Optimization: set MJPG to improve frame rates at high resolution
+                            main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+                            w_req, h_req = self.worker.requested_camera_res
+                            main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
+                            main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
+
+                            # Buffering: Minimize latency
+                            main_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
-                        w_req, h_req = self.worker.requested_camera_res
-                        main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
-                        main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
                         # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
                         # Note: behavior is backend dependent. 1/0.25 usually means manual.
@@ -179,10 +188,11 @@ class TrackingThread(QThread):
                     self.worker.confidence_internal = self.worker.confidence
                     self.worker.tracking_frame_count += 1
 
+                if tracked_points is None: tracked_points = []
                 self.worker.trackers_detected.emit(len(tracked_points))
                 self.worker.trackers_ready.emit(tracked_points)
 
-                if len(tracked_points) >= 2:
+                if tracked_points and len(tracked_points) >= 2:
                     current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
                     if self.worker._calibrate_depth_flag and current_dist > 0.001:
                         self.worker.baseline_distance = current_dist
@@ -673,9 +683,15 @@ class Worker(QObject):
         if self.throttle_level > 0.9 and not live_only:
              return frame
 
-        # Performance: Use GPU for FX
-        u_frame = cv2.UMat(frame)
-        h, w = frame.shape[:2]
+        # Performance: Use GPU for FX (Maintain UMat if already on GPU)
+        is_umat = isinstance(frame, cv2.UMat)
+        u_frame = frame if is_umat else cv2.UMat(frame)
+
+        # Get dimensions (works for both UMat and numpy)
+        if is_umat:
+            h, w = u_frame.get().shape[:2] # Unfortunately UMat doesn't expose shape directly in Python easily without get() or size()
+        else:
+            h, w = frame.shape[:2]
         res_scale = np.sqrt((w * h) / (1280 * 720))
 
         # 1. Transform/Mirror FX (GPU Accelerated)
@@ -919,6 +935,20 @@ class Worker(QObject):
     def get_tracked_points(self, frame, force_full=False, return_rejected=False):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
         if frame is None: return ([], []) if return_rejected else []
+
+        # Defensive catch-all to prevent thread crashes
+        try:
+            res = self._get_tracked_points_internal(frame, force_full, return_rejected)
+            if res is None:
+                 return ([], []) if return_rejected else []
+            return res
+        except Exception as e:
+            print(f"Error in tracking logic: {e}")
+            return ([], []) if return_rejected else []
+
+    def _get_tracked_points_internal(self, frame, force_full=False, return_rejected=False):
+        # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
+        if frame is None: return ([], []) if return_rejected else []
         h, w = frame.shape[:2]
 
         # Performance: Use GPU (UMat) for image processing
@@ -966,8 +996,8 @@ class Worker(QObject):
                         u_proj_small = cv2.warpPerspective(u_proj_last, T_scale @ M_roi_to_proj, (mask_w, mask_h))
                         u_proj_mask = cv2.resize(u_proj_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
 
-                        # Aggressive suppression (0.6)
-                        u_suppression = cv2.multiply(u_proj_mask, 0.6)
+                        # Aggressive suppression (0.8) - help cancel out bright projector spots
+                        u_suppression = cv2.multiply(u_proj_mask, 0.8)
                         u_gray = cv2.subtract(u_gray, u_suppression)
                     except: pass
 
@@ -1053,17 +1083,23 @@ class Worker(QObject):
         detected_points_raw.sort(key=lambda x: (x['intensity'], x['area'], x['circ']), reverse=True)
         detected_points_all = [x['pos'] for x in detected_points_raw]
 
-        # Dot Persistence: only keep dots that were present in the last frame (or if searching)
+        # Dot Persistence: only keep dots that were present in the last frame to filter out transient flashes
         detected_points = []
-        if self.confidence > 0.5:
-            for p in detected_points_all:
-                # Increased radii to account for high-velocity "neck" movement
-                if any(np.linalg.norm(np.array(p) - np.array(prev_p)) < 0.01 for prev_p in self.last_raw_detections):
-                    detected_points.append(p)
-                elif any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.05 for lp in (self.last_tracked_points or [])):
-                    detected_points.append(p)
-        else:
-            detected_points = detected_points_all
+        # Radius for temporal persistence (normalized units)
+        persistence_radius = 0.015
+
+        for p in detected_points_all:
+            # Check against ALL detections from the previous frame
+            is_persistent = any(np.linalg.norm(np.array(p) - np.array(prev_p)) < persistence_radius for prev_p in self.last_raw_detections)
+
+            # Check against last known tracked positions (with larger radius for movement)
+            is_near_tracked = any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.05 for lp in (self.last_tracked_points or []))
+
+            if is_persistent or is_near_tracked:
+                detected_points.append(p)
+            elif force_full:
+                # Still frames for calibration should include everything
+                detected_points.append(p)
 
         self.last_raw_detections = detected_points_all # Store all for next frame's comparison
         rejected_points = [x['pos'] for x in rejected_points_raw]
@@ -1263,7 +1299,8 @@ class Worker(QObject):
                     # For a guitar, moving > 8% of screen width in one frame is unlikely
                     if np.linalg.norm(curr_center - prev_center) > 0.08:
                         self.confidence = max(0.0, self.confidence - 0.2)
-                        return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
+                        pts = self.last_tracked_points if self.last_tracked_points is not None else []
+                        return (pts, []) if return_rejected else pts
 
                 # Kalman Correction
                 kalman_pts = []
@@ -1286,7 +1323,8 @@ class Worker(QObject):
                     dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
                     if dist > 0.06: # Significant jump detected (lowered for better stability)
                         self.confidence = max(0.0, self.confidence - 0.15)
-                        return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
+                        pts = self.last_tracked_points if self.last_tracked_points is not None else []
+                        return (pts, []) if return_rejected else pts
 
                 # High-Distance Temporal Smoothing with Adaptive Alpha & Deadband
                 if self.smoothed_points is None:
@@ -1299,7 +1337,8 @@ class Worker(QObject):
                     # Deadband: if movement is microscopic, ignore it to prevent static jitter
                     # Increased for high-res stability
                     if move_dist < 0.0035:
-                        return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
+                        pts = self.last_tracked_points if self.last_tracked_points is not None else []
+                        return (pts, []) if return_rejected else pts
 
                     # Adaptive Alpha: lower when still, higher when moving
                     # base_alpha for stillness
@@ -1345,7 +1384,8 @@ class Worker(QObject):
         if self.last_tracked_points is not None:
             if roi_x != 0 or roi_y != 0 or roi_w != w or roi_h != h:
                 self.last_tracked_points = None
-                return self.get_tracked_points(frame, return_rejected=return_rejected)
+                res = self.get_tracked_points(frame, return_rejected=return_rejected)
+                return res if res is not None else (([], []) if return_rejected else [])
 
         if self.confidence > 0.1 and (self.confidence - self.confidence_decay) <= 0.1:
             self.status_update.emit("Tracking Status: LOST")
@@ -1362,7 +1402,7 @@ class Worker(QObject):
             if self.marker_config:
                 self.init_kalman(len(self.marker_config))
 
-        if (self.confidence > 0.1 or self.tracking_freeze_enabled) and self.last_tracked_points:
+        if (self.confidence > 0.1 or self.tracking_freeze_enabled) and self.last_tracked_points is not None:
             return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
         return (detected_points, rejected_points) if return_rejected else detected_points
@@ -1786,6 +1826,8 @@ class Worker(QObject):
                     self.projector_buffer.fill(0)
 
                 projector_output = self.projector_buffer
+                # Performance: Composition on GPU
+                u_projector_output = cv2.UMat(projector_output)
 
                 # Handle Auto-Calibration logic (Multi-frame averaging)
                 if self._run_calibration_flag:
@@ -1902,7 +1944,10 @@ class Worker(QObject):
                 # Skip particles and occlusion during setup to save CPU and avoid corrupting calibration patterns
                 if not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
                     self.update_particles(tracked_points, h, w, w_cam, h_cam)
-                    self.draw_particles(projector_output)
+                    # Draw particles on CPU and upload once (more efficient than individual GPU draws for many points)
+                    particle_layer = np.zeros((h, w, 3), dtype=np.uint8)
+                    self.draw_particles(particle_layer)
+                    u_projector_output = cv2.add(u_projector_output, cv2.UMat(particle_layer))
 
                 # Performer Occlusion Logic
                 if self.occlusion_enabled and not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
@@ -1995,36 +2040,44 @@ class Worker(QObject):
                             del self.fades[mask.tag]
 
                     if frame_cue is not None:
+                        # Performance: Transition to GPU for the rest of the mask chain
+                        u_frame_cue = cv2.UMat(frame_cue)
+
                         # Performance: Only apply FX if not fully throttled or essential
-                        frame_cue = self.apply_fx(frame_cue, mask)
+                        u_frame_cue = self.apply_fx(u_frame_cue, mask)
 
                         if mask.design_overlay != 'none':
-                            design_m = self.get_design_mask(mask.design_overlay, frame_cue.shape[0], frame_cue.shape[1])
-                            design_m_3ch = cv2.merge([design_m, design_m, design_m])
-                            frame_cue = cv2.bitwise_and(frame_cue, design_m_3ch)
+                            # design masks are generated on CPU but bitwise_and on GPU is faster
+                            design_m = self.get_design_mask(mask.design_overlay, h, w)
+                            u_design_m = cv2.UMat(design_m)
+                            u_design_m_3ch = cv2.merge([u_design_m, u_design_m, u_design_m])
+                            u_frame_cue = cv2.bitwise_and(u_frame_cue, u_design_m_3ch)
 
                         # Safety Fallback
                         is_safe = True
                         if mask.type == 'dynamic' and curr_confidence < 0.2 and self.safety_mode_enabled:
                             is_safe = False
                             # Override frame with fallback generator
-                            frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
+                            u_frame_cue = cv2.UMat(self.get_vj_generator(self.fallback_generator, h, w))
 
-                        effective_frame_cue = frame_cue
+                        u_effective_frame_cue = u_frame_cue
                         if mask.type == 'dynamic' and mask.is_linked:
                             # Only fade out tracked masks when tracking is shaky
                             if curr_confidence < 1.0:
                                 # Ensure it doesn't go totally black if safety fallback is active
                                 min_vis = 0.4 if not is_safe else 0.0
                                 alpha = max(min_vis, curr_confidence)
-                                effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=alpha)
+                                u_effective_frame_cue = cv2.convertScaleAbs(u_frame_cue, alpha=alpha)
 
                         effective_opacity = mask.opacity * curr_fade
                         if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
                             effective_opacity *= lfo_val
 
                         if effective_opacity < 1.0:
-                            effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
+                            u_effective_frame_cue = cv2.convertScaleAbs(u_effective_frame_cue, alpha=effective_opacity)
+
+                        # Download back for the warping phase (remap/warpPerspective can take UMat but it is complex in the current multi-mask setup)
+                        frame_cue = u_effective_frame_cue.get()
 
                         # Static Caching Check
                         cache_key = (mask_id, tuple(map(tuple, mask.source_points)))
@@ -2099,8 +2152,7 @@ class Worker(QObject):
                                 if matrix is not None:
                                     # Use UMat for perspective warp
                                     u_eff = cv2.UMat(effective_frame_cue)
-                                    u_warped = cv2.warpPerspective(u_eff, matrix, (w, h))
-                                    warped_cue = u_warped.get()
+                                    warped_cue = cv2.warpPerspective(u_eff, matrix, (w, h))
 
                                     # Draw mask
                                     curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -2156,8 +2208,7 @@ class Worker(QObject):
                                     if matrix is not None:
                                         # Use UMat for perspective warp
                                         u_eff = cv2.UMat(effective_frame_cue)
-                                        u_warped = cv2.warpPerspective(u_eff, matrix, (w, h))
-                                        warped_cue = u_warped.get()
+                                        warped_cue = cv2.warpPerspective(u_eff, matrix, (w, h))
 
                                         curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
                                         cv2.fillPoly(curr_mask_img, [np.int32(dst_pts)], (255, 255, 255))
@@ -2171,7 +2222,12 @@ class Worker(QObject):
                                 self.static_warp_cache[cache_key] = (frame_id, warped_cue, mask_img)
 
                         if warped_cue is not None and mask_img is not None:
-                            projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
+                            # Performance: Keep blending on GPU
+                            u_overlay = warped_cue if isinstance(warped_cue, cv2.UMat) else cv2.UMat(warped_cue)
+                            u_mask = mask_img if isinstance(mask_img, cv2.UMat) else cv2.UMat(mask_img)
+
+                            # Blend using GPU-optimized function
+                            u_projector_output = self.blend_frames(u_projector_output, u_overlay, u_mask, mask.blend_mode)
 
                     # Draw outlines on projector during calibration/alignment
                     if self.show_camera_on_projector:
@@ -2186,8 +2242,9 @@ class Worker(QObject):
                         draw_pts = self.transform_to_projector(draw_pts_norm, target_w=w, target_h=h).astype(np.int32)
 
                         if len(draw_pts) >= 3:
-                            cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
-                            cv2.putText(projector_output, f"{mask.tag or mask.name}", (int(draw_pts[0][0]), int(draw_pts[0][1] - 5)),
+                            # Drawing on UMat is supported and efficient for small number of calls
+                            cv2.polylines(u_projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
+                            cv2.putText(u_projector_output, f"{mask.tag or mask.name}", (int(draw_pts[0][0]), int(draw_pts[0][1] - 5)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
 
@@ -2235,49 +2292,49 @@ class Worker(QObject):
                 self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
 
                 # Apply Master FX to the composition before warping
-                if self.master_active_fx or self.master_brightness != 0 or self.master_contrast != 0 or self.master_saturation != 100:
-                    master_proxy = Mask("Master", [], None)
-                    master_proxy.active_fx = self.master_active_fx
-                    master_proxy.tint_color = self.master_tint_color
-                    projector_output = self.apply_fx(projector_output, master_proxy)
+                # Apply Master FX to the composition before warping
+                if self.master_active_fx or self.master_brightness != 0 or self.master_contrast != 0 or self.master_saturation != 100 or self.master_grain > 0 or self.master_bloom > 0 or self.master_fader < 1.0:
+
+                    if self.master_active_fx:
+                        master_proxy = Mask("Master", [], None)
+                        master_proxy.active_fx = self.master_active_fx
+                        master_proxy.tint_color = self.master_tint_color
+                        # apply_fx already returns UMat if input is UMat
+                        u_projector_output = self.apply_fx(u_projector_output, master_proxy)
 
                     # Apply Brightness/Contrast/Saturation on GPU
-                    u_proj = cv2.UMat(projector_output)
-
                     if self.master_brightness != 0 or self.master_contrast != 0:
                         alpha = (self.master_contrast + 100.0) / 100.0
                         beta = self.master_brightness
-                        u_proj = cv2.convertScaleAbs(u_proj, alpha=alpha, beta=beta)
+                        u_projector_output = cv2.convertScaleAbs(u_projector_output, alpha=alpha, beta=beta)
 
                     if self.master_saturation != 100:
-                        u_hsv = cv2.cvtColor(u_proj, cv2.COLOR_BGR2HSV)
-                        # Split channels on GPU
+                        u_hsv = cv2.cvtColor(u_projector_output, cv2.COLOR_BGR2HSV)
                         h_c, s_c, v_c = cv2.split(u_hsv)
                         s_c = cv2.multiply(s_c, self.master_saturation / 100.0)
                         u_hsv = cv2.merge([h_c, s_c, v_c])
-                        u_proj = cv2.cvtColor(u_hsv, cv2.COLOR_HSV2BGR)
+                        u_projector_output = cv2.cvtColor(u_hsv, cv2.COLOR_HSV2BGR)
 
-                    projector_output = u_proj.get()
-
-                    # Apply Grain
+                    # Apply Grain (GPU accelerated)
                     if self.master_grain > 0:
+                        # We still generate noise on CPU but can add on GPU
                         noise = np.random.randint(0, self.master_grain, (h, w, 3), dtype=np.uint8)
-                        projector_output = cv2.add(projector_output, noise)
+                        u_noise = cv2.UMat(noise)
+                        u_projector_output = cv2.add(u_projector_output, u_noise)
 
-                    # Apply Bloom (Simple)
+                    # Apply Bloom (GPU accelerated)
                     if self.master_bloom > 0:
-                        # Extract highlights
-                        gray = cv2.cvtColor(projector_output, cv2.COLOR_BGR2GRAY)
-                        _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-                        highlights = cv2.bitwise_and(projector_output, cv2.merge([mask, mask, mask]))
-                        # Blur highlights
+                        u_gray = cv2.cvtColor(u_projector_output, cv2.COLOR_BGR2GRAY)
+                        _, u_mask = cv2.threshold(u_gray, 200, 255, cv2.THRESH_BINARY)
+                        u_mask_3ch = cv2.merge([u_mask, u_mask, u_mask])
+                        u_highlights = cv2.bitwise_and(u_projector_output, u_mask_3ch)
                         k = int(self.master_bloom / 2) | 1
-                        bloom = cv2.GaussianBlur(highlights, (k, k), 0)
-                        projector_output = cv2.addWeighted(projector_output, 1.0, bloom, 0.5, 0)
+                        u_bloom = cv2.GaussianBlur(u_highlights, (k, k), 0)
+                        u_projector_output = cv2.addWeighted(u_projector_output, 1.0, u_bloom, 0.5, 0)
 
-                # Apply Master Fader
-                if self.master_fader < 1.0:
-                    projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
+                    # Apply Master Fader on GPU
+                    if self.master_fader < 1.0:
+                        u_projector_output = cv2.convertScaleAbs(u_projector_output, alpha=self.master_fader)
 
                 # Apply Projector Boundary Global Clip (in internal resolution)
                 # Disable clipping during Wizard steps 0 and 1 to prevent interference with calibration
@@ -2287,15 +2344,14 @@ class Worker(QObject):
 
                 # Apply Performer Occlusion
                 if self.occlusion_enabled and self.occlusion_mask is not None:
-                    # Black out the performer
-                    inv_mask = cv2.bitwise_not(self.occlusion_mask)
-                    if len(inv_mask.shape) == 2:
-                        inv_mask = cv2.merge([inv_mask, inv_mask, inv_mask])
-                    projector_output = cv2.bitwise_and(projector_output, inv_mask)
+                    # Black out the performer on GPU
+                    u_occl = cv2.UMat(self.occlusion_mask)
+                    u_inv_mask = cv2.bitwise_not(u_occl)
+                    u_inv_mask_3ch = cv2.merge([u_inv_mask, u_inv_mask, u_inv_mask])
+                    u_projector_output = cv2.bitwise_and(u_projector_output, u_inv_mask_3ch)
 
                 # 9-point grid warping (piecewise perspective optimization)
-                # Optimized: Use GPU for final remap/resize
-                u_projector_output = cv2.UMat(projector_output)
+                # Optimized: Already using GPU (u_projector_output)
 
                 if self._warp_is_identity:
                     if (w, h) != (w_proj, h_proj):
@@ -2573,12 +2629,14 @@ class Worker(QObject):
 
     def blend_frames(self, base, overlay, mask_img, mode):
         # Performance: Use GPU (UMat) for blending
-        u_base = cv2.UMat(base)
-        u_overlay = cv2.UMat(overlay)
-        u_mask = cv2.UMat(mask_img)
+        is_umat = isinstance(base, cv2.UMat)
+        u_base = base if is_umat else cv2.UMat(base)
+        u_overlay = overlay if isinstance(overlay, cv2.UMat) else cv2.UMat(overlay)
+        u_mask = mask_img if isinstance(mask_img, cv2.UMat) else cv2.UMat(mask_img)
 
         # Ensure u_mask has the same number of channels as u_base
-        if u_mask.channels() == 1:
+        # UMat doesn't expose channels() in Python easily, so we check via get().shape
+        if len(u_mask.get().shape) == 2:
             u_mask = cv2.merge([u_mask, u_mask, u_mask])
 
         # Optimized integer-based blending on GPU
@@ -2603,7 +2661,7 @@ class Worker(QObject):
         else:
             return base
 
-        return u_res.get()
+        return u_res if is_umat else u_res.get()
 
     def normalize_points_to_reference(self, points):
         """Converts points from current frame space to marker-config reference space."""

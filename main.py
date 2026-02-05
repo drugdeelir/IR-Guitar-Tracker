@@ -21,15 +21,17 @@ from utils import resource_path
 
 def get_available_cameras():
     """Returns a list of available camera indices."""
-    index = 0
     arr = []
-    while True:
-        cap = cv2.VideoCapture(index)
+    # Limit probing to first 8 indices to prevent long hangs and obsensor errors
+    # Also use CAP_DSHOW for faster probing on Windows
+    for index in range(8):
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            break
-        arr.append(index)
-        cap.release()
-        index += 1
+            cap = cv2.VideoCapture(index) # Fallback
+
+        if cap.isOpened():
+            arr.append(index)
+            cap.release()
     return arr
 
 class MIDIMappingDialog(QDialog):
