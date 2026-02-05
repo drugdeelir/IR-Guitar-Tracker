@@ -255,6 +255,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
         self.worker.system_warning.connect(lambda msg: self.statusBar().showMessage(msg, 10000))
+        self.worker.status_update.connect(lambda msg: self.statusBar().showMessage(msg, 0))
         self.worker.calibration_complete.connect(self.handle_calibration_complete)
         self.worker.boundary_detected.connect(self.handle_boundary_detected)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
@@ -316,29 +317,33 @@ class ProjectionMappingApp(QMainWindow):
 
     def refresh_link_status_labels(self):
         try:
-            if getattr(self, 'setup_link_status_label', None) and getattr(self, 'setup_link_mask_combo', None):
-                selected = self.setup_link_mask_combo.currentText()
+            combo = getattr(self, 'setup_link_mask_combo', None)
+            label = getattr(self, 'setup_link_status_label', None)
+            if combo and label:
+                selected = combo.currentText()
                 linked = any(m.name == selected and m.is_linked for m in self.masks)
                 if linked:
-                    self.setup_link_status_label.setText("Status: LINKED")
-                    self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
+                    label.setText("Status: LINKED")
+                    label.setStyleSheet("font-weight: bold; color: #00c853;")
                 else:
-                    self.setup_link_status_label.setText("Status: Not Linked")
-                    self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        except (RuntimeError, AttributeError):
+                    label.setText("Status: Not Linked")
+                    label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        except (RuntimeError, AttributeError, TypeError):
             pass
 
         try:
-            if getattr(self, 'workspace_link_status_label', None) and getattr(self, 'workspace_link_mask_combo', None):
-                selected = self.workspace_link_mask_combo.currentText()
+            combo = getattr(self, 'workspace_link_mask_combo', None)
+            label = getattr(self, 'workspace_link_status_label', None)
+            if combo and label:
+                selected = combo.currentText()
                 linked = any(m.name == selected and m.is_linked for m in self.masks)
                 if linked:
-                    self.workspace_link_status_label.setText("Status: LINKED")
-                    self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
+                    label.setText("Status: LINKED")
+                    label.setStyleSheet("font-weight: bold; color: #00c853;")
                 else:
-                    self.workspace_link_status_label.setText("Status: Not Linked")
-                    self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        except (RuntimeError, AttributeError):
+                    label.setText("Status: Not Linked")
+                    label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        except (RuntimeError, AttributeError, TypeError):
             pass
 
     def assign_media_to_mask(self):
@@ -1368,6 +1373,11 @@ class ProjectionMappingApp(QMainWindow):
         self.ir_trackers_label = QLabel("Trackers detected: 0")
         ir_layout.addWidget(self.ir_trackers_label)
 
+        self.freeze_check = QCheckBox("Enable Tracking Safety Freeze")
+        self.freeze_check.setToolTip("If enabled, the mask will freeze in place if tracking is lost instead of disappearing.")
+        self.freeze_check.toggled.connect(lambda checked: setattr(self.worker, 'tracking_freeze_enabled', checked))
+        ir_layout.addWidget(self.freeze_check)
+
         self.select_markers_button = QPushButton("Calibrate Guitar Markers")
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
         ir_layout.addWidget(self.select_markers_button)
@@ -1616,6 +1626,7 @@ class ProjectionMappingApp(QMainWindow):
                 'projector_boundary': self.worker.projector_boundary,
                 'pnp_enabled': self.pnp_check.isChecked(),
                 'occlusion_enabled': self.occlusion_check.isChecked(),
+                'tracking_freeze_enabled': self.worker.tracking_freeze_enabled,
                 'setup_reference': ref_frame_b64,
                 'master_visuals': {
                     'brightness': self.brightness_slider.value(),
@@ -1707,13 +1718,14 @@ class ProjectionMappingApp(QMainWindow):
 
                 marker_config = data.get('marker_config')
                 if marker_config:
-                    config_pts = [tuple(p) for p in marker_config]
-                    self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
+                    # Pass normalized points directly to worker
+                    self.worker.set_marker_points(marker_config)
 
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
                 self.worker.projector_boundary = data.get('projector_boundary')
                 self.pnp_check.setChecked(data.get('pnp_enabled', False))
                 self.occlusion_check.setChecked(data.get('occlusion_enabled', False))
+                self.freeze_check.setChecked(data.get('tracking_freeze_enabled', False))
 
                 h_c2p = data.get('h_c2p')
                 calib_points = data.get('calib_points')
