@@ -119,7 +119,10 @@ class TrackingThread(QThread):
             try:
                 start_time = time.time()
 
-                if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
+                # Optimization: captured requested res in local scope to avoid scope errors
+                w_req, h_req = self.worker.requested_camera_res
+
+                if self.worker._camera_changed or (w_req, h_req) != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
                         # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
@@ -131,7 +134,6 @@ class TrackingThread(QThread):
                             # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-                            w_req, h_req = self.worker.requested_camera_res
                             main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                             main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
@@ -841,9 +843,9 @@ class Worker(QObject):
                 if 'tint' in self.audio_param_mappings:
                     mod *= (self.audio_bands[self.audio_param_mappings['tint']] * 3)
                 alpha = 0.3 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
-                # Performance: setTo on GPU is faster than np.full_like
+                # Performance: filling on GPU with rectangle is faster than np.full_like
                 u_tint = cv2.UMat(h, w, cv2.CV_8UC3)
-                u_tint.setTo(mask.tint_color)
+                cv2.rectangle(u_tint, (0, 0), (w, h), mask.tint_color, -1)
                 u_frame = cv2.addWeighted(u_frame, 1.0 - alpha, u_tint, alpha, 0)
 
             if 'duotone' in mask.active_fx:
@@ -1911,11 +1913,15 @@ class Worker(QObject):
                     if self.u_projector_output is None:
                         self.u_projector_output = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
                     else:
-                        self.u_projector_output.setTo((0, 0, 0))
+                        cv2.rectangle(self.u_projector_output, (0, 0), (w, h), (0, 0, 0), -1)
 
                 projector_output = self.projector_buffer
                 # Performance: Composition on GPU
                 u_projector_output = self.u_projector_output
+
+                # Sync CPU composition to GPU for calibration/setup modes
+                if self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag or self.show_camera_on_projector or self.show_calibration_pattern or self.show_calibration_verify:
+                    u_projector_output = cv2.UMat(projector_output)
 
                 # Handle Auto-Calibration logic (Multi-frame averaging)
                 if self._run_calibration_flag:
@@ -2271,9 +2277,9 @@ class Worker(QObject):
                                 if not mask.source_points:
                                     # Use UMat for resize
                                     u_warped_cue = cv2.resize(u_effective_frame_cue, (w, h))
-                                    # Use setTo on GPU
+                                    # Use rectangle on GPU to fill
                                     u_mask_img = cv2.UMat(h, w, cv2.CV_8UC3)
-                                    u_mask_img.setTo((255, 255, 255))
+                                    cv2.rectangle(u_mask_img, (0, 0), (w, h), (255, 255, 255), -1)
                                 else:
                                     src_pts_static = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
                                     # mask.source_points is already normalized

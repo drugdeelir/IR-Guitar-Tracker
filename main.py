@@ -22,12 +22,13 @@ from utils import resource_path
 def get_available_cameras():
     """Returns a list of available camera indices."""
     arr = []
-    # Limit probing to first 8 indices to prevent long hangs and obsensor errors
-    # Also use CAP_DSHOW for faster probing on Windows
-    for index in range(8):
+    # Optimization: Probe fewer indices (4 instead of 8) to reduce startup latency.
+    # 15+ second hangs are often caused by the OS timeout for non-existent or busy USB cameras.
+    for index in range(4):
+        # Use DSHOW on Windows as it's generally faster to probe
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(index) # Fallback
+            cap = cv2.VideoCapture(index)
 
         if cap.isOpened():
             arr.append(index)
