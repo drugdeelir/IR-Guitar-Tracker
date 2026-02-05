@@ -213,8 +213,8 @@ class VideoDisplay(QWidget):
         pix_w, pix_h = 640, 480
         if self.current_pixmap:
             pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
-            # Scale to fit while maintaining aspect ratio
-            scaled_pixmap = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # Scale to fit while maintaining aspect ratio (FastTransformation for performance)
+            scaled_pixmap = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
             sw, sh = scaled_pixmap.width(), scaled_pixmap.height()
         else:
             # Fallback scaling for empty display

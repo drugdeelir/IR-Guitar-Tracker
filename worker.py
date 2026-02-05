@@ -105,99 +105,103 @@ class TrackingThread(QThread):
         frame_time = 1.0 / target_fps
 
         while self._running:
-            start_time = time.time()
+            try:
+                start_time = time.time()
 
-            if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
-                if self.worker._camera_changed:
-                    if main_cap: main_cap.release()
-                    main_cap = cv2.VideoCapture(self.worker.video_source)
-                    self.worker._camera_changed = False
-
-                if main_cap and main_cap.isOpened():
-                    w_req, h_req = self.worker.requested_camera_res
-                    main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
-                    main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
-                    # Read back actual resolution
-                    act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    self.worker._current_camera_res = (act_w, act_h)
-
-                    # Clear frame buffer to avoid resolution mismatch
-                    with QMutexLocker(self.worker.latest_main_frame_mutex):
-                         self.worker.latest_main_frame = None
-
-                    # If we requested max res, update the request to match reality
-                    # to prevent constant re-initialization
-                    if w_req > 5000:
-                        self.worker.requested_camera_res = (act_w, act_h)
-
-                    self.worker.camera_matrix = None # Reset estimation
-                    print(f"Camera Resolution Switched to: {act_w}x{act_h}")
-                else:
+                if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
-                        self.worker.camera_error.emit(self.worker.video_source)
-                    main_cap = None
+                        if main_cap: main_cap.release()
+                        main_cap = cv2.VideoCapture(self.worker.video_source)
+                        self.worker._camera_changed = False
 
-            if main_cap is None:
-                QThread.msleep(1000)
-                continue
+                    if main_cap and main_cap.isOpened():
+                        w_req, h_req = self.worker.requested_camera_res
+                        main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
+                        main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
+                        # Read back actual resolution
+                        act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        self.worker._current_camera_res = (act_w, act_h)
 
-            ret, main_frame = main_cap.read()
-            if not ret:
-                self.worker.camera_error.emit(self.worker.video_source)
-                main_cap.release()
-                main_cap = cv2.VideoCapture(self.worker.video_source)
-                QThread.msleep(1000)
-                continue
+                        # Clear frame buffer to avoid resolution mismatch
+                        with QMutexLocker(self.worker.latest_main_frame_mutex):
+                             self.worker.latest_main_frame = None
 
-            h_cam, w_cam = main_frame.shape[:2]
+                        # If we requested max res, update the request to match reality
+                        # to prevent constant re-initialization
+                        if w_req > 5000:
+                            self.worker.requested_camera_res = (act_w, act_h)
 
-            # IR Tracking
-            # Optimization: Skip tracking during setup/calibration to save CPU
-            if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
-                tracked_points = self.worker.get_tracked_points(main_frame)
-            else:
-                tracked_points = []
+                        self.worker.camera_matrix = None # Reset estimation
+                        print(f"Camera Resolution Switched to: {act_w}x{act_h}")
+                    else:
+                        if self.worker._camera_changed:
+                            self.worker.camera_error.emit(self.worker.video_source)
+                        main_cap = None
 
-            with QMutexLocker(self.worker.tracking_mutex):
-                self.worker.last_tracked_points_internal = tracked_points
-                self.worker.last_homography_internal = self.worker.last_homography
-                self.worker.confidence_internal = self.worker.confidence
-                self.worker.tracking_frame_count += 1
+                if main_cap is None:
+                    QThread.msleep(1000)
+                    continue
 
-            self.worker.trackers_detected.emit(len(tracked_points))
-            self.worker.trackers_ready.emit(tracked_points)
+                ret, main_frame = main_cap.read()
+                if not ret:
+                    self.worker.camera_error.emit(self.worker.video_source)
+                    main_cap.release()
+                    main_cap = cv2.VideoCapture(self.worker.video_source)
+                    QThread.msleep(1000)
+                    continue
 
-            if len(tracked_points) >= 2:
-                current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
-                if self.worker._calibrate_depth_flag and current_dist > 0.001:
-                    self.worker.baseline_distance = current_dist
-                    self.worker._calibrate_depth_flag = False
+                h_cam, w_cam = main_frame.shape[:2]
 
-                if self.worker.baseline_distance > 0.001:
-                    self.worker.proximity_val = current_dist / self.worker.baseline_distance
+                # IR Tracking
+                # Optimization: Skip tracking during setup/calibration to save CPU
+                if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
+                    tracked_points = self.worker.get_tracked_points(main_frame)
                 else:
-                    self.worker.proximity_val = 1.0
+                    tracked_points = []
 
-            # HUD Data preparation (camera side)
-            with QMutexLocker(self.worker.latest_main_frame_mutex):
-                self.worker.latest_main_frame = main_frame.copy()
-                self.worker.latest_main_frame_id += 1
-                self.worker.latest_tracked_points_for_ui = tracked_points
+                with QMutexLocker(self.worker.tracking_mutex):
+                    self.worker.last_tracked_points_internal = tracked_points
+                    self.worker.last_homography_internal = self.worker.last_homography
+                    self.worker.confidence_internal = self.worker.confidence
+                    self.worker.tracking_frame_count += 1
 
-            # Handle Calibration Flags (some need to run in camera thread)
-            if self.worker._capture_still_frame_flag:
-                # Wait for resolution change to apply if requested
-                if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
-                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                    # Perform specialized high-res detection for the still frame
-                    still_dots = self.worker.get_tracked_points(main_frame, force_full=True)
-                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots)
-                    self.worker._capture_still_frame_flag = False
+                self.worker.trackers_detected.emit(len(tracked_points))
+                self.worker.trackers_ready.emit(tracked_points)
 
-            elapsed = time.time() - start_time
-            sleep_time = max(1, int((frame_time - elapsed) * 1000))
-            QThread.msleep(sleep_time)
+                if len(tracked_points) >= 2:
+                    current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
+                    if self.worker._calibrate_depth_flag and current_dist > 0.001:
+                        self.worker.baseline_distance = current_dist
+                        self.worker._calibrate_depth_flag = False
+
+                    if self.worker.baseline_distance > 0.001:
+                        self.worker.proximity_val = current_dist / self.worker.baseline_distance
+                    else:
+                        self.worker.proximity_val = 1.0
+
+                # HUD Data preparation (camera side)
+                with QMutexLocker(self.worker.latest_main_frame_mutex):
+                    self.worker.latest_main_frame = main_frame.copy()
+                    self.worker.latest_main_frame_id += 1
+                    self.worker.latest_tracked_points_for_ui = tracked_points
+
+                # Handle Calibration Flags (some need to run in camera thread)
+                if self.worker._capture_still_frame_flag:
+                    # Wait for resolution change to apply if requested
+                    if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
+                        rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                        # Perform specialized high-res detection for the still frame
+                        still_dots = self.worker.get_tracked_points(main_frame, force_full=True)
+                        self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots)
+                        self.worker._capture_still_frame_flag = False
+
+                elapsed = time.time() - start_time
+                sleep_time = max(1, int((frame_time - elapsed) * 1000))
+                QThread.msleep(sleep_time)
+            except Exception as e:
+                print(f"Critical Error in Tracking Thread: {e}")
+                QThread.msleep(500)
 
         if main_cap:
             main_cap.release()
@@ -386,6 +390,12 @@ class Worker(QObject):
         self.blend_temp2 = None
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         self.tracking_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+
+        # Global OpenCV Performance Optimizations
+        try:
+            cv2.setUseOptimized(True)
+            cv2.setNumThreads(4)
+        except: pass
 
         # Start Tracking Thread
         self.tracking_thread = TrackingThread(self)
@@ -1009,6 +1019,14 @@ class Worker(QObject):
                 if best_match: break
 
             if best_match:
+                # Sanity Check: Filter out sudden jumps (reflections)
+                if self.last_tracked_points is not None and self.confidence > 0.6:
+                    prev_center = np.mean(self.last_tracked_points, axis=0)
+                    curr_center = np.mean(best_match, axis=0)
+                    if np.linalg.norm(curr_center - prev_center) > 0.25:
+                        self.confidence = max(0.0, self.confidence - 0.2)
+                        return self.last_tracked_points
+
                 self.last_homography = best_matrix
                 # Kalman Correction
                 kalman_pts = []
@@ -1053,14 +1071,14 @@ class Worker(QObject):
 
         return detected_points
 
-    def _update_warp_maps(self, w, h):
-        if w <= 0 or h <= 0: return
-        self.map_x = np.zeros((h, w), dtype=np.float32)
-        self.map_y = np.zeros((h, w), dtype=np.float32)
+    def _update_warp_maps(self, w_render, h_render, w_proj, h_proj):
+        if w_render <= 0 or h_render <= 0 or w_proj <= 0 or h_proj <= 0: return
+        self.map_x = np.zeros((h_proj, w_proj), dtype=np.float32)
+        self.map_y = np.zeros((h_proj, w_proj), dtype=np.float32)
 
         wp = np.array(self.warp_points)
-        wp[:, 0] *= w
-        wp[:, 1] *= h
+        wp[:, 0] *= w_proj
+        wp[:, 1] *= h_proj
 
         res = self.warp_grid_res
 
@@ -1074,14 +1092,14 @@ class Worker(QObject):
 
                 dst_q = np.float32([wp[p1], wp[p2], wp[p3], wp[p4]])
 
-                # Source quad in linear grid
-                src_x_start = c * (w // (res - 1))
-                src_y_start = r * (h // (res - 1))
-                src_x_end = (c + 1) * (w // (res - 1))
-                src_y_end = (r + 1) * (h // (res - 1))
+                # Source quad in linear grid (mapped back to render resolution)
+                src_x_start = c * (w_render // (res - 1))
+                src_y_start = r * (h_render // (res - 1))
+                src_x_end = (c + 1) * (w_render // (res - 1))
+                src_y_end = (r + 1) * (h_render // (res - 1))
 
-                if c == res - 2: src_x_end = w
-                if r == res - 2: src_y_end = h
+                if c == res - 2: src_x_end = w_render
+                if r == res - 2: src_y_end = h_render
 
                 src_q = np.float32([
                     [src_x_start, src_y_start], [src_x_end, src_y_start],
@@ -1097,9 +1115,9 @@ class Worker(QObject):
                 min_y = int(np.min(dst_q[:, 1]))
                 max_y = int(np.max(dst_q[:, 1]))
 
-                # Clip to image boundaries
-                min_x, max_x = max(0, min_x), min(w, max_x)
-                min_y, max_y = max(0, min_y), min(h, max_y)
+                # Clip to image boundaries (at projector resolution)
+                min_x, max_x = max(0, min_x), min(w_proj, max_x)
+                min_y, max_y = max(0, min_y), min(h_proj, max_y)
 
                 # Create a localized coordinate grid
                 yy, xx = np.mgrid[min_y:max_y, min_x:max_x].astype(np.float32)
@@ -1123,365 +1141,290 @@ class Worker(QObject):
         frame_time = 1.0 / target_fps
 
         while self._running:
-            start_time = time.time()
+            try:
+                start_time = time.time()
 
-            if self.blackout_active:
+                if self.blackout_active:
+                    h_proj, w_proj = self.projector_height, self.projector_width
+                    black = np.zeros((h_proj, w_proj, 3), dtype=np.uint8)
+                    self.projector_frame_ready.emit(QImage(black.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
+                    elapsed = time.time() - start_time
+                    QThread.msleep(max(1, int((frame_time - elapsed) * 1000)))
+                    continue
+
+                # 1. Update Tracking Info (from shared data)
+                with QMutexLocker(self.tracking_mutex):
+                    tracked_points = self.last_tracked_points_internal
+                    curr_homography = self.last_homography_internal
+                    curr_confidence = self.confidence_internal
+                    t_fps = self.tracking_frame_count / max(1, (time.time() - self.last_stats_time))
+                    self.tracking_fps = t_fps
+
+                # 2. Get Main Frame (for UI/Outlines/Calibration)
+                with QMutexLocker(self.latest_main_frame_mutex):
+                    main_frame = self.latest_main_frame.copy() if self.latest_main_frame is not None else None
+                    ui_tracked_points = self.latest_tracked_points_for_ui
+                    curr_frame_id = self.latest_main_frame_id
+
+                if main_frame is None:
+                    main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(main_frame, "WAITING FOR CAMERA...", (150, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
+
+                h_cam, w_cam = main_frame.shape[:2]
+
+                # Projector and Render Resolution
                 h_proj, w_proj = self.projector_height, self.projector_width
-                black = np.zeros((h_proj, w_proj, 3), dtype=np.uint8)
-                self.projector_frame_ready.emit(QImage(black.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
-                elapsed = time.time() - start_time
-                QThread.msleep(max(1, int((frame_time - elapsed) * 1000)))
-                continue
 
-            # 1. Update Tracking Info (from shared data)
-            with QMutexLocker(self.tracking_mutex):
-                tracked_points = self.last_tracked_points_internal
-                curr_homography = self.last_homography_internal
-                curr_confidence = self.confidence_internal
-                t_fps = self.tracking_frame_count / max(1, (time.time() - self.last_stats_time))
-                self.tracking_fps = t_fps
+                # Dynamically calculate render resolution based on projector dimensions
+                # For ultra-wide setups (like 4480px), we want higher internal res
+                target_w = int(w_proj * self.render_scale)
+                target_h = int(h_proj * self.render_scale)
 
-            # 2. Get Main Frame (for UI/Outlines/Calibration)
-            with QMutexLocker(self.latest_main_frame_mutex):
-                main_frame = self.latest_main_frame.copy() if self.latest_main_frame is not None else None
-                ui_tracked_points = self.latest_tracked_points_for_ui
-                curr_frame_id = self.latest_main_frame_id
+                # Clamp to reasonable limits for performance
+                self.render_width = max(640, min(target_w, 2560))
+                self.render_height = max(360, min(target_h, 1440))
 
-            if main_frame is None:
-                main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(main_frame, "WAITING FOR CAMERA...", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
+                w, h = self.render_width, self.render_height
 
-            h_cam, w_cam = main_frame.shape[:2]
+                if self.camera_matrix is None:
+                    # Estimate camera matrix based on FOV (approx 60 deg)
+                    f = max(w_cam, h_cam)
+                    self.camera_matrix = np.array([
+                        [f, 0, w_cam / 2],
+                        [0, f, h_cam / 2],
+                        [0, 0, 1]
+                    ], dtype=np.float32)
 
-            # Projector and Render Resolution
-            h_proj, w_proj = self.projector_height, self.projector_width
+                if self.projector_buffer is None or self.projector_buffer.shape[:2] != (h, w):
+                    self.projector_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+                    self.mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+                    self.static_warp_cache.clear()
+                    self._warp_map_dirty = True
 
-            # Dynamically calculate render resolution based on projector dimensions
-            # For ultra-wide setups (like 4480px), we want higher internal res
-            target_w = int(w_proj * self.render_scale)
-            target_h = int(h_proj * self.render_scale)
+                if self._run_boundary_detection_flag:
+                    # Ensure resolution is stable before capturing
+                    if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                        # Still waiting for camera thread to catch up
+                        self._sls_curr_wait = 0
+                        continue
 
-            # Clamp to reasonable limits for performance
-            self.render_width = max(640, min(target_w, 2560))
-            self.render_height = max(360, min(target_h, 1440))
-
-            w, h = self.render_width, self.render_height
-
-            if self.camera_matrix is None:
-                # Estimate camera matrix based on FOV (approx 60 deg)
-                f = max(w_cam, h_cam)
-                self.camera_matrix = np.array([
-                    [f, 0, w_cam / 2],
-                    [0, f, h_cam / 2],
-                    [0, 0, 1]
-                ], dtype=np.float32)
-
-            if self.projector_buffer is None or self.projector_buffer.shape[:2] != (h, w):
-                self.projector_buffer = np.zeros((h, w, 3), dtype=np.uint8)
-                self.mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
-                self.static_warp_cache.clear()
-
-            if self._run_boundary_detection_flag:
-                # Ensure resolution is stable before capturing
-                if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
-                    # Still waiting for camera thread to catch up
-                    self._sls_curr_wait = 0
-                    continue
-
-                if self._boundary_step == 0:
-                    # Capture Black Frame
-                    self.projector_buffer.fill(0)
-                    if self._sls_curr_wait >= self._sls_wait_frames:
-                        if curr_frame_id > self._last_captured_frame_id:
-                            self._boundary_captures.append(self.boost_contrast(main_frame))
-                            self._boundary_step = 1
-                            self._sls_curr_wait = 0
-                            self._last_captured_frame_id = curr_frame_id
-                    else:
-                        self._sls_curr_wait += 1
-                elif self._boundary_step == 1:
-                    # Capture White Frame
-                    self.projector_buffer.fill(255)
-                    if self._sls_curr_wait >= self._sls_wait_frames:
-                        if curr_frame_id > self._last_captured_frame_id:
-                            self._boundary_captures.append(self.boost_contrast(main_frame))
-                            self._boundary_step = 2
-                            self._sls_curr_wait = 0
-                            self._last_captured_frame_id = curr_frame_id
-                    else:
-                        self._sls_curr_wait += 1
-                elif self._boundary_step == 2:
-                    # Process Detection
-                    print("Processing Projector Boundary...")
-                    black = self._boundary_captures[0]
-                    white = self._boundary_captures[1]
-                    diff = cv2.absdiff(white, black)
-                    # Use Otsu's thresholding for IR cameras
-                    _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    # Fallback if Otsu results in near-zero coverage
-                    if np.mean(thresh) < 1.0:
-                         _, thresh = cv2.threshold(diff, 5, 255, cv2.THRESH_BINARY)
-
-                    # Clean up
-                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-                    thresh = cv2.dilate(thresh, kernel, iterations=2)
-
-                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if contours:
-                        # Find largest contour
-                        main_contour = max(contours, key=cv2.contourArea)
-                        area_ratio = cv2.contourArea(main_contour) / (w_cam * h_cam)
-
-                        if area_ratio < 0.05:
-                            msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
-                            self.system_warning.emit(msg)
-
-                        # Simplify for boundary - User wants a "big rectangle"
-                        # Use convex hull for a clean outer boundary
-                        hull = cv2.convexHull(main_contour)
-                        peri = cv2.arcLength(hull, True)
-                        # More aggressive simplification to ensure a clean rectangle or simple polygon
-                        approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
-
-                        # If still too complex or too many points, use minAreaRect for a perfect rectangle
-                        if len(approx) > 6:
-                            rect = cv2.minAreaRect(hull)
-                            approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
-
-                        # Store as normalized points
-                        pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
-                        self.projector_boundary = pts
-                        self.boundary_detected.emit(pts)
-                    else:
-                        print("Error: No projector light detected!")
-                        self.boundary_detected.emit([])
-
-                    self._run_boundary_detection_flag = False
-                    self._boundary_step = 0
-                    self._boundary_captures = []
-            elif self._run_sls_flag:
-                # Ensure resolution is stable before capturing
-                if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
-                    # Still waiting for camera thread to catch up
-                    self._sls_curr_wait = 0
-                    continue
-
-                # Structured Light Scanning takes priority
-                total_x = len(self._sls_patterns_x)
-                total_y = len(self._sls_patterns_y)
-
-                if self._sls_step < total_x:
-                    self.status_update.emit(f"Room Scan: Capturing X pattern {self._sls_step+1}/{total_x}...")
-                    pattern = self._sls_patterns_x[self._sls_step]
-                    # Resize pattern to internal render resolution for consistency
-                    pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
-                    self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
-                    if self._sls_curr_wait >= self._sls_wait_frames:
-                        if curr_frame_id > self._last_captured_frame_id:
-                            gray = self.boost_contrast(main_frame)
-                            self._sls_captures_x.append(gray)
-                            self._sls_step += 1
-                            self._sls_curr_wait = 0
-                            self._last_captured_frame_id = curr_frame_id
-                    else:
-                        self._sls_curr_wait += 1
-                elif self._sls_step < total_x + total_y:
-                    idx = self._sls_step - total_x
-                    self.status_update.emit(f"Room Scan: Capturing Y pattern {idx+1}/{total_y}...")
-                    pattern = self._sls_patterns_y[idx]
-                    # Resize pattern to internal render resolution for consistency
-                    pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
-                    self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
-                    if self._sls_curr_wait >= self._sls_wait_frames:
-                        if curr_frame_id > self._last_captured_frame_id:
-                            gray = self.boost_contrast(main_frame)
-                            self._sls_captures_y.append(gray)
-                            self._sls_step += 1
-                            self._sls_curr_wait = 0
-                            self._last_captured_frame_id = curr_frame_id
-                    else:
-                        self._sls_curr_wait += 1
-                else:
-                    # Decoding
-                    print("Decoding Room Scan...")
-                    proj_x, valid_x = decode_gray_code(self._sls_captures_x, self.projector_width)
-                    proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
-                    valid = valid_x & valid_y
-
-                    # Store dense LUT and apply median filter to remove noise-induced "spikes"
-                    self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5)
-                    self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5)
-                    self.sls_valid_mask = valid.astype(np.uint8)
-
-                    # Automatically derive Projector Boundary from SLS valid mask
-                    # Clean up the mask aggressively to fill holes and smooth edges
-                    kernel = np.ones((15, 15), np.uint8)
-                    mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_OPEN, kernel)
-                    mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_CLOSE, kernel)
-                    mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
-
-                    contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if contours:
-                        main_contour = max(contours, key=cv2.contourArea)
-                        # Simplify for boundary - User wants a "big rectangle"
-                        hull = cv2.convexHull(main_contour)
-                        peri = cv2.arcLength(hull, True)
-                        approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
-
-                        if len(approx) > 8:
-                            rect = cv2.minAreaRect(hull)
-                            approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
-
-                        # Store as normalized points
-                        pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
-                        self.projector_boundary = pts
-                        self.boundary_detected.emit(pts)
-                        print(f"One-Click Sync: Detected boundary with {len(pts)} points.")
-
-                    # Collect mapping points for RBF (sub-sampled)
-                    calib_data = []
-                    step = 10 # Sample every 10 pixels
-                    # Ensure indices are within bounds
-                    h_idx, w_idx = valid.shape
-                    for r in range(0, h_idx, step):
-                        for c in range(0, w_idx, step):
-                            if valid[r, c]:
-                                calib_data.append([float(c), float(r),
-                                                   float(proj_x[r, c]), float(proj_y[r, c])])
-
-                    if len(calib_data) > 10:
-                        self.init_rbf_from_points(calib_data)
-                        # Estimate homography from sample points for fallback
-                        pts_arr = np.array(calib_data)
-                        self.h_c2p, _ = cv2.findHomography(pts_arr[:100, :2], pts_arr[:100, 2:])
-                        self.calibration_camera_res = (w_cam, h_cam)
-                        self.calibration_complete.emit(True)
-                    else:
-                        self.calibration_complete.emit(False)
-
-                    self._run_sls_flag = False
-                    self.show_calibration_verify = True # Automatically show verification
-            elif self.show_camera_on_projector:
-                cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
-            elif self.show_calibration_pattern:
-                # Draw a centered checkerboard pattern for robust calibration
-                # Inset by 15% to ensure it stays on camera even if alignment is rough
-                self.projector_buffer.fill(255) # White background
-                margin_x = int(w * 0.15)
-                margin_y = int(h * 0.15)
-                grid_w = w - 2 * margin_x
-                grid_h = h - 2 * margin_y
-
-                cols, rows = 10, 7 # 9x6 internal corners
-                sq_w = grid_w // cols
-                sq_h = grid_h // rows
-
-                # Center the actual grid
-                start_x = margin_x + (grid_w % cols) // 2
-                start_y = margin_y + (grid_h % rows) // 2
-
-                for r in range(rows):
-                    for c in range(cols):
-                        if (r + c) % 2 == 1:
-                            cv2.rectangle(self.projector_buffer,
-                                          (start_x + c * sq_w, start_y + r * sq_h),
-                                          (start_x + (c + 1) * sq_w, start_y + (r + 1) * sq_h),
-                                          (0, 0, 0), -1)
-
-                # Overlay status (moved to bottom to avoid grid interference)
-                status_text = f"ANALYZING... ({self._calib_frames_captured}/{self._calib_total_frames})"
-                if hasattr(self, '_last_calib_attempt_time') and time.time() - self._last_calib_attempt_time > 3.0:
-                    status_text += " (Check Exposure/Alignment)"
-                cv2.putText(self.projector_buffer, status_text, (w//2-200, h - 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-
-                # Visual capture confirmation
-                if hasattr(self, '_last_calib_success_time') and time.time() - self._last_calib_success_time < 0.2:
-                    # Flash green border on successful frame capture
-                    cv2.rectangle(self.projector_buffer, (0, 0), (w, h), (0, 255, 0), 20)
-            elif self.show_calibration_verify:
-                self.projector_buffer.fill(0)
-                # Draw high-visibility grid and circles
-                margin_x = int(w * 0.15)
-                margin_y = int(h * 0.15)
-                grid_w = w - 2 * margin_x
-                grid_h = h - 2 * margin_y
-                sq_w = grid_w // 10
-                sq_h = grid_h // 7
-                start_x = margin_x + (grid_w % 10) // 2
-                start_y = margin_y + (grid_h % 7) // 2
-
-                # Draw lines
-                for r in range(rows := 7 + 1):
-                    y_line = start_y + r * sq_h
-                    if y_line < h:
-                        cv2.line(self.projector_buffer, (0, y_line), (w, y_line), (50, 50, 50), 1)
-                for c in range(cols := 10 + 1):
-                    x_line = start_x + c * sq_w
-                    if x_line < w:
-                        cv2.line(self.projector_buffer, (x_line, 0), (x_line, h), (50, 50, 50), 1)
-
-                for r in range(1, 7):
-                    for c in range(1, 10):
-                        color = (0, 255, 0) if (r+c)%2==0 else (0, 255, 255)
-                        target_x = start_x + c * sq_w
-                        target_y = start_y + r * sq_h
-                        # Circle with crosshair
-                        cv2.circle(self.projector_buffer, (target_x, target_y), 15, color, 2, cv2.LINE_AA)
-                        cv2.circle(self.projector_buffer, (target_x, target_y), 2, (255, 255, 255), -1)
-                        cv2.line(self.projector_buffer, (target_x-20, target_y), (target_x+20, target_y), color, 1)
-                        cv2.line(self.projector_buffer, (target_x, target_y-20), (target_x, target_y+20), color, 1)
-
-                        cv2.putText(self.projector_buffer, f"{c},{r}", (target_x + 18, target_y + 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-                cv2.putText(self.projector_buffer, "VERIFICATION MODE - CHECK CAMERA ALIGNMENT", (50, h-50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            else:
-                self.projector_buffer.fill(0)
-
-            projector_output = self.projector_buffer
-
-            # Handle Auto-Calibration logic (Multi-frame averaging)
-            if self._run_calibration_flag:
-                # Ensure resolution is stable before capturing
-                if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
-                    continue
-
-                if curr_frame_id > self._last_captured_frame_id:
-                    gray = self.boost_contrast(main_frame)
-                    board_size = (9, 6)
-
-                    # Try high-accuracy detection first
-                    ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY | cv2.CALIB_CB_EXHAUSTIVE)
-
-                    if not ret:
-                        if not hasattr(self, '_last_calib_attempt_time'):
-                            self._last_calib_attempt_time = time.time()
-
-                        if time.time() - self._last_calib_attempt_time > 5.0:
-                            # Fallback to standard detection after 5 seconds
-                            ret, corners = cv2.findChessboardCorners(gray, board_size, cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
-
-                    if ret:
-                        if self._calib_corners_sum is None:
-                            self._calib_corners_sum = corners.astype(np.float64)
+                    if self._boundary_step == 0:
+                        # Capture Black Frame
+                        self.projector_buffer.fill(0)
+                        if self._sls_curr_wait >= self._sls_wait_frames:
+                            if curr_frame_id > self._last_captured_frame_id:
+                                self._boundary_captures.append(self.boost_contrast(main_frame))
+                                self._boundary_step = 1
+                                self._sls_curr_wait = 0
+                                self._last_captured_frame_id = curr_frame_id
                         else:
-                            self._calib_corners_sum += corners
-                        self._calib_frames_captured += 1
-                        self._last_calib_success_time = time.time()
-                        self._last_calib_attempt_time = time.time()
+                            self._sls_curr_wait += 1
+                    elif self._boundary_step == 1:
+                        # Capture White Frame
+                        self.projector_buffer.fill(255)
+                        if self._sls_curr_wait >= self._sls_wait_frames:
+                            if curr_frame_id > self._last_captured_frame_id:
+                                self._boundary_captures.append(self.boost_contrast(main_frame))
+                                self._boundary_step = 2
+                                self._sls_curr_wait = 0
+                                self._last_captured_frame_id = curr_frame_id
+                        else:
+                            self._sls_curr_wait += 1
+                    elif self._boundary_step == 2:
+                        # Process Detection
+                        print("Processing Projector Boundary...")
+                        black = self._boundary_captures[0]
+                        white = self._boundary_captures[1]
+                        diff = cv2.absdiff(white, black)
+                        # Use Otsu's thresholding for IR cameras
+                        _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        # Fallback if Otsu results in near-zero coverage
+                        if np.mean(thresh) < 1.0:
+                             _, thresh = cv2.threshold(diff, 5, 255, cv2.THRESH_BINARY)
 
-                    self._last_captured_frame_id = curr_frame_id
+                        # Clean up
+                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+                        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+                        thresh = cv2.dilate(thresh, kernel, iterations=2)
 
-                # Check if we have enough samples or reached timeout
-                if self._calib_frames_captured >= self._calib_total_frames:
-                    avg_corners = (self._calib_corners_sum / self._calib_frames_captured).astype(np.float32)
+                        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if contours:
+                            # Find largest contour
+                            main_contour = max(contours, key=cv2.contourArea)
+                            area_ratio = cv2.contourArea(main_contour) / (w_cam * h_cam)
 
-                    # Calculate reference points matching the centered pattern
+                            if area_ratio < 0.05:
+                                msg = f"Detected projector area is very small ({area_ratio:.1%}). Ensure the camera has a clear view of the projection."
+                                self.system_warning.emit(msg)
+
+                            # Simplify for boundary - User wants a "big rectangle"
+                            # Use convex hull for a clean outer boundary
+                            hull = cv2.convexHull(main_contour)
+                            peri = cv2.arcLength(hull, True)
+                            # More aggressive simplification to ensure a clean rectangle or simple polygon
+                            approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
+
+                            # If still too complex or too many points, use minAreaRect for a perfect rectangle
+                            if len(approx) > 6:
+                                rect = cv2.minAreaRect(hull)
+                                approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+                            # Store as normalized points
+                            pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
+                            self.projector_boundary = pts
+                            self.boundary_detected.emit(pts)
+                        else:
+                            print("Error: No projector light detected!")
+                            self.boundary_detected.emit([])
+
+                        self._run_boundary_detection_flag = False
+                        self._boundary_step = 0
+                        self._boundary_captures = []
+                elif self._run_sls_flag:
+                    # Ensure resolution is stable before capturing
+                    if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                        # Still waiting for camera thread to catch up
+                        self._sls_curr_wait = 0
+                        continue
+
+                    # Structured Light Scanning takes priority
+                    total_x = len(self._sls_patterns_x)
+                    total_y = len(self._sls_patterns_y)
+
+                    if self._sls_step < total_x:
+                        self.status_update.emit(f"Room Scan: Capturing X pattern {self._sls_step+1}/{total_x}...")
+                        pattern = self._sls_patterns_x[self._sls_step]
+                        # Resize pattern to internal render resolution for consistency
+                        pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
+                        self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
+                        if self._sls_curr_wait >= self._sls_wait_frames:
+                            if curr_frame_id > self._last_captured_frame_id:
+                                gray = self.boost_contrast(main_frame)
+                                self._sls_captures_x.append(gray)
+                                self._sls_step += 1
+                                self._sls_curr_wait = 0
+                                self._last_captured_frame_id = curr_frame_id
+                        else:
+                            self._sls_curr_wait += 1
+                    elif self._sls_step < total_x + total_y:
+                        idx = self._sls_step - total_x
+                        self.status_update.emit(f"Room Scan: Capturing Y pattern {idx+1}/{total_y}...")
+                        pattern = self._sls_patterns_y[idx]
+                        # Resize pattern to internal render resolution for consistency
+                        pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
+                        self.projector_buffer = cv2.merge([pattern_resized, pattern_resized, pattern_resized])
+                        if self._sls_curr_wait >= self._sls_wait_frames:
+                            if curr_frame_id > self._last_captured_frame_id:
+                                gray = self.boost_contrast(main_frame)
+                                self._sls_captures_y.append(gray)
+                                self._sls_step += 1
+                                self._sls_curr_wait = 0
+                                self._last_captured_frame_id = curr_frame_id
+                        else:
+                            self._sls_curr_wait += 1
+                    else:
+                        # Decoding
+                        print("Decoding Room Scan...")
+                        proj_x, valid_x = decode_gray_code(self._sls_captures_x, self.projector_width)
+                        proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
+                        valid = valid_x & valid_y
+
+                        # Store dense LUT and apply median filter to remove noise-induced "spikes"
+                        self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5)
+                        self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5)
+                        self.sls_valid_mask = valid.astype(np.uint8)
+
+                        # Automatically derive Projector Boundary from SLS valid mask
+                        # Clean up the mask aggressively to fill holes and smooth edges
+                        kernel = np.ones((15, 15), np.uint8)
+                        mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_OPEN, kernel)
+                        mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_CLOSE, kernel)
+                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
+
+                        contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if contours:
+                            main_contour = max(contours, key=cv2.contourArea)
+                            # Simplify for boundary - User wants a "big rectangle"
+                            hull = cv2.convexHull(main_contour)
+                            peri = cv2.arcLength(hull, True)
+                            approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
+
+                            if len(approx) > 8:
+                                rect = cv2.minAreaRect(hull)
+                                approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+                            # Store as normalized points
+                            pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
+                            self.projector_boundary = pts
+                            self.boundary_detected.emit(pts)
+                            print(f"One-Click Sync: Detected boundary with {len(pts)} points.")
+
+                        # Collect mapping points for RBF (sub-sampled)
+                        calib_data = []
+                        step = 10 # Sample every 10 pixels
+                        # Ensure indices are within bounds
+                        h_idx, w_idx = valid.shape
+                        for r in range(0, h_idx, step):
+                            for c in range(0, w_idx, step):
+                                if valid[r, c]:
+                                    calib_data.append([float(c), float(r),
+                                                       float(proj_x[r, c]), float(proj_y[r, c])])
+
+                        if len(calib_data) > 10:
+                            self.init_rbf_from_points(calib_data)
+                            # Estimate homography from sample points for fallback
+                            pts_arr = np.array(calib_data)
+                            self.h_c2p, _ = cv2.findHomography(pts_arr[:100, :2], pts_arr[:100, 2:])
+                            self.calibration_camera_res = (w_cam, h_cam)
+                            self.calibration_complete.emit(True)
+                        else:
+                            self.calibration_complete.emit(False)
+
+                        self._run_sls_flag = False
+                        self.show_calibration_verify = True # Automatically show verification
+                elif self.show_camera_on_projector:
+                    cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
+                elif self.show_calibration_pattern:
+                    # Draw a centered checkerboard pattern for robust calibration
+                    # Inset by 15% to ensure it stays on camera even if alignment is rough
+                    self.projector_buffer.fill(255) # White background
+                    margin_x = int(w * 0.15)
+                    margin_y = int(h * 0.15)
+                    grid_w = w - 2 * margin_x
+                    grid_h = h - 2 * margin_y
+
+                    cols, rows = 10, 7 # 9x6 internal corners
+                    sq_w = grid_w // cols
+                    sq_h = grid_h // rows
+
+                    # Center the actual grid
+                    start_x = margin_x + (grid_w % cols) // 2
+                    start_y = margin_y + (grid_h % rows) // 2
+
+                    for r in range(rows):
+                        for c in range(cols):
+                            if (r + c) % 2 == 1:
+                                cv2.rectangle(self.projector_buffer,
+                                              (start_x + c * sq_w, start_y + r * sq_h),
+                                              (start_x + (c + 1) * sq_w, start_y + (r + 1) * sq_h),
+                                              (0, 0, 0), -1)
+
+                    # Overlay status (moved to bottom to avoid grid interference)
+                    status_text = f"ANALYZING... ({self._calib_frames_captured}/{self._calib_total_frames})"
+                    if hasattr(self, '_last_calib_attempt_time') and time.time() - self._last_calib_attempt_time > 3.0:
+                        status_text += " (Check Exposure/Alignment)"
+                    cv2.putText(self.projector_buffer, status_text, (w//2-200, h - 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+                    # Visual capture confirmation
+                    if hasattr(self, '_last_calib_success_time') and time.time() - self._last_calib_success_time < 0.2:
+                        # Flash green border on successful frame capture
+                        cv2.rectangle(self.projector_buffer, (0, 0), (w, h), (0, 255, 0), 20)
+                elif self.show_calibration_verify:
+                    self.projector_buffer.fill(0)
+                    # Draw high-visibility grid and circles
                     margin_x = int(w * 0.15)
                     margin_y = int(h * 0.15)
                     grid_w = w - 2 * margin_x
@@ -1491,479 +1434,559 @@ class Worker(QObject):
                     start_x = margin_x + (grid_w % 10) // 2
                     start_y = margin_y + (grid_h % 7) // 2
 
-                    proj_pts = []
+                    # Draw lines
+                    for r in range(rows := 7 + 1):
+                        y_line = start_y + r * sq_h
+                        if y_line < h:
+                            cv2.line(self.projector_buffer, (0, y_line), (w, y_line), (50, 50, 50), 1)
+                    for c in range(cols := 10 + 1):
+                        x_line = start_x + c * sq_w
+                        if x_line < w:
+                            cv2.line(self.projector_buffer, (x_line, 0), (x_line, h), (50, 50, 50), 1)
+
                     for r in range(1, 7):
                         for c in range(1, 10):
-                            proj_pts.append([start_x + c * sq_w, start_y + r * sq_h])
+                            color = (0, 255, 0) if (r+c)%2==0 else (0, 255, 255)
+                            target_x = start_x + c * sq_w
+                            target_y = start_y + r * sq_h
+                            # Circle with crosshair
+                            cv2.circle(self.projector_buffer, (target_x, target_y), 15, color, 2, cv2.LINE_AA)
+                            cv2.circle(self.projector_buffer, (target_x, target_y), 2, (255, 255, 255), -1)
+                            cv2.line(self.projector_buffer, (target_x-20, target_y), (target_x+20, target_y), color, 1)
+                            cv2.line(self.projector_buffer, (target_x, target_y-20), (target_x, target_y+20), color, 1)
 
-                    proj_pts = np.array(proj_pts, dtype=np.float32)
-                    cam_pts = avg_corners.reshape(-1, 2)
+                            cv2.putText(self.projector_buffer, f"{c},{r}", (target_x + 18, target_y + 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
-                    # Store as point list for RBF
-                    calib_data = []
-                    for i in range(len(cam_pts)):
-                        calib_data.append([float(cam_pts[i, 0]), float(cam_pts[i, 1]),
-                                           float(proj_pts[i, 0]), float(proj_pts[i, 1])])
-
-                    self.init_rbf_from_points(calib_data)
-                    # Also keep homography as a robust fallback
-                    self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
-                    self.calibration_camera_res = (w_cam, h_cam)
-
-                    self._run_calibration_flag = False
-                    self._calib_frames_captured = 0
-                    self._calib_corners_sum = None
-                    self.calibration_complete.emit(True)
-                elif self._run_calibration_flag and self.frame_count % 100 == 0: # Timeout safety
-                     # If we've been trying too long (frame_count is not perfect for time but works)
-                     pass
-
-            if self.show_splash:
-                if self.splash_player is None:
-                    self.splash_player = VideoPlayer(resource_path('logo.mkv'))
-                    self.splash_player.start()
-
-                splash_frame, _ = self.splash_player.get_frame()
-                if splash_frame is not None:
-                    projector_output = cv2.resize(splash_frame, (w, h))
+                    cv2.putText(self.projector_buffer, "VERIFICATION MODE - CHECK CAMERA ALIGNMENT", (50, h-50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
                 else:
-                    cv2.putText(projector_output, "PRE-SHOW", (w//2-100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 3)
-            else:
-                if self.splash_player is not None:
-                    self.splash_player.stop()
-                    self.splash_player = None
+                    self.projector_buffer.fill(0)
 
-            # Tracking is now handled by TrackingThread.
-            # We use ui_tracked_points for visualization on the main_frame.
-            if ui_tracked_points:
-                for pt in ui_tracked_points:
-                    try:
-                        # pt is normalized, convert to pixels for drawing
-                        px = int(pt[0] * w_cam)
-                        py = int(pt[1] * h_cam)
-                        cv2.circle(main_frame, (px, py), 5, (0, 0, 255), -1)
-                    except (TypeError, ValueError, IndexError):
-                        pass
+                projector_output = self.projector_buffer
 
-            # Draw calibration overlay on camera feed
-            if self._run_calibration_flag:
-                gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
-                ret, corners = cv2.findChessboardCorners(gray, (9, 6), None)
-                if ret:
-                    cv2.drawChessboardCorners(main_frame, (9, 6), corners, ret)
-                    cv2.putText(main_frame, f"CALIBRATING: {self._calib_frames_captured}/{self._calib_total_frames}",
-                                (10, h_cam-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                else:
-                    cv2.putText(main_frame, "CHECKERBOARD NOT FOUND", (10, h_cam-20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # Handle Auto-Calibration logic (Multi-frame averaging)
+                if self._run_calibration_flag:
+                    # Ensure resolution is stable before capturing
+                    if main_frame.shape[1] != self.requested_camera_res[0] or main_frame.shape[0] != self.requested_camera_res[1]:
+                        continue
 
-            # Skip particles and occlusion during setup to save CPU and avoid corrupting calibration patterns
-            if not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
-                self.update_particles(tracked_points, h, w, w_cam, h_cam)
-                self.draw_particles(projector_output)
+                    if curr_frame_id > self._last_captured_frame_id:
+                        gray = self.boost_contrast(main_frame)
+                        board_size = (9, 6)
 
-            # Performer Occlusion Logic
-            if self.occlusion_enabled and not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
-                fg_mask = self.back_subtractor.apply(main_frame)
-                # Cleanup mask
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-                fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+                        # Try high-accuracy detection first
+                        ret, corners = cv2.findChessboardCornersSB(gray, board_size, cv2.CALIB_CB_ACCURACY | cv2.CALIB_CB_EXHAUSTIVE)
 
-                # Exclude the guitar area from occlusion if tracking
-                if curr_confidence > 0.5 and tracked_points:
-                    pts = np.array(tracked_points, dtype=np.int32)
-                    cv2.fillPoly(fg_mask, [cv2.convexHull(pts)], 0)
+                        if not ret:
+                            if not hasattr(self, '_last_calib_attempt_time'):
+                                self._last_calib_attempt_time = time.time()
 
-                # Transform occlusion mask to internal render space
-                self.occlusion_mask = self.warp_full_frame_to_projector(fg_mask, w_cam, h_cam, w, h)
+                            if time.time() - self._last_calib_attempt_time > 5.0:
+                                # Fallback to standard detection after 5 seconds
+                                ret, corners = cv2.findChessboardCorners(gray, board_size, cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
 
-            with QMutexLocker(self.mask_mutex):
-                iterable_masks = [m for m in self.masks] # Snapshot for this frame
+                        if ret:
+                            if self._calib_corners_sum is None:
+                                self._calib_corners_sum = corners.astype(np.float64)
+                            else:
+                                self._calib_corners_sum += corners
+                            self._calib_frames_captured += 1
+                            self._last_calib_success_time = time.time()
+                            self._last_calib_attempt_time = time.time()
 
-            # Frame cache for this rendering cycle
-            cycle_generator_cache = {}
-            cycle_video_cache = {} # path -> (frame_resized, id)
+                        self._last_captured_frame_id = curr_frame_id
 
-            for mask in iterable_masks:
-                mask_id = id(mask)
-                target_fade = 1.0 if mask.visible else 0.0
-                curr_fade = self.mask_fade_levels.get(mask_id, 0.0)
+                    # Check if we have enough samples or reached timeout
+                    if self._calib_frames_captured >= self._calib_total_frames:
+                        avg_corners = (self._calib_corners_sum / self._calib_frames_captured).astype(np.float32)
 
-                # Smoothly transition fade level (approx 0.5s at 30fps)
-                if curr_fade < target_fade:
-                    curr_fade = min(target_fade, curr_fade + 0.1)
-                elif curr_fade > target_fade:
-                    curr_fade = max(target_fade, curr_fade - 0.1)
-                self.mask_fade_levels[mask_id] = curr_fade
+                        # Calculate reference points matching the centered pattern
+                        margin_x = int(w * 0.15)
+                        margin_y = int(h * 0.15)
+                        grid_w = w - 2 * margin_x
+                        grid_h = h - 2 * margin_y
+                        sq_w = grid_w // 10
+                        sq_h = grid_h // 7
+                        start_x = margin_x + (grid_w % 10) // 2
+                        start_y = margin_y + (grid_h % 7) // 2
 
-                if curr_fade <= 0 and not mask.visible: continue
-                if not mask.video_path: continue
+                        proj_pts = []
+                        for r in range(1, 7):
+                            for c in range(1, 10):
+                                proj_pts.append([start_x + c * sq_w, start_y + r * sq_h])
 
-                frame_cue = None
-                frame_id = 0
+                        proj_pts = np.array(proj_pts, dtype=np.float32)
+                        cam_pts = avg_corners.reshape(-1, 2)
 
-                if mask.video_path == "generative":
-                    if "generative" not in cycle_generator_cache:
-                        cycle_generator_cache["generative"] = self.get_generative_frame(h, w)
-                    frame_cue = cycle_generator_cache["generative"].copy()
-                    frame_id = self.frame_count
-                elif mask.video_path.startswith("generator:"):
-                    pattern = mask.video_path.split(":")[-1]
-                    if mask.video_path not in cycle_generator_cache:
-                        cycle_generator_cache[mask.video_path] = self.get_vj_generator(pattern, h, w)
-                    frame_cue = cycle_generator_cache[mask.video_path].copy()
-                    frame_id = self.frame_count
-                else:
-                    if mask.video_path in cycle_video_cache:
-                        frame_cue_orig, frame_id = cycle_video_cache[mask.video_path]
-                        if frame_cue_orig is not None:
-                            frame_cue = frame_cue_orig.copy()
+                        # Store as point list for RBF
+                        calib_data = []
+                        for i in range(len(cam_pts)):
+                            calib_data.append([float(cam_pts[i, 0]), float(cam_pts[i, 1]),
+                                               float(proj_pts[i, 0]), float(proj_pts[i, 1])])
+
+                        self.init_rbf_from_points(calib_data)
+                        # Also keep homography as a robust fallback
+                        self.h_c2p, _ = cv2.findHomography(cam_pts, proj_pts)
+                        self.calibration_camera_res = (w_cam, h_cam)
+
+                        self._run_calibration_flag = False
+                        self._calib_frames_captured = 0
+                        self._calib_corners_sum = None
+                        self.calibration_complete.emit(True)
+                    elif self._run_calibration_flag and self.frame_count % 100 == 0: # Timeout safety
+                         # If we've been trying too long (frame_count is not perfect for time but works)
+                         pass
+
+                if self.show_splash:
+                    if self.splash_player is None:
+                        self.splash_player = VideoPlayer(resource_path('logo.mkv'))
+                        self.splash_player.start()
+
+                    splash_frame, _ = self.splash_player.get_frame()
+                    if splash_frame is not None:
+                        projector_output = cv2.resize(splash_frame, (w, h))
                     else:
-                        with QMutexLocker(self.player_mutex):
-                            if mask.video_path not in self.video_players:
-                                player = VideoPlayer(mask.video_path)
-                                player.start()
-                                self.video_players[mask.video_path] = player
-                            player = self.video_players[mask.video_path]
-                            frame_cue_raw, frame_id = player.get_frame()
+                        cv2.putText(projector_output, "PRE-SHOW", (w//2-100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 3)
+                else:
+                    if self.splash_player is not None:
+                        self.splash_player.stop()
+                        self.splash_player = None
 
-                        if frame_cue_raw is not None:
-                            # Downscale once per video path per cycle
-                            fh_raw, fw_raw = frame_cue_raw.shape[:2]
-                            if fw_raw > w or fh_raw > h:
-                                frame_cue_raw = cv2.resize(frame_cue_raw, (w, h), interpolation=cv2.INTER_LINEAR)
-                            cycle_video_cache[mask.video_path] = (frame_cue_raw, frame_id)
-                            frame_cue = frame_cue_raw.copy()
+                # Tracking is now handled by TrackingThread.
+                # We use ui_tracked_points for visualization on the main_frame.
+                if ui_tracked_points:
+                    for pt in ui_tracked_points:
+                        try:
+                            # pt is normalized, convert to pixels for drawing
+                            px = int(pt[0] * w_cam)
+                            py = int(pt[1] * h_cam)
+                            cv2.circle(main_frame, (px, py), 5, (0, 0, 255), -1)
+                        except (TypeError, ValueError, IndexError):
+                            pass
 
-                if mask.tag in self.fades:
-                    fade_info = self.fades[mask.tag]
-                    elapsed = time.time() - fade_info['start_time']
-                    if elapsed < self.fade_duration:
-                        if fade_info['prev_path'] in self.video_players:
+                # Draw calibration overlay on camera feed
+                if self._run_calibration_flag:
+                    gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                    ret, corners = cv2.findChessboardCorners(gray, (9, 6), None)
+                    if ret:
+                        cv2.drawChessboardCorners(main_frame, (9, 6), corners, ret)
+                        cv2.putText(main_frame, f"CALIBRATING: {self._calib_frames_captured}/{self._calib_total_frames}",
+                                    (10, h_cam-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(main_frame, "CHECKERBOARD NOT FOUND", (10, h_cam-20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                # Skip particles and occlusion during setup to save CPU and avoid corrupting calibration patterns
+                if not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
+                    self.update_particles(tracked_points, h, w, w_cam, h_cam)
+                    self.draw_particles(projector_output)
+
+                # Performer Occlusion Logic
+                if self.occlusion_enabled and not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
+                    fg_mask = self.back_subtractor.apply(main_frame)
+                    # Cleanup mask
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+                    fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+
+                    # Exclude the guitar area from occlusion if tracking
+                    if curr_confidence > 0.5 and tracked_points:
+                        pts = np.array(tracked_points, dtype=np.int32)
+                        cv2.fillPoly(fg_mask, [cv2.convexHull(pts)], 0)
+
+                    # Transform occlusion mask to internal render space
+                    self.occlusion_mask = self.warp_full_frame_to_projector(fg_mask, w_cam, h_cam, w, h)
+
+                with QMutexLocker(self.mask_mutex):
+                    iterable_masks = [m for m in self.masks] # Snapshot for this frame
+
+                # Frame cache for this rendering cycle
+                cycle_generator_cache = {}
+                cycle_video_cache = {} # path -> (frame_resized, id)
+
+                for mask in iterable_masks:
+                    mask_id = id(mask)
+                    target_fade = 1.0 if mask.visible else 0.0
+                    curr_fade = self.mask_fade_levels.get(mask_id, 0.0)
+
+                    # Smoothly transition fade level (approx 0.5s at 30fps)
+                    if curr_fade < target_fade:
+                        curr_fade = min(target_fade, curr_fade + 0.1)
+                    elif curr_fade > target_fade:
+                        curr_fade = max(target_fade, curr_fade - 0.1)
+                    self.mask_fade_levels[mask_id] = curr_fade
+
+                    if curr_fade <= 0 and not mask.visible: continue
+                    if not mask.video_path: continue
+
+                    frame_cue = None
+                    frame_id = 0
+
+                    if mask.video_path == "generative":
+                        if "generative" not in cycle_generator_cache:
+                            cycle_generator_cache["generative"] = self.get_generative_frame(h, w)
+                        frame_cue = cycle_generator_cache["generative"].copy()
+                        frame_id = self.frame_count
+                    elif mask.video_path.startswith("generator:"):
+                        pattern = mask.video_path.split(":")[-1]
+                        if mask.video_path not in cycle_generator_cache:
+                            cycle_generator_cache[mask.video_path] = self.get_vj_generator(pattern, h, w)
+                        frame_cue = cycle_generator_cache[mask.video_path].copy()
+                        frame_id = self.frame_count
+                    else:
+                        if mask.video_path in cycle_video_cache:
+                            frame_cue_orig, frame_id = cycle_video_cache[mask.video_path]
+                            if frame_cue_orig is not None:
+                                frame_cue = frame_cue_orig.copy()
+                        else:
                             with QMutexLocker(self.player_mutex):
-                                prev_player = self.video_players[fade_info['prev_path']]
-                                prev_frame, _ = prev_player.get_frame()
-                            if prev_frame is not None and frame_cue is not None:
-                                if prev_frame.shape[:2] != frame_cue.shape[:2]:
-                                    prev_frame = cv2.resize(prev_frame, (frame_cue.shape[1], frame_cue.shape[0]))
-                                alpha = elapsed / self.fade_duration
-                                cv2.addWeighted(prev_frame, 1.0 - alpha, frame_cue, alpha, 0, dst=frame_cue)
-                    else:
-                        del self.fades[mask.tag]
+                                if mask.video_path not in self.video_players:
+                                    player = VideoPlayer(mask.video_path)
+                                    player.start()
+                                    self.video_players[mask.video_path] = player
+                                player = self.video_players[mask.video_path]
+                                frame_cue_raw, frame_id = player.get_frame()
 
-                if frame_cue is not None:
-                    # Performance: Only apply FX if not fully throttled or essential
-                    frame_cue = self.apply_fx(frame_cue, mask)
+                            if frame_cue_raw is not None:
+                                # Downscale once per video path per cycle
+                                fh_raw, fw_raw = frame_cue_raw.shape[:2]
+                                if fw_raw > w or fh_raw > h:
+                                    frame_cue_raw = cv2.resize(frame_cue_raw, (w, h), interpolation=cv2.INTER_LINEAR)
+                                cycle_video_cache[mask.video_path] = (frame_cue_raw, frame_id)
+                                frame_cue = frame_cue_raw.copy()
 
-                    if mask.design_overlay != 'none':
-                        design_m = self.get_design_mask(mask.design_overlay, frame_cue.shape[0], frame_cue.shape[1])
-                        design_m_3ch = cv2.merge([design_m, design_m, design_m])
-                        frame_cue = cv2.bitwise_and(frame_cue, design_m_3ch)
+                    if mask.tag in self.fades:
+                        fade_info = self.fades[mask.tag]
+                        elapsed = time.time() - fade_info['start_time']
+                        if elapsed < self.fade_duration:
+                            if fade_info['prev_path'] in self.video_players:
+                                with QMutexLocker(self.player_mutex):
+                                    prev_player = self.video_players[fade_info['prev_path']]
+                                    prev_frame, _ = prev_player.get_frame()
+                                if prev_frame is not None and frame_cue is not None:
+                                    if prev_frame.shape[:2] != frame_cue.shape[:2]:
+                                        prev_frame = cv2.resize(prev_frame, (frame_cue.shape[1], frame_cue.shape[0]))
+                                    alpha = elapsed / self.fade_duration
+                                    cv2.addWeighted(prev_frame, 1.0 - alpha, frame_cue, alpha, 0, dst=frame_cue)
+                        else:
+                            del self.fades[mask.tag]
 
-                    effective_frame_cue = frame_cue
-                    if mask.type == 'dynamic':
-                        if curr_confidence < 1.0:
-                            effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=curr_confidence)
+                    if frame_cue is not None:
+                        # Performance: Only apply FX if not fully throttled or essential
+                        frame_cue = self.apply_fx(frame_cue, mask)
 
-                    effective_opacity = mask.opacity * curr_fade
-                    if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
-                        effective_opacity *= lfo_val
+                        if mask.design_overlay != 'none':
+                            design_m = self.get_design_mask(mask.design_overlay, frame_cue.shape[0], frame_cue.shape[1])
+                            design_m_3ch = cv2.merge([design_m, design_m, design_m])
+                            frame_cue = cv2.bitwise_and(frame_cue, design_m_3ch)
 
-                    if effective_opacity < 1.0:
-                        effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
+                        effective_frame_cue = frame_cue
+                        if mask.type == 'dynamic':
+                            if curr_confidence < 1.0:
+                                effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=curr_confidence)
 
-                    # Safety Fallback
-                    is_safe = True
-                    if mask.type == 'dynamic' and curr_confidence < 0.2 and self.safety_mode_enabled:
-                        is_safe = False
-                        # Override frame with fallback generator
-                        frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
-
-                    # Static Caching Check
-                    cache_key = (mask_id, tuple(map(tuple, mask.source_points)))
-                    warped_cue = None
-                    mask_img = None
-
-                    if mask.type == 'static' and cache_key in self.static_warp_cache:
-                        cached_fid, cached_warped, cached_mask_img = self.static_warp_cache[cache_key]
-                        if cached_fid == frame_id:
-                            warped_cue = cached_warped
-                            mask_img = cached_mask_img
-
-                    if warped_cue is None:
-                        if mask.type == 'dynamic' and ((mask.is_linked and curr_homography is not None) or not is_safe):
-                            src_pts = np.float32(mask.source_points)
-
-                            if is_safe:
-                                cal_w, cal_h = self.calibration_camera_res if self.calibration_camera_res else (w_cam, h_cam)
-                                # 3D PnP Perspective Logic
-                                if self.pnp_enabled and self.marker_config and len(self.marker_config) == 4 and len(tracked_points) == 4:
-                                    # Model points (markers in their reference plane, Z=0)
-                                    model_pts = np.array([ [p[0]*cal_w, p[1]*cal_h, 0] for p in self.marker_config ], dtype=np.float32)
-                                    image_pts = (np.array(tracked_points, dtype=np.float32) * [w_cam, h_cam]).reshape(-1, 2)
-
-                                    # Use a camera matrix matching current w_cam, h_cam
-                                    f = max(w_cam, h_cam)
-                                    cam_mtx = np.array([[f, 0, w_cam/2], [0, f, h_cam/2], [0, 0, 1]], dtype=np.float32)
-                                    success, rvec, tvec = cv2.solvePnP(model_pts, image_pts, cam_mtx, self.dist_coeffs)
-
-                                    if success:
-                                        # Project the mask points based on 3D pose
-                                        mask_model_pts = np.array([ [p[0]*cal_w, p[1]*cal_h, 0] for p in mask.source_points ], dtype=np.float32)
-                                        dst_pts_raw, _ = cv2.projectPoints(mask_model_pts, rvec, tvec, cam_mtx, self.dist_coeffs)
-                                        dst_pts_px = dst_pts_raw.reshape(-1, 2)
-                                        # Normalize back for transform_to_projector
-                                        dst_pts_norm = dst_pts_px / [w_cam, h_cam]
-                                    else:
-                                        # Fallback to standard Homography (maps Normalized to Normalized)
-                                        dst_pts_norm = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
-                                else:
-                                    # Fallback to standard Homography (maps Normalized to Normalized)
-                                    dst_pts_norm = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
-
-                                # Audio Scaling
-                                if self.audio_reactive_target == 'scale':
-                                    center = np.mean(dst_pts_norm, axis=0)
-                                    scale_factor = 1.0 + self.audio_bands[0] * 0.5
-                                    dst_pts_norm = (dst_pts_norm - center) * scale_factor + center
-                            else:
-                                # Tracking lost or not linked: stay at source points (already normalized)
-                                dst_pts_norm = src_pts
-
-                            # Transform camera coordinates to internal render coordinates
-                            dst_pts = self.transform_to_projector(dst_pts_norm, target_w=w, target_h=h)
-
-                            # Warp video to the dynamic polygon
-                            video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
-
-                            if len(dst_pts) == 4:
-                                dst_pts_warp = np.float32(dst_pts).reshape(-1, 2)
-                            elif len(dst_pts) >= 3:
-                                dst_pts_arr = np.array(dst_pts, dtype=np.float32)
-                                if not np.all(np.isfinite(dst_pts_arr)):
-                                    continue
-                                min_x, min_y = np.min(dst_pts_arr, axis=0)
-                                max_x, max_y = np.max(dst_pts_arr, axis=0)
-                                dst_pts_warp = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
-                            else:
-                                continue
-
-                            matrix, _ = cv2.findHomography(video_corners, dst_pts_warp)
-                            if matrix is not None:
-                                warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
-
-                                # Draw mask
-                                curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
-                                draw_pts = np.int32(dst_pts)
-                                if mask.bezier_enabled and len(dst_pts) >= 3:
-                                    pts = np.array(dst_pts)
-                                    pts = np.vstack([pts, pts[0]])
-                                    t_interp = np.linspace(0, 1, len(pts))
-                                    t_new = np.linspace(0, 1, 100)
-                                    f_x = interp1d(t_interp, pts[:, 0], kind='quadratic')
-                                    f_y = interp1d(t_interp, pts[:, 1], kind='quadratic')
-                                    draw_pts = np.stack([f_x(t_new), f_y(t_new)], axis=1).astype(np.int32)
-
-                                cv2.fillPoly(curr_mask_img, [draw_pts], (255, 255, 255))
-                                if mask.feather > 0:
-                                    k = int(mask.feather) | 1
-                                    cv2.boxFilter(curr_mask_img, -1, (k, k), dst=curr_mask_img)
-                                mask_img = curr_mask_img
-
-                        elif mask.type == 'static' or (mask.type == 'dynamic' and not mask.is_linked):
-                            effective_frame_cue = frame_cue
-
-                            effective_opacity = mask.opacity
+                        effective_opacity = mask.opacity * curr_fade
                         if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
-                            lfo_val = self.get_lfo_value(mask)
                             effective_opacity *= lfo_val
 
                         if effective_opacity < 1.0:
-                            effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=effective_opacity)
+                            effective_frame_cue = cv2.convertScaleAbs(effective_frame_cue, alpha=effective_opacity)
 
-                            if not mask.source_points:
-                                warped_cue = cv2.resize(effective_frame_cue, (w, h))
-                                mask_img = np.full((h, w, 3), 255, dtype=np.uint8)
-                            else:
-                                src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
-                                # mask.source_points is already normalized
-                                dst_pts = self.transform_to_projector(mask.source_points, target_w=w, target_h=h)
+                        # Safety Fallback
+                        is_safe = True
+                        if mask.type == 'dynamic' and curr_confidence < 0.2 and self.safety_mode_enabled:
+                            is_safe = False
+                            # Override frame with fallback generator
+                            frame_cue = self.get_vj_generator(self.fallback_generator, h, w)
+
+                        # Static Caching Check
+                        cache_key = (mask_id, tuple(map(tuple, mask.source_points)))
+                        warped_cue = None
+                        mask_img = None
+
+                        if mask.type == 'static' and cache_key in self.static_warp_cache:
+                            cached_fid, cached_warped, cached_mask_img = self.static_warp_cache[cache_key]
+                            if cached_fid == frame_id:
+                                warped_cue = cached_warped
+                                mask_img = cached_mask_img
+
+                        if warped_cue is None:
+                            if mask.type == 'dynamic' and ((mask.is_linked and curr_homography is not None) or not is_safe):
+                                src_pts = np.float32(mask.source_points)
+
+                                if is_safe:
+                                    cal_w, cal_h = self.calibration_camera_res if self.calibration_camera_res else (w_cam, h_cam)
+                                    # 3D PnP Perspective Logic
+                                    if self.pnp_enabled and self.marker_config and len(self.marker_config) == 4 and len(tracked_points) == 4:
+                                        # Model points (markers in their reference plane, Z=0)
+                                        model_pts = np.array([ [p[0]*cal_w, p[1]*cal_h, 0] for p in self.marker_config ], dtype=np.float32)
+                                        image_pts = (np.array(tracked_points, dtype=np.float32) * [w_cam, h_cam]).reshape(-1, 2)
+
+                                        # Use a camera matrix matching current w_cam, h_cam
+                                        f = max(w_cam, h_cam)
+                                        cam_mtx = np.array([[f, 0, w_cam/2], [0, f, h_cam/2], [0, 0, 1]], dtype=np.float32)
+                                        success, rvec, tvec = cv2.solvePnP(model_pts, image_pts, cam_mtx, self.dist_coeffs)
+
+                                        if success:
+                                            # Project the mask points based on 3D pose
+                                            mask_model_pts = np.array([ [p[0]*cal_w, p[1]*cal_h, 0] for p in mask.source_points ], dtype=np.float32)
+                                            dst_pts_raw, _ = cv2.projectPoints(mask_model_pts, rvec, tvec, cam_mtx, self.dist_coeffs)
+                                            dst_pts_px = dst_pts_raw.reshape(-1, 2)
+                                            # Normalize back for transform_to_projector
+                                            dst_pts_norm = dst_pts_px / [w_cam, h_cam]
+                                        else:
+                                            # Fallback to standard Homography (maps Normalized to Normalized)
+                                            dst_pts_norm = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
+                                    else:
+                                        # Fallback to standard Homography (maps Normalized to Normalized)
+                                        dst_pts_norm = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
+
+                                    # Audio Scaling
+                                    if self.audio_reactive_target == 'scale':
+                                        center = np.mean(dst_pts_norm, axis=0)
+                                        scale_factor = 1.0 + self.audio_bands[0] * 0.5
+                                        dst_pts_norm = (dst_pts_norm - center) * scale_factor + center
+                                else:
+                                    # Tracking lost or not linked: stay at source points (already normalized)
+                                    dst_pts_norm = src_pts
+
+                                # Transform camera coordinates to internal render coordinates
+                                dst_pts = self.transform_to_projector(dst_pts_norm, target_w=w, target_h=h)
+
+                                # Warp video to the dynamic polygon
+                                video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
 
                                 if len(dst_pts) == 4:
-                                    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                                    dst_pts_warp = np.float32(dst_pts).reshape(-1, 2)
+                                elif len(dst_pts) >= 3:
+                                    dst_pts_arr = np.array(dst_pts, dtype=np.float32)
+                                    if not np.all(np.isfinite(dst_pts_arr)):
+                                        continue
+                                    min_x, min_y = np.min(dst_pts_arr, axis=0)
+                                    max_x, max_y = np.max(dst_pts_arr, axis=0)
+                                    dst_pts_warp = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
                                 else:
-                                    min_x, min_y = np.min(dst_pts, axis=0)
-                                    max_x, max_y = np.max(dst_pts, axis=0)
-                                    bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
-                                    matrix = cv2.getPerspectiveTransform(src_pts, bbox_pts)
+                                    continue
 
-                                warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
-                                curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
-                                cv2.fillPoly(curr_mask_img, [np.int32(dst_pts)], (255, 255, 255))
-                                if mask.feather > 0:
-                                    k = int(mask.feather) | 1
-                                    cv2.boxFilter(curr_mask_img, -1, (k, k), dst=curr_mask_img)
-                                mask_img = curr_mask_img
+                                matrix, _ = cv2.findHomography(video_corners, dst_pts_warp)
+                                if matrix is not None:
+                                    warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
 
-                        # Store in cache if static
-                        if mask.type == 'static' and warped_cue is not None:
-                            self.static_warp_cache[cache_key] = (frame_id, warped_cue, mask_img)
+                                    # Draw mask
+                                    curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
+                                    draw_pts = np.int32(dst_pts)
+                                    if mask.bezier_enabled and len(dst_pts) >= 3:
+                                        pts = np.array(dst_pts)
+                                        pts = np.vstack([pts, pts[0]])
+                                        t_interp = np.linspace(0, 1, len(pts))
+                                        t_new = np.linspace(0, 1, 100)
+                                        f_x = interp1d(t_interp, pts[:, 0], kind='quadratic')
+                                        f_y = interp1d(t_interp, pts[:, 1], kind='quadratic')
+                                        draw_pts = np.stack([f_x(t_new), f_y(t_new)], axis=1).astype(np.int32)
 
-                    if warped_cue is not None and mask_img is not None:
-                        projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
+                                    cv2.fillPoly(curr_mask_img, [draw_pts], (255, 255, 255))
+                                    if mask.feather > 0:
+                                        k = int(mask.feather) | 1
+                                        cv2.boxFilter(curr_mask_img, -1, (k, k), dst=curr_mask_img)
+                                    mask_img = curr_mask_img
 
-                # Draw outlines on projector during calibration/alignment
-                if self.show_camera_on_projector:
-                    # Determine current points for outline
-                    if mask.type == 'dynamic' and mask.is_linked and curr_homography is not None:
-                        # curr_homography maps Normalized to Normalized
-                        src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
-                        draw_pts_norm = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
-                    else:
-                        draw_pts_norm = np.array(mask.source_points)
+                            elif mask.type == 'static' or (mask.type == 'dynamic' and not mask.is_linked):
+                                effective_frame_cue = frame_cue
 
-                    draw_pts = self.transform_to_projector(draw_pts_norm, target_w=w, target_h=h).astype(np.int32)
+                                effective_opacity = mask.opacity
+                            if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
+                                lfo_val = self.get_lfo_value(mask)
+                                effective_opacity *= lfo_val
 
-                    if len(draw_pts) >= 3:
-                        cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
-                        cv2.putText(projector_output, f"{mask.tag or mask.name}", (int(draw_pts[0][0]), int(draw_pts[0][1] - 5)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                            if effective_opacity < 1.0:
+                                effective_frame_cue = cv2.convertScaleAbs(frame_cue, alpha=effective_opacity)
 
-            if self._capture_still_frame_flag:
-                rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                self.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
-                self._capture_still_frame_flag = False
+                                if not mask.source_points:
+                                    warped_cue = cv2.resize(effective_frame_cue, (w, h))
+                                    mask_img = np.full((h, w, 3), 255, dtype=np.uint8)
+                                else:
+                                    src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
+                                    # mask.source_points is already normalized
+                                    dst_pts = self.transform_to_projector(mask.source_points, target_w=w, target_h=h)
 
-            self.frame_count += 1
-            now = time.time()
-            if now - self.last_stats_time >= 1.0:
-                self.fps = self.frame_count / (now - self.last_stats_time)
-                self.frame_count = 0
-                self.last_stats_time = now
+                                    if len(dst_pts) == 4:
+                                        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                                    else:
+                                        min_x, min_y = np.min(dst_pts, axis=0)
+                                        max_x, max_y = np.max(dst_pts, axis=0)
+                                        bbox_pts = np.float32([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+                                        matrix = cv2.getPerspectiveTransform(src_pts, bbox_pts)
 
-            if self.show_hud:
-                hud_color = (255, 0, 255) # Purple
-                cv2.putText(main_frame, f"FPS: {self.fps:.1f} (Track: {self.tracking_fps:.1f})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
-                cv2.putText(main_frame, f"Conf: {curr_confidence:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
-                cv2.putText(main_frame, f"BPM: {self.bpm:.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
-                if self.throttle_level > 0.1:
-                    cv2.putText(main_frame, f"THROTTLE: {self.throttle_level:.1%}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                if self.auto_pilot:
-                    cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                    warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
+                                    curr_mask_img = np.zeros((h, w, 3), dtype=np.uint8)
+                                    cv2.fillPoly(curr_mask_img, [np.int32(dst_pts)], (255, 255, 255))
+                                    if mask.feather > 0:
+                                        k = int(mask.feather) | 1
+                                        cv2.boxFilter(curr_mask_img, -1, (k, k), dst=curr_mask_img)
+                                    mask_img = curr_mask_img
 
-            # Draw outlines on main_frame for UI feedback
-            with QMutexLocker(self.mask_mutex):
-                for mask in self.masks:
-                    if mask.visible:
+                            # Store in cache if static
+                            if mask.type == 'static' and warped_cue is not None:
+                                self.static_warp_cache[cache_key] = (frame_id, warped_cue, mask_img)
+
+                        if warped_cue is not None and mask_img is not None:
+                            projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
+
+                    # Draw outlines on projector during calibration/alignment
+                    if self.show_camera_on_projector:
                         # Determine current points for outline
-                        if mask.is_linked and curr_homography is not None:
+                        if mask.type == 'dynamic' and mask.is_linked and curr_homography is not None:
+                            # curr_homography maps Normalized to Normalized
                             src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
-                            try:
-                                # curr_homography maps Normalized to Normalized
-                                draw_pts_norm = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
-                                draw_pts = (draw_pts_norm * [w_cam, h_cam]).astype(np.int32)
-                            except:
-                                draw_pts = (np.array(mask.source_points) * [w_cam, h_cam]).astype(np.int32)
+                            draw_pts_norm = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
                         else:
-                            draw_pts = (np.array(mask.source_points) * [w_cam, h_cam]).astype(np.int32)
+                            draw_pts_norm = np.array(mask.source_points)
 
-                        if len(draw_pts) >= 2:
-                            color = (0, 255, 0) if mask.is_linked else (0, 255, 255)
-                            cv2.polylines(main_frame, [draw_pts], True, color, 2, cv2.LINE_AA)
-                            if mask.is_linked:
-                                cv2.putText(main_frame, f"LINKED: {mask.name}", tuple(draw_pts[0]),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        draw_pts = self.transform_to_projector(draw_pts_norm, target_w=w, target_h=h).astype(np.int32)
 
-            rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-            self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
+                        if len(draw_pts) >= 3:
+                            cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
+                            cv2.putText(projector_output, f"{mask.tag or mask.name}", (int(draw_pts[0][0]), int(draw_pts[0][1] - 5)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-            # Apply Master FX to the composition before warping
-            if self.master_active_fx or self.master_brightness != 0 or self.master_contrast != 0 or self.master_saturation != 100:
-                master_proxy = Mask("Master", [], None)
-                master_proxy.active_fx = self.master_active_fx
-                master_proxy.tint_color = self.master_tint_color
-                projector_output = self.apply_fx(projector_output, master_proxy)
+                if self._capture_still_frame_flag:
+                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                    self.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
+                    self._capture_still_frame_flag = False
 
-                # Apply Brightness/Contrast
-                if self.master_brightness != 0 or self.master_contrast != 0:
-                    alpha = (self.master_contrast + 100.0) / 100.0
-                    beta = self.master_brightness
-                    projector_output = cv2.convertScaleAbs(projector_output, alpha=alpha, beta=beta)
+                self.frame_count += 1
+                now = time.time()
+                if now - self.last_stats_time >= 1.0:
+                    self.fps = self.frame_count / (now - self.last_stats_time)
+                    self.frame_count = 0
+                    self.last_stats_time = now
 
-                # Apply Saturation
-                if self.master_saturation != 100:
-                    hsv = cv2.cvtColor(projector_output, cv2.COLOR_BGR2HSV).astype(np.float32)
-                    hsv[:,:,1] *= (self.master_saturation / 100.0)
-                    hsv[:,:,1] = np.clip(hsv[:,:,1], 0, 255)
-                    projector_output = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+                if self.show_hud:
+                    hud_color = (255, 0, 255) # Purple
+                    cv2.putText(main_frame, f"FPS: {self.fps:.1f} (Track: {self.tracking_fps:.1f})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+                    cv2.putText(main_frame, f"Conf: {curr_confidence:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+                    cv2.putText(main_frame, f"BPM: {self.bpm:.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+                    if self.throttle_level > 0.1:
+                        cv2.putText(main_frame, f"THROTTLE: {self.throttle_level:.1%}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    if self.auto_pilot:
+                        cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                # Apply Grain
-                if self.master_grain > 0:
-                    noise = np.random.randint(0, self.master_grain, (h, w, 3), dtype=np.uint8)
-                    projector_output = cv2.add(projector_output, noise)
+                # Draw outlines on main_frame for UI feedback
+                with QMutexLocker(self.mask_mutex):
+                    for mask in self.masks:
+                        if mask.visible:
+                            # Determine current points for outline
+                            if mask.is_linked and curr_homography is not None:
+                                src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
+                                try:
+                                    # curr_homography maps Normalized to Normalized
+                                    draw_pts_norm = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
+                                    draw_pts = (draw_pts_norm * [w_cam, h_cam]).astype(np.int32)
+                                except:
+                                    draw_pts = (np.array(mask.source_points) * [w_cam, h_cam]).astype(np.int32)
+                            else:
+                                draw_pts = (np.array(mask.source_points) * [w_cam, h_cam]).astype(np.int32)
 
-                # Apply Bloom (Simple)
-                if self.master_bloom > 0:
-                    # Extract highlights
-                    gray = cv2.cvtColor(projector_output, cv2.COLOR_BGR2GRAY)
-                    _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-                    highlights = cv2.bitwise_and(projector_output, cv2.merge([mask, mask, mask]))
-                    # Blur highlights
-                    k = int(self.master_bloom / 2) | 1
-                    bloom = cv2.GaussianBlur(highlights, (k, k), 0)
-                    projector_output = cv2.addWeighted(projector_output, 1.0, bloom, 0.5, 0)
+                            if len(draw_pts) >= 2:
+                                color = (0, 255, 0) if mask.is_linked else (0, 255, 255)
+                                cv2.polylines(main_frame, [draw_pts], True, color, 2, cv2.LINE_AA)
+                                if mask.is_linked:
+                                    cv2.putText(main_frame, f"LINKED: {mask.name}", tuple(draw_pts[0]),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-            # Apply Master Fader
-            if self.master_fader < 1.0:
-                projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
+                rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
 
-            # Apply Projector Boundary Global Clip (in internal resolution)
-            # Disable clipping during Wizard steps 0 and 1 to prevent interference with calibration
-            is_wizard = (self.projector_width == 1280 and self.projector_height == 720) # Simple heuristic or pass flag
+                # Apply Master FX to the composition before warping
+                if self.master_active_fx or self.master_brightness != 0 or self.master_contrast != 0 or self.master_saturation != 100:
+                    master_proxy = Mask("Master", [], None)
+                    master_proxy.active_fx = self.master_active_fx
+                    master_proxy.tint_color = self.master_tint_color
+                    projector_output = self.apply_fx(projector_output, master_proxy)
 
-            if self.projector_boundary and not (self._run_sls_flag or self.show_calibration_pattern or self.show_calibration_verify):
-                clip_mask = np.zeros((h, w), dtype=np.uint8)
-                # self.projector_boundary is already normalized
-                proj_pts = self.transform_to_projector(self.projector_boundary, target_w=w, target_h=h)
-                if len(proj_pts) >= 3:
-                    cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
-                    projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
+                    # Apply Brightness/Contrast
+                    if self.master_brightness != 0 or self.master_contrast != 0:
+                        alpha = (self.master_contrast + 100.0) / 100.0
+                        beta = self.master_brightness
+                        projector_output = cv2.convertScaleAbs(projector_output, alpha=alpha, beta=beta)
 
-            # Apply Performer Occlusion
-            if self.occlusion_enabled and self.occlusion_mask is not None:
-                # Black out the performer
-                inv_mask = cv2.bitwise_not(self.occlusion_mask)
-                if len(inv_mask.shape) == 2:
-                    inv_mask = cv2.merge([inv_mask, inv_mask, inv_mask])
-                projector_output = cv2.bitwise_and(projector_output, inv_mask)
+                    # Apply Saturation
+                    if self.master_saturation != 100:
+                        hsv = cv2.cvtColor(projector_output, cv2.COLOR_BGR2HSV).astype(np.float32)
+                        hsv[:,:,1] *= (self.master_saturation / 100.0)
+                        hsv[:,:,1] = np.clip(hsv[:,:,1], 0, 255)
+                        projector_output = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-            # 9-point grid warping (piecewise perspective optimization)
-            if self._warp_is_identity:
-                warped_output = projector_output
-            else:
-                if self.map_x is None or self.map_x.shape[:2] != (h, w) or self._warp_map_dirty:
-                    self._update_warp_maps(w, h)
+                    # Apply Grain
+                    if self.master_grain > 0:
+                        noise = np.random.randint(0, self.master_grain, (h, w, 3), dtype=np.uint8)
+                        projector_output = cv2.add(projector_output, noise)
 
-                warped_output = cv2.remap(projector_output, self.map_x, self.map_y, cv2.INTER_LINEAR)
+                    # Apply Bloom (Simple)
+                    if self.master_bloom > 0:
+                        # Extract highlights
+                        gray = cv2.cvtColor(projector_output, cv2.COLOR_BGR2GRAY)
+                        _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+                        highlights = cv2.bitwise_and(projector_output, cv2.merge([mask, mask, mask]))
+                        # Blur highlights
+                        k = int(self.master_bloom / 2) | 1
+                        bloom = cv2.GaussianBlur(highlights, (k, k), 0)
+                        projector_output = cv2.addWeighted(projector_output, 1.0, bloom, 0.5, 0)
 
-            # Final Upscale to Projector Resolution
-            if (w, h) != (w_proj, h_proj):
-                warped_output = cv2.resize(warped_output, (w_proj, h_proj), interpolation=cv2.INTER_LINEAR)
+                # Apply Master Fader
+                if self.master_fader < 1.0:
+                    projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
 
-            rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
-            self.projector_frame_ready.emit(QImage(rgb_proj.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
+                # Apply Projector Boundary Global Clip (in internal resolution)
+                # Disable clipping during Wizard steps 0 and 1 to prevent interference with calibration
+                is_wizard = (self.projector_width == 1280 and self.projector_height == 720) # Simple heuristic or pass flag
 
-            elapsed = time.time() - start_time
+                if self.projector_boundary and not (self._run_sls_flag or self.show_calibration_pattern or self.show_calibration_verify):
+                    clip_mask = np.zeros((h, w), dtype=np.uint8)
+                    # self.projector_boundary is already normalized
+                    proj_pts = self.transform_to_projector(self.projector_boundary, target_w=w, target_h=h)
+                    if len(proj_pts) >= 3:
+                        cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
+                        projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
 
-            # Auto-Throttle Logic
-            if elapsed > frame_time:
-                self.throttle_level = min(1.0, self.throttle_level + 0.05)
-            else:
-                self.throttle_level = max(0.0, self.throttle_level - 0.01)
+                # Apply Performer Occlusion
+                if self.occlusion_enabled and self.occlusion_mask is not None:
+                    # Black out the performer
+                    inv_mask = cv2.bitwise_not(self.occlusion_mask)
+                    if len(inv_mask.shape) == 2:
+                        inv_mask = cv2.merge([inv_mask, inv_mask, inv_mask])
+                    projector_output = cv2.bitwise_and(projector_output, inv_mask)
 
-            sleep_time = max(1, int((frame_time - elapsed) * 1000))
-            QThread.msleep(sleep_time)
+                # 9-point grid warping (piecewise perspective optimization)
+                # Optimized: Combine warping and upscaling into a single remap if not identity
+                if self._warp_is_identity:
+                    if (w, h) != (w_proj, h_proj):
+                        warped_output = cv2.resize(projector_output, (w_proj, h_proj), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        warped_output = projector_output
+                else:
+                    if self.map_x is None or self.map_x.shape[:2] != (h_proj, w_proj) or self._warp_map_dirty:
+                        self._update_warp_maps(w, h, w_proj, h_proj)
+
+                    warped_output = cv2.remap(projector_output, self.map_x, self.map_y, cv2.INTER_LINEAR)
+
+                rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
+                self.projector_frame_ready.emit(QImage(rgb_proj.data, w_proj, h_proj, w_proj * 3, QImage.Format_RGB888).copy())
+
+                elapsed = time.time() - start_time
+
+                # Auto-Throttle Logic
+                if elapsed > frame_time:
+                    self.throttle_level = min(1.0, self.throttle_level + 0.05)
+                else:
+                    self.throttle_level = max(0.0, self.throttle_level - 0.01)
+
+                sleep_time = max(1, int((frame_time - elapsed) * 1000))
+                QThread.msleep(sleep_time)
+            except Exception as e:
+                print(f"Critical Error in Rendering Loop: {e}")
+                QThread.msleep(500)
 
         self.tracking_thread.stop()
         self.tracking_thread.wait()
