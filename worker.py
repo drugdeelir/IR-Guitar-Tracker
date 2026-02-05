@@ -385,6 +385,7 @@ class Worker(QObject):
         self.blend_temp1 = None
         self.blend_temp2 = None
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        self.tracking_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
 
         # Start Tracking Thread
         self.tracking_thread = TrackingThread(self)
@@ -875,6 +876,9 @@ class Worker(QObject):
 
         roi_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+
+        # Boost contrast for IR markers using dedicated tracking CLAHE
+        gray = self.tracking_clahe.apply(gray)
 
         if self.auto_threshold:
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)

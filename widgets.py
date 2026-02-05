@@ -30,7 +30,7 @@ class MarkerImageLabel(QLabel):
         px, py = self.map_pos_to_pixmap(event.pos())
         pix_w = self.pix.width()
 
-        snap_threshold = max(25, int(pix_w * 0.04))
+        snap_threshold = max(60, int(pix_w * 0.08)) # Increased threshold for small IR dots
         best_pt = None
         min_dist = snap_threshold
 
@@ -78,7 +78,7 @@ class MarkerImageLabel(QLabel):
             best_pt = click_pt
 
             # Snap logic
-            snap_threshold = max(30, int(pix_w * 0.05))
+            snap_threshold = max(60, int(pix_w * 0.08)) # Increased threshold for small IR dots
             for dp in self.detected_points:
                 dp_pt = QPoint(int(dp[0] * pix_w), int(dp[1] * pix_h))
                 dist = (click_pt - dp_pt).manhattanLength()
@@ -188,7 +188,7 @@ class VideoDisplay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mask_creation_mode = False
-        self.snap_to_markers = True
+        self.snap_to_markers = False # Default to False for better drawing experience
         self.mask_points = []
         self.detected_markers = []
         self.current_pixmap = None
@@ -326,7 +326,6 @@ class VideoDisplay(QWidget):
         self.current_mask_color = color
         if not enabled:
             self.clear_mask_points()
-            self.snap_to_markers = True # Reset to default
         self.update()
 
     def set_snap_to_markers(self, enabled):

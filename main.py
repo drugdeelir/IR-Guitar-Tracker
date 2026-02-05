@@ -218,8 +218,8 @@ class ProjectionMappingApp(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QHBoxLayout(self.central_widget)
-        self.layout.setSpacing(25)
-        self.layout.setContentsMargins(20, 20, 20, 20)
+        self.layout.setSpacing(35)
+        self.layout.setContentsMargins(30, 30, 30, 30)
 
         self.video_display = VideoDisplay()
         self.video_display.setMinimumWidth(800)
@@ -500,7 +500,7 @@ class ProjectionMappingApp(QMainWindow):
             new_markers = self.marker_selection_dialog.get_selected_points()
 
             # If we already have a configuration, try to transition masks
-            if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 3:
+            if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 3 and self.marker_selection_dialog.image_label.pix:
                 # markers in dialog are in still-frame pixels
                 w_still = self.marker_selection_dialog.image_label.pix.width()
                 h_still = self.marker_selection_dialog.image_label.pix.height()
@@ -571,11 +571,11 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_scroll.setWidget(self.setup_tab)
 
         self.setup_layout = QVBoxLayout(self.setup_tab)
-        self.setup_layout.setSpacing(30)
-        self.setup_layout.setContentsMargins(25, 25, 25, 25)
+        self.setup_layout.setSpacing(40)
+        self.setup_layout.setContentsMargins(30, 30, 30, 30)
 
         self.setup_title = QLabel("<h1>Guided Setup</h1>")
-        self.setup_desc = QLabel("Welcome! Let's get your projection mapped. Follow the steps below.")
+        self.setup_desc = QLabel("<h2>Welcome! Let's get your projection mapped. Follow the steps below.</h2>")
         self.setup_desc.setWordWrap(True)
 
         self.setup_layout.addWidget(self.setup_title)
@@ -608,7 +608,7 @@ class ProjectionMappingApp(QMainWindow):
 
         # One-Click Sync
         self.sync_btn = QPushButton("ONE-CLICK SYNC (ALIGN & BOUNDS)")
-        self.sync_btn.setMinimumHeight(70)
+        self.sync_btn.setMinimumHeight(100)
         self.sync_btn.setStyleSheet("background-color: #d500f9; color: white; font-weight: bold; font-size: 16px; margin-top: 10px;")
         self.sync_btn.clicked.connect(self.start_one_click_sync)
         self.setup_group_layout.addWidget(self.sync_btn)
@@ -625,11 +625,11 @@ class ProjectionMappingApp(QMainWindow):
 
         self.load_template_btn = QPushButton("OR: Load Existing Template / Project")
         self.load_template_btn.clicked.connect(self.load_project)
-        self.load_template_btn.setStyleSheet("background-color: #311b92; color: white; margin-top: 20px;")
+        self.load_template_btn.setStyleSheet("background-color: #311b92; color: white; margin-top: 40px;")
         self.setup_group_layout.addWidget(self.load_template_btn)
 
         self.setup_next_btn = QPushButton("Next Step")
-        self.setup_next_btn.setMinimumHeight(50)
+        self.setup_next_btn.setMinimumHeight(80)
         self.setup_next_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
         self.setup_next_btn.clicked.connect(self.next_setup_step)
 
@@ -790,10 +790,11 @@ class ProjectionMappingApp(QMainWindow):
         # Add common instruction label back
         self.setup_instruction = QLabel()
         self.setup_instruction.setWordWrap(True)
+        self.setup_instruction.setStyleSheet("margin-bottom: 20px; color: #bbdefb;")
         self.setup_group_layout.addWidget(self.setup_instruction)
 
         if self.setup_step == 1: # Alignment
-            self.setup_group.setTitle("Step 2: Verification")
+            self.setup_group.setTitle("Step 2: Verification & Masking")
             self.setup_instruction.setText("Verify that the alignment and background bounds are correct. If the background boundary is incorrect, you can manually adjust it in the 'Boundary' tab.")
 
             self.verify_align_btn = QPushButton("VERIFY ALIGNMENT (GRID)")
@@ -911,9 +912,9 @@ class ProjectionMappingApp(QMainWindow):
 
     def start_setup_guitar_mask(self):
         self.video_display.clear_mask_points()
-        self.video_display.set_snap_to_markers(True)
+        self.video_display.set_snap_to_markers(False)
         if hasattr(self, 'snap_check'):
-            self.snap_check.setChecked(True)
+            self.snap_check.setChecked(False)
         self.video_display.set_mask_color(Qt.green)
         mask = None
         for m in self.masks:
@@ -1056,7 +1057,7 @@ class ProjectionMappingApp(QMainWindow):
         form.addRow(self.bezier_check)
 
         self.snap_check = QCheckBox("Snap to Markers")
-        self.snap_check.setChecked(True)
+        self.snap_check.setChecked(False)
         self.snap_check.toggled.connect(self.video_display.set_snap_to_markers)
         form.addRow(self.snap_check)
 
@@ -2305,6 +2306,11 @@ class ProjectionMappingApp(QMainWindow):
             mask.z_order = min_z - 1
             self.worker.set_masks(self.masks)
             self.statusBar().showMessage(f"'{mask.name}' sent to back", 3000)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.showNormal()
+        super().keyPressEvent(event)
 
     def closeEvent(self, event):
         self.worker.stop()
