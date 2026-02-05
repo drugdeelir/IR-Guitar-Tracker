@@ -2092,7 +2092,7 @@ class ProjectionMappingApp(QMainWindow):
             mask.name = 'Guitar'
             # Automatically link to markers if they exist
             if self.selected_markers and not mask.is_linked:
-                 self.link_mask_to_markers()
+                 self.link_mask_to_markers(mask)
         elif self.setup_step == 4: # Amp Mask step
             mask.tag = 'background'
             mask.type = 'static'
@@ -2153,16 +2153,20 @@ class ProjectionMappingApp(QMainWindow):
     def add_mask_point_to_list(self, point):
         pass # Removed log list to save space
 
-    def link_mask_to_markers(self):
+    def link_mask_to_markers(self, mask=None):
+        if isinstance(mask, bool): mask = None
         # Determine which mask to link based on dropdown or selection
         target_mask_name = None
-        if self.tabs.currentIndex() == 0 and hasattr(self, 'setup_link_mask_combo'):
-            target_mask_name = self.setup_link_mask_combo.currentText()
-        elif hasattr(self, 'workspace_link_mask_combo'):
-            target_mask_name = self.workspace_link_mask_combo.currentText()
+        if not mask:
+            setup_combo = getattr(self, 'setup_link_mask_combo', None)
+            workspace_combo = getattr(self, 'workspace_link_mask_combo', None)
 
-        mask = None
-        if target_mask_name:
+            if self.tabs.currentIndex() == 0 and setup_combo:
+                target_mask_name = setup_combo.currentText()
+            elif workspace_combo:
+                target_mask_name = workspace_combo.currentText()
+
+        if not mask and target_mask_name:
             for m in self.masks:
                 if m.name == target_mask_name:
                     mask = m
