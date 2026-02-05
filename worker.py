@@ -188,26 +188,12 @@ class TrackingThread(QThread):
 
                 # Handle Calibration Flags (some need to run in camera thread)
                 if self.worker._capture_still_frame_flag:
-                    # Wait for resolution change to apply if requested
-                    if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
-                        # Burst capture (15 frames) for robust calibration
-                        frames = [main_frame]
-                        for _ in range(14):
-                            ret, f = main_cap.read()
-                            if ret: frames.append(f)
-                            QThread.msleep(15)
-
-                        # Use Max Composite to find the brightest/most persistent spots
-                        composite = frames[0].copy()
-                        for i in range(1, len(frames)):
-                            composite = cv2.max(composite, frames[i])
-
-                        rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
-                        # Perform specialized high-res detection for the still frame
-                        # Use a dedicated return for rejected candidates to guide user
-                        still_dots, rejected_dots = self.worker.get_tracked_points(composite, force_full=True, return_rejected=True)
-                        self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots, rejected_dots)
-                        self.worker._capture_still_frame_flag = False
+                    # Capture immediately to avoid "Waiting for Camera" hang
+                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                    # Perform specialized high-res detection for the still frame
+                    still_dots, rejected_dots = self.worker.get_tracked_points(main_frame, force_full=True, return_rejected=True)
+                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots, rejected_dots)
+                    self.worker._capture_still_frame_flag = False
 
                 elapsed = time.time() - start_time
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
@@ -919,31 +905,25 @@ class Worker(QObject):
             effective_threshold = min(self.ir_threshold, 245)
             _, thresh = cv2.threshold(gray, effective_threshold, 255, cv2.THRESH_BINARY)
 
-        # Using Connected Components for more reliable detection of small dots
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+        # Using findContours for efficient blob finding
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detected_points_raw = []
         rejected_points_raw = []
 
         # Min circularity: more lenient for still capture, strict for live tracking
-        min_circ = 0.45 if force_full else 0.70
+        min_circ = 0.55 if force_full else 0.82
 
-        for i in range(1, num_labels): # Skip background label 0
-            area = stats[i, cv2.CC_STAT_AREA]
-            if 1 <= area < 1000:
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if 1 <= area < 800:
                 # Calculate circularity
-                mask = (labels == i).astype(np.uint8)
-                contours_lbl, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not contours_lbl: continue
-                contour = contours_lbl[0]
-
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
 
                 # Use intensity-weighted moments for sub-pixel centroid stability
-                # Expand ROI to capture the full Gaussian spot for better sub-pixel accuracy
                 x_b, y_b, w_b, h_b = cv2.boundingRect(contour)
-                pad = 4
+                pad = 3
                 x1 = max(0, x_b - pad)
                 y1 = max(0, y_b - pad)
                 x2 = min(roi_w, x_b + w_b + pad)
@@ -963,7 +943,7 @@ class Worker(QObject):
                     cY = (cy_px + roi_y) / h
                     candidate = {'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity}
 
-                    if circularity >= min_circ and intensity >= (self.ir_threshold * 0.8):
+                    if circularity >= min_circ and intensity >= (self.ir_threshold * 0.9):
                         detected_points_raw.append(candidate)
                     else:
                         rejected_points_raw.append(candidate)
@@ -1129,13 +1109,13 @@ class Worker(QObject):
                         if best_match: break
                 if best_match: break
 
-            if best_match and best_overall_error < 0.05: # Final threshold for a valid lock (tightened)
+            if best_match and best_overall_error < 0.035: # Final threshold for a valid lock (highly tightened)
                 # Sanity Check: Filter out sudden jumps (reflections)
                 if self.last_tracked_points is not None and self.confidence > 0.3:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
                     curr_center = np.mean(best_match, axis=0)
-                    # For a guitar, moving > 10% of screen width in one frame is unlikely
-                    if np.linalg.norm(curr_center - prev_center) > 0.10:
+                    # For a guitar, moving > 8% of screen width in one frame is unlikely
+                    if np.linalg.norm(curr_center - prev_center) > 0.08:
                         self.confidence = max(0.0, self.confidence - 0.2)
                         return self.last_tracked_points
 
@@ -1156,7 +1136,7 @@ class Worker(QObject):
                 # Decisive Reset: If current points are too far from the history
                 if self.smoothed_points is not None and self.confidence > 0.5:
                     dist = np.linalg.norm(np.mean(new_points_arr, axis=0) - np.mean(self.smoothed_points, axis=0))
-                    if dist > 0.08: # Significant jump detected (lowered for better stability)
+                    if dist > 0.06: # Significant jump detected (lowered for better stability)
                         self.confidence = max(0.0, self.confidence - 0.15)
                         return self.last_tracked_points
 
