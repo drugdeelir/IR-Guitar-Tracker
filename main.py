@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog,
                              QLineEdit, QSlider, QListWidget, QStatusBar, QCheckBox,
                              QDialog, QFormLayout, QInputDialog, QTabWidget, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QAbstractItemView)
+                             QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea)
 from PyQt5.QtGui import QPixmap, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor
@@ -255,6 +255,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.trackers_ready.connect(self.video_display.set_detected_markers)
         self.worker.camera_error.connect(self.show_camera_error)
         self.worker.system_warning.connect(lambda msg: self.statusBar().showMessage(msg, 10000))
+        self.worker.status_update.connect(lambda msg: self.statusBar().showMessage(msg, 0))
         self.worker.calibration_complete.connect(self.handle_calibration_complete)
         self.worker.boundary_detected.connect(self.handle_boundary_detected)
         self.marker_selection_dialog = MarkerSelectionDialog(self)
@@ -316,29 +317,33 @@ class ProjectionMappingApp(QMainWindow):
 
     def refresh_link_status_labels(self):
         try:
-            if hasattr(self, 'setup_link_status_label') and self.setup_link_status_label and hasattr(self, 'setup_link_mask_combo'):
-                selected = self.setup_link_mask_combo.currentText()
+            combo = getattr(self, 'setup_link_mask_combo', None)
+            label = getattr(self, 'setup_link_status_label', None)
+            if combo and label:
+                selected = combo.currentText()
                 linked = any(m.name == selected and m.is_linked for m in self.masks)
                 if linked:
-                    self.setup_link_status_label.setText("Status: LINKED")
-                    self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
+                    label.setText("Status: LINKED")
+                    label.setStyleSheet("font-weight: bold; color: #00c853;")
                 else:
-                    self.setup_link_status_label.setText("Status: Not Linked")
-                    self.setup_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        except RuntimeError:
+                    label.setText("Status: Not Linked")
+                    label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        except (RuntimeError, AttributeError, TypeError):
             pass
 
         try:
-            if hasattr(self, 'workspace_link_status_label') and self.workspace_link_status_label and hasattr(self, 'workspace_link_mask_combo'):
-                selected = self.workspace_link_mask_combo.currentText()
+            combo = getattr(self, 'workspace_link_mask_combo', None)
+            label = getattr(self, 'workspace_link_status_label', None)
+            if combo and label:
+                selected = combo.currentText()
                 linked = any(m.name == selected and m.is_linked for m in self.masks)
                 if linked:
-                    self.workspace_link_status_label.setText("Status: LINKED")
-                    self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #00c853;")
+                    label.setText("Status: LINKED")
+                    label.setStyleSheet("font-weight: bold; color: #00c853;")
                 else:
-                    self.workspace_link_status_label.setText("Status: Not Linked")
-                    self.workspace_link_status_label.setStyleSheet("font-weight: bold; color: #ff5252;")
-        except RuntimeError:
+                    label.setText("Status: Not Linked")
+                    label.setStyleSheet("font-weight: bold; color: #ff5252;")
+        except (RuntimeError, AttributeError, TypeError):
             pass
 
     def assign_media_to_mask(self):
@@ -486,14 +491,20 @@ class ProjectionMappingApp(QMainWindow):
 
             # If we already have a configuration, try to transition masks
             if self.worker.marker_config and len(new_markers) == len(self.worker.marker_config) and len(new_markers) >= 4:
+                # markers in dialog are in still-frame pixels
+                w_still = self.marker_selection_dialog.image_label.pix.width()
+                h_still = self.marker_selection_dialog.image_label.pix.height()
+
+                # Both old and new pts are now normalized for resolution-independence
                 old_pts = np.float32(self.worker.marker_config).reshape(-1, 1, 2)
-                new_pts = np.float32([(p.x(), p.y()) for p in new_markers]).reshape(-1, 1, 2)
+                new_pts = np.float32([(p.x() / w_still, p.y() / h_still) for p in new_markers]).reshape(-1, 1, 2)
                 matrix, _ = cv2.findHomography(old_pts, new_pts)
 
                 if matrix is not None:
                     for mask in self.masks:
                         # Only transform static masks; linked ones are already relative to markers
                         if not mask.is_linked and mask.source_points:
+                            # mask.source_points are normalized
                             pts = np.float32(mask.source_points).reshape(-1, 1, 2)
                             trans_pts = cv2.perspectiveTransform(pts, matrix).reshape(-1, 2)
                             mask.source_points = [(float(p[0]), float(p[1])) for p in trans_pts]
@@ -534,9 +545,14 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage("Marker selection cleared.", 3000)
 
     def create_setup_tab(self):
+        self.setup_scroll = QScrollArea()
+        self.setup_scroll.setWidgetResizable(True)
+        self.setup_scroll.setFrameShape(QScrollArea.NoFrame)
         self.setup_tab = QWidget()
+        self.setup_scroll.setWidget(self.setup_tab)
+
         self.setup_layout = QVBoxLayout(self.setup_tab)
-        self.setup_layout.setSpacing(12)
+        self.setup_layout.setSpacing(20)
         self.setup_layout.setContentsMargins(15, 15, 15, 15)
 
         self.setup_title = QLabel("<h2>Guided Setup</h2>")
@@ -603,7 +619,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_layout.addWidget(self.setup_next_btn)
 
         self.setup_layout.addStretch()
-        self.tabs.insertTab(0, self.setup_tab, "Setup Wizard")
+        self.tabs.insertTab(0, self.setup_scroll, "Setup Wizard")
 
     def start_auto_calibration(self):
         self.statusBar().showMessage("Displaying calibration pattern...", 2000)
@@ -943,8 +959,14 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage("Configuration Mode", 3000)
 
     def create_workspace_tab(self):
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.workspace_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
 
         # Project controls
         proj_group = QGroupBox("Project")
@@ -1172,7 +1194,7 @@ class ProjectionMappingApp(QMainWindow):
         layout.addWidget(master_group)
 
         layout.addStretch()
-        self.tabs.addTab(tab, "Stage")
+        self.tabs.addTab(self.workspace_scroll, "Stage")
 
     def create_media_tab(self):
         tab = QWidget()
@@ -1317,8 +1339,14 @@ class ProjectionMappingApp(QMainWindow):
         self.statusBar().showMessage("Boundary saved as Background mask.", 3000)
 
     def create_calibration_tab(self):
+        self.calib_scroll = QScrollArea()
+        self.calib_scroll.setWidgetResizable(True)
+        self.calib_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.calib_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
 
         self.warp_group = QGroupBox("Projector Warping (3x3 Grid)")
         warp_layout = QVBoxLayout()
@@ -1362,6 +1390,11 @@ class ProjectionMappingApp(QMainWindow):
         self.ir_trackers_label = QLabel("Trackers detected: 0")
         ir_layout.addWidget(self.ir_trackers_label)
 
+        self.freeze_check = QCheckBox("Enable Tracking Safety Freeze")
+        self.freeze_check.setToolTip("If enabled, the mask will freeze in place if tracking is lost instead of disappearing.")
+        self.freeze_check.toggled.connect(lambda checked: setattr(self.worker, 'tracking_freeze_enabled', checked))
+        ir_layout.addWidget(self.freeze_check)
+
         self.select_markers_button = QPushButton("Calibrate Guitar Markers")
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
         ir_layout.addWidget(self.select_markers_button)
@@ -1391,11 +1424,17 @@ class ProjectionMappingApp(QMainWindow):
         layout.addWidget(depth_group)
 
         layout.addStretch()
-        self.tabs.addTab(tab, "Calibration")
+        self.tabs.addTab(self.calib_scroll, "Calibration")
 
     def create_system_tab(self):
+        self.system_scroll = QScrollArea()
+        self.system_scroll.setWidgetResizable(True)
+        self.system_scroll.setFrameShape(QScrollArea.NoFrame)
         tab = QWidget()
+        self.system_scroll.setWidget(tab)
+
         layout = QVBoxLayout(tab)
+        layout.setSpacing(15)
 
         # Camera
         cam_group = QGroupBox("Camera")
@@ -1452,7 +1491,7 @@ class ProjectionMappingApp(QMainWindow):
         layout.addWidget(audio_group)
 
         layout.addStretch()
-        self.tabs.addTab(tab, "System")
+        self.tabs.addTab(self.system_scroll, "System")
 
     def create_diagnostics_tab(self):
         tab = QWidget()
@@ -1610,6 +1649,7 @@ class ProjectionMappingApp(QMainWindow):
                 'projector_boundary': self.worker.projector_boundary,
                 'pnp_enabled': self.pnp_check.isChecked(),
                 'occlusion_enabled': self.occlusion_check.isChecked(),
+                'tracking_freeze_enabled': self.worker.tracking_freeze_enabled,
                 'setup_reference': ref_frame_b64,
                 'master_visuals': {
                     'brightness': self.brightness_slider.value(),
@@ -1701,13 +1741,14 @@ class ProjectionMappingApp(QMainWindow):
 
                 marker_config = data.get('marker_config')
                 if marker_config:
-                    config_pts = [tuple(p) for p in marker_config]
-                    self.worker.set_marker_points([QPoint(p[0], p[1]) for p in config_pts])
+                    # Pass normalized points directly to worker
+                    self.worker.set_marker_points(marker_config)
 
                 self.worker.baseline_distance = data.get('baseline_distance', 0)
                 self.worker.projector_boundary = data.get('projector_boundary')
                 self.pnp_check.setChecked(data.get('pnp_enabled', False))
                 self.occlusion_check.setChecked(data.get('occlusion_enabled', False))
+                self.freeze_check.setChecked(data.get('tracking_freeze_enabled', False))
 
                 h_c2p = data.get('h_c2p')
                 calib_points = data.get('calib_points')

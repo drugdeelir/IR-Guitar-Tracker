@@ -4,7 +4,7 @@ import numpy as np
 import time
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
-from itertools import combinations
+from itertools import combinations, permutations
 from scipy.interpolate import interp1d, RBFInterpolator
 from utils import resource_path
 from mask import Mask
@@ -170,12 +170,14 @@ class TrackingThread(QThread):
 
             if len(tracked_points) >= 2:
                 current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
-                if self.worker._calibrate_depth_flag:
+                if self.worker._calibrate_depth_flag and current_dist > 0.001:
                     self.worker.baseline_distance = current_dist
                     self.worker._calibrate_depth_flag = False
 
-                if self.worker.baseline_distance > 0:
+                if self.worker.baseline_distance > 0.001:
                     self.worker.proximity_val = current_dist / self.worker.baseline_distance
+                else:
+                    self.worker.proximity_val = 1.0
 
             # HUD Data preparation (camera side)
             with QMutexLocker(self.worker.latest_main_frame_mutex):
@@ -188,7 +190,9 @@ class TrackingThread(QThread):
                 # Wait for resolution change to apply if requested
                 if self.worker._current_camera_res == self.worker.requested_camera_res or self.worker.requested_camera_res == (9999, 9999):
                     rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), tracked_points)
+                    # Perform specialized high-res detection for the still frame
+                    still_dots = self.worker.get_tracked_points(main_frame, force_full=True)
+                    self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots)
                     self.worker._capture_still_frame_flag = False
 
             elapsed = time.time() - start_time
@@ -206,6 +210,7 @@ class Worker(QObject):
     trackers_ready = pyqtSignal(list)
     camera_error = pyqtSignal(int)
     system_warning = pyqtSignal(str)
+    status_update = pyqtSignal(str)
     calibration_complete = pyqtSignal(bool)
     boundary_detected = pyqtSignal(list) # List of points
 
@@ -231,7 +236,7 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
-        self.requested_camera_res = (1280, 720) # Default for performance
+        self.requested_camera_res = (9999, 9999) # Default to max FOV for stability
         self._current_camera_res = (0, 0)
         self.calibration_camera_res = None
         self.baseline_distance = 0
@@ -239,6 +244,8 @@ class Worker(QObject):
         self._calibrate_depth_flag = False
         self._capture_still_frame_flag = False
         self.marker_config = None
+        self.marker_config_base = None
+        self.marker_capture_res = None
         self.bpm = 120.0
         self.last_tracked_points = None
         self.last_tracked_points_internal = []
@@ -252,7 +259,9 @@ class Worker(QObject):
         # Smoothing and Confidence
         self.kalman_filters = []
         self.smoothed_points = None
-        self.smoothing_factor = 0.5
+        self.smoothing_factor = 0.8 # Increased smoothing for stage distance
+        self.history_points = []
+        self.history_len = 5
         self.confidence = 0.0
         self.confidence_gain = 0.2
         self.confidence_decay = 0.1
@@ -293,6 +302,7 @@ class Worker(QObject):
         self.last_stats_time = time.time()
         self.show_hud = True
         self.blackout_active = False
+        self.tracking_freeze_enabled = False
 
         # Safety Mode
         self.safety_mode_enabled = True
@@ -351,8 +361,9 @@ class Worker(QObject):
         self.mask_fade_levels = {} # mask_id -> current_fade (0.0 to 1.0)
 
         # Performance Tuning
-        self.render_width = 960
-        self.render_height = 540
+        self.render_width = 1280
+        self.render_height = 720
+        self.render_scale = 0.7 # Default scale factor
         self.throttle_level = 0.0 # 0.0 to 1.0 (degrade quality)
 
         # Caching
@@ -397,8 +408,28 @@ class Worker(QObject):
             self.kalman_filters.append(kf)
 
     def set_marker_points(self, points):
+        """Sets the reference marker configuration. Supports QPoint (pixels) or tuples (normalized)."""
         with QMutexLocker(self.tracking_mutex):
-            self.marker_config = [ (p.x(), p.y()) for p in points]
+            # Reset tracking history when markers change
+            self.history_points = []
+            self.smoothed_points = None
+
+            w, h = self._current_camera_res
+            if w <= 0 or h <= 0: w, h = 1280, 720
+
+            new_config = []
+            for p in points:
+                if hasattr(p, 'x'): # QPoint or QPointF
+                    # If it's a QPoint and looks like it's in pixels (> 1.0), normalize it.
+                    # Otherwise, it might already be normalized QPointF.
+                    if p.x() > 1.0 or p.y() > 1.0:
+                        new_config.append((p.x() / w, p.y() / h))
+                    else:
+                        new_config.append((p.x(), p.y()))
+                else: # Tuple or list (normalized)
+                    new_config.append((p[0], p[1]))
+
+            self.marker_config = new_config
             if len(self.marker_config) > 1:
                 self.init_kalman(len(self.marker_config))
                 distances = []
@@ -414,6 +445,8 @@ class Worker(QObject):
     def clear_marker_config(self):
         with QMutexLocker(self.tracking_mutex):
             self.marker_config = None
+            self.marker_config_base = None
+            self.marker_capture_res = None
             self.marker_fingerprint = []
             self.last_tracked_points = None
             self.smoothed_points = None
@@ -774,7 +807,8 @@ class Worker(QObject):
                 r = i // 10
                 x = int(center[0] + r * np.cos(np.radians(i)))
                 y = int(center[1] + r * np.sin(np.radians(i)))
-                cv2.circle(mask, (x, y), 10 + i // 100, 255, -1)
+                if -100 < x < w + 100 and -100 < y < h + 100:
+                    cv2.circle(mask, (x, y), 10 + i // 100, 255, -1)
         elif design_name == 'moon':
             cv2.circle(mask, center, h // 3, 255, -1)
             offset = h // 10
@@ -806,32 +840,34 @@ class Worker(QObject):
                 t = np.radians(i)
                 x = 16 * np.sin(t)**3
                 y = -(13 * np.cos(t) - 5 * np.cos(2*t) - 2 * np.cos(3*t) - np.cos(4*t))
-                cv2.circle(mask, (int(center[0] + x * (h//50)), int(center[1] + y * (h//50))), h // 40, 255, -1)
+                px = int(center[0] + x * (h//50))
+                py = int(center[1] + y * (h//50))
+                if -50 < px < w + 50 and -50 < py < h + 50:
+                    cv2.circle(mask, (px, py), h // 40, 255, -1)
         else:
             mask.fill(255)
 
         self._design_cache[cache_key] = mask
         return mask
 
-    def get_tracked_points(self, frame):
+    def get_tracked_points(self, frame, force_full=False):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
+        h, w = frame.shape[:2]
         with QMutexLocker(self.tracking_mutex):
             marker_cfg = self.marker_config
             marker_fp = self.marker_fingerprint
 
-        if marker_cfg is None:
-            return []
-
-        h, w = frame.shape[:2]
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
-        if self.last_tracked_points is not None:
+        if not force_full and self.last_tracked_points is not None:
+            # pts are normalized
             pts = np.array(self.last_tracked_points)
             min_x, min_y = np.min(pts, axis=0)
             max_x, max_y = np.max(pts, axis=0)
-            roi_x = max(0, int(min_x - self.roi_padding))
-            roi_y = max(0, int(min_y - self.roi_padding))
-            roi_w = min(w - roi_x, int(max_x - min_x + 2 * self.roi_padding))
-            roi_h = min(h - roi_y, int(max_y - min_y + 2 * self.roi_padding))
+            # Convert to pixels for ROI calculation
+            roi_x = max(0, int(min_x * w - self.roi_padding))
+            roi_y = max(0, int(min_y * h - self.roi_padding))
+            roi_w = min(w - roi_x, int((max_x - min_x) * w + 2 * self.roi_padding))
+            roi_h = min(h - roi_y, int((max_y - min_y) * h + 2 * self.roi_padding))
 
         roi_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
@@ -848,94 +884,119 @@ class Worker(QObject):
             if cv2.contourArea(contour) > 20:
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
-                    cX = int(M["m10"] / M["m00"]) + roi_x
-                    cY = int(M["m01"] / M["m00"]) + roi_y
+                    cX = (M["m10"] / M["m00"] + roi_x) / w
+                    cY = (M["m01"] / M["m00"] + roi_y) / h
                     detected_points.append((cX, cY))
 
-        if marker_cfg and len(marker_cfg) > 1 and len(detected_points) >= len(marker_cfg):
+        if marker_cfg and len(marker_cfg) >= 3 and len(detected_points) >= len(marker_cfg) - 1:
+            # OC-TOLERANCE: If we see at least 3 markers (and 1 is missing), we can estimate the guitar pose
             # If we were tracking, prioritize points near last known location
-            if self.confidence > 0.5 and self.last_tracked_points:
+            if self.confidence > 0.2 and self.last_tracked_points:
                 center = np.mean(self.last_tracked_points, axis=0)
                 detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
 
-            # Limit points to check to avoid O(N^K) explosion (N=12, K=4 -> 495 combos)
-            limit = 12 if len(marker_cfg) >= 4 else 15
+            num_markers = len(marker_cfg)
+            limit = 12
             points_to_check = detected_points[:limit]
 
-            num_markers = len(marker_cfg)
+            # Try to find a match with N markers first, then N-1
+            for search_count in [num_markers, num_markers - 1]:
+                if len(points_to_check) < search_count: continue
 
-            # Optimization: Pre-calculate pairwise distances between detected points
-            # to avoid redundant norm calculations in the combinations loop.
-            dist_matrix = {}
-            for i, j in combinations(range(len(points_to_check)), 2):
-                d = np.linalg.norm(np.array(points_to_check[i]) - np.array(points_to_check[j]))
-                dist_matrix[(i, j)] = d
-
-            for indices in combinations(range(len(points_to_check)), num_markers):
-                # Quick bounding box check
-                pts_arr = np.array([points_to_check[i] for i in indices])
-                if self.confidence > 0.5 and self.last_tracked_points is not None:
-                    # If tracking, current combo shouldn't be too far from last known size
-                    prev_pts = np.array(self.last_tracked_points)
-                    prev_size = np.max(prev_pts, axis=0) - np.min(prev_pts, axis=0)
-                    curr_size = np.max(pts_arr, axis=0) - np.min(pts_arr, axis=0)
-                    if any(curr_size > prev_size * 2.0) or any(curr_size < prev_size * 0.5):
-                        continue
-
-                current_distances = []
-                for i, j in combinations(range(num_markers), 2):
-                    # Map local combo indices back to dist_matrix keys
-                    idx1, idx2 = sorted((indices[i], indices[j]))
-                    current_distances.append(dist_matrix[(idx1, idx2)])
-
-                current_fingerprint = sorted(current_distances)
-
-                if len(current_fingerprint) == len(marker_fp):
+                for indices in combinations(range(len(points_to_check)), search_count):
                     point_combo = [points_to_check[i] for i in indices]
-                    is_match = True
-                    for i in range(len(current_fingerprint)):
-                        if not np.isclose(current_fingerprint[i], marker_fp[i], rtol=0.15):
-                            is_match = False
-                            break
-                    if is_match:
+
+                    # We need to find WHICH N-1 markers we found.
+                    # Try to match the combo to subsets of the config
+                    best_match = None
+                    best_matrix = None
+                    best_error = float('inf')
+
+                    # If we found all N markers
+                    if search_count == num_markers:
                         src_pts = np.float32(marker_cfg).reshape(-1, 1, 2)
                         dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
-                        matrix, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                        if matrix is not None:
-                            self.last_homography = matrix
-                            transformed_src = cv2.perspectiveTransform(src_pts, matrix)
-                            ordered_points = []
-                            remaining_dst = list(point_combo)
+                        # We don't know the order yet. For N points, try a simpler approach if N is small
+                        # or use the last homography as a seed.
+                        if self.last_homography is not None and self.confidence > 0.3:
+                            # Re-order point_combo to match marker_cfg based on last known transform
+                            transformed_src = cv2.perspectiveTransform(src_pts, self.last_homography)
+                            ordered_dst = []
+                            temp_dst = list(point_combo)
                             for i in range(num_markers):
                                 pred = transformed_src[i][0]
-                                closest = min(remaining_dst, key=lambda p: np.linalg.norm(np.array(p) - pred))
-                                ordered_points.append(closest)
-                                remaining_dst.remove(closest)
+                                closest_idx = min(range(len(temp_dst)), key=lambda j: np.linalg.norm(np.array(temp_dst[j]) - pred))
+                                ordered_dst.append(temp_dst.pop(closest_idx))
 
-                            # Kalman Correction
-                            kalman_pts = []
-                            for i, pt in enumerate(ordered_points):
-                                self.kalman_filters[i].correct(np.array([[np.float32(pt[0])], [np.float32(pt[1])]]))
-                                pred = self.kalman_filters[i].predict()
-                                kalman_pts.append((pred[0, 0], pred[1, 0]))
+                            m, mask = cv2.findHomography(src_pts, np.float32(ordered_dst).reshape(-1, 1, 2), cv2.RANSAC, 0.01)
+                            if m is not None and np.sum(mask) >= 3:
+                                best_match = ordered_dst
+                                best_matrix = m
+                                break
+                        else:
+                            # Search for best permutation (only if N is small)
+                            for p in permutations(point_combo):
+                                m, mask = cv2.findHomography(src_pts, np.float32(p).reshape(-1, 1, 2), cv2.RANSAC, 0.01)
+                                if m is not None and np.sum(mask) >= 3:
+                                    err = 0 # Could calc projection error
+                                    best_match = list(p)
+                                    best_matrix = m
+                                    break
+                            if best_match: break
 
-                            if self.smoothed_points is None:
-                                self.smoothed_points = np.array(kalman_pts, dtype=np.float32)
-                            else:
-                                alpha = 1.0 - self.smoothing_factor
-                                self.smoothed_points = self.smoothed_points * (1.0 - alpha) + np.array(kalman_pts, dtype=np.float32) * alpha
+                    # If we found N-1 markers
+                    elif search_count == num_markers - 1 and self.last_homography is not None:
+                        # Try each subset of the config
+                        for missing_idx in range(num_markers):
+                            subset_cfg = [marker_cfg[i] for i in range(num_markers) if i != missing_idx]
+                            src_pts = np.float32(subset_cfg).reshape(-1, 1, 2)
 
-                            self.confidence = min(1.0, self.confidence + self.confidence_gain)
-                            self.last_tracked_points = [tuple(p.astype(int)) for p in self.smoothed_points]
+                            # Order points using last homography
+                            transformed_src = cv2.perspectiveTransform(src_pts, self.last_homography)
+                            ordered_dst = []
+                            temp_dst = list(point_combo)
+                            for i in range(search_count):
+                                pred = transformed_src[i][0]
+                                closest_idx = min(range(len(temp_dst)), key=lambda j: np.linalg.norm(np.array(temp_dst[j]) - pred))
+                                ordered_dst.append(temp_dst.pop(closest_idx))
 
-                            # Predictive ROI Scaling based on velocity
-                            max_v = 0
-                            for kf in self.kalman_filters:
-                                v = np.linalg.norm(kf.statePost[2:])
-                                max_v = max(max_v, v)
-                            self.roi_padding = int(50 + max_v * 5)
+                            m, mask = cv2.findHomography(src_pts, np.float32(ordered_dst).reshape(-1, 1, 2), cv2.RANSAC, 0.01)
+                            if m is not None and np.sum(mask) >= 3:
+                                # Re-predict the full set
+                                full_src = np.float32(marker_cfg).reshape(-1, 1, 2)
+                                predicted_full = cv2.perspectiveTransform(full_src, m).reshape(-1, 2)
+                                best_match = [tuple(p) for p in predicted_full]
+                                best_matrix = m
+                                break
+                        if best_match: break
+                if best_match: break
 
-                            return self.last_tracked_points
+            if best_match:
+                self.last_homography = best_matrix
+                # Kalman Correction
+                kalman_pts = []
+                for i, pt in enumerate(best_match):
+                    self.kalman_filters[i].correct(np.array([[np.float32(pt[0])], [np.float32(pt[1])]]))
+                    pred = self.kalman_filters[i].predict()
+                    kalman_pts.append((pred[0, 0], pred[1, 0]))
+
+                # High-Distance Temporal Smoothing
+                if self.smoothed_points is None:
+                    self.smoothed_points = np.array(kalman_pts, dtype=np.float32)
+                else:
+                    # Adaptive smoothing based on confidence
+                    alpha = (1.0 - self.smoothing_factor) * (1.0 - self.confidence * 0.5)
+                    self.smoothed_points = self.smoothed_points * (1.0 - alpha) + np.array(kalman_pts, dtype=np.float32) * alpha
+
+                # Moving Average over history
+                self.history_points.append(self.smoothed_points.copy())
+                if len(self.history_points) > self.history_len:
+                    self.history_points.pop(0)
+
+                avg_points = np.mean(self.history_points, axis=0)
+                self.confidence = min(1.0, self.confidence + self.confidence_gain)
+                self.last_tracked_points = [tuple(p) for p in avg_points]
+                return self.last_tracked_points
 
         if self.last_tracked_points is not None:
             if roi_x != 0 or roi_y != 0 or roi_w != w or roi_h != h:
@@ -943,7 +1004,13 @@ class Worker(QObject):
                 return self.get_tracked_points(frame)
 
         self.confidence = max(0.0, self.confidence - self.confidence_decay)
-        if self.confidence > 0.1 and self.last_tracked_points:
+
+        # If tracking is completely lost, clear history to avoid "jumps" when regained
+        if self.confidence <= 0:
+            self.history_points = []
+            self.smoothed_points = None
+
+        if (self.confidence > 0.1 or self.tracking_freeze_enabled) and self.last_tracked_points:
             return self.last_tracked_points
 
         return detected_points
@@ -1051,7 +1118,16 @@ class Worker(QObject):
 
             # Projector and Render Resolution
             h_proj, w_proj = self.projector_height, self.projector_width
-            # Use fixed 540p internal for performance, then upscale
+
+            # Dynamically calculate render resolution based on projector dimensions
+            # For ultra-wide setups (like 4480px), we want higher internal res
+            target_w = int(w_proj * self.render_scale)
+            target_h = int(h_proj * self.render_scale)
+
+            # Clamp to reasonable limits for performance
+            self.render_width = max(640, min(target_w, 2560))
+            self.render_height = max(360, min(target_h, 1440))
+
             w, h = self.render_width, self.render_height
 
             if self.camera_matrix is None:
@@ -1129,14 +1205,16 @@ class Worker(QObject):
                         # Use convex hull for a clean outer boundary
                         hull = cv2.convexHull(main_contour)
                         peri = cv2.arcLength(hull, True)
-                        approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
+                        # More aggressive simplification to ensure a clean rectangle or simple polygon
+                        approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
 
-                        # If still too complex, use minAreaRect for a perfect rectangle
-                        if len(approx) > 8:
+                        # If still too complex or too many points, use minAreaRect for a perfect rectangle
+                        if len(approx) > 6:
                             rect = cv2.minAreaRect(hull)
                             approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
-                        pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
+                        # Store as normalized points
+                        pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
                         self.projector_boundary = pts
                         self.boundary_detected.emit(pts)
                     else:
@@ -1158,6 +1236,7 @@ class Worker(QObject):
                 total_y = len(self._sls_patterns_y)
 
                 if self._sls_step < total_x:
+                    self.status_update.emit(f"Room Scan: Capturing X pattern {self._sls_step+1}/{total_x}...")
                     pattern = self._sls_patterns_x[self._sls_step]
                     # Resize pattern to internal render resolution for consistency
                     pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -1173,6 +1252,7 @@ class Worker(QObject):
                         self._sls_curr_wait += 1
                 elif self._sls_step < total_x + total_y:
                     idx = self._sls_step - total_x
+                    self.status_update.emit(f"Room Scan: Capturing Y pattern {idx+1}/{total_y}...")
                     pattern = self._sls_patterns_y[idx]
                     # Resize pattern to internal render resolution for consistency
                     pattern_resized = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -1193,16 +1273,17 @@ class Worker(QObject):
                     proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
                     valid = valid_x & valid_y
 
-                    # Store dense LUT
-                    self.sls_lut_x = proj_x.astype(np.float32)
-                    self.sls_lut_y = proj_y.astype(np.float32)
+                    # Store dense LUT and apply median filter to remove noise-induced "spikes"
+                    self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5)
+                    self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5)
                     self.sls_valid_mask = valid.astype(np.uint8)
 
                     # Automatically derive Projector Boundary from SLS valid mask
                     # Clean up the mask aggressively to fill holes and smooth edges
-                    kernel = np.ones((7, 7), np.uint8)
-                    mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
-                    mask_solid = cv2.dilate(mask_solid, kernel, iterations=1)
+                    kernel = np.ones((15, 15), np.uint8)
+                    mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_OPEN, kernel)
+                    mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_CLOSE, kernel)
+                    mask_solid = cv2.dilate(mask_solid, kernel, iterations=2)
 
                     contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if contours:
@@ -1216,7 +1297,8 @@ class Worker(QObject):
                             rect = cv2.minAreaRect(hull)
                             approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
 
-                        pts = [ (float(p[0][0]), float(p[0][1])) for p in approx ]
+                        # Store as normalized points
+                        pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
                         self.projector_boundary = pts
                         self.boundary_detected.emit(pts)
                         print(f"One-Click Sync: Detected boundary with {len(pts)} points.")
@@ -1416,8 +1498,14 @@ class Worker(QObject):
             # Tracking is now handled by TrackingThread.
             # We use ui_tracked_points for visualization on the main_frame.
             if ui_tracked_points:
-                for point in ui_tracked_points:
-                    cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
+                for pt in ui_tracked_points:
+                    try:
+                        # pt is normalized, convert to pixels for drawing
+                        px = int(pt[0] * w_cam)
+                        py = int(pt[1] * h_cam)
+                        cv2.circle(main_frame, (px, py), 5, (0, 0, 255), -1)
+                    except (TypeError, ValueError, IndexError):
+                        pass
 
             # Draw calibration overlay on camera feed
             if self._run_calibration_flag:
@@ -1570,39 +1658,43 @@ class Worker(QObject):
                             src_pts = np.float32(mask.source_points)
 
                             if is_safe:
+                                cal_w, cal_h = self.calibration_camera_res if self.calibration_camera_res else (w_cam, h_cam)
                                 # 3D PnP Perspective Logic
                                 if self.pnp_enabled and self.marker_config and len(self.marker_config) == 4 and len(tracked_points) == 4:
                                     # Model points (markers in their reference plane, Z=0)
-                                    model_pts = np.array([ [p[0], p[1], 0] for p in self.marker_config ], dtype=np.float32)
-                                    image_pts = np.array(tracked_points, dtype=np.float32)
+                                    model_pts = np.array([ [p[0]*cal_w, p[1]*cal_h, 0] for p in self.marker_config ], dtype=np.float32)
+                                    image_pts = (np.array(tracked_points, dtype=np.float32) * [w_cam, h_cam]).reshape(-1, 2)
 
-                                    success, rvec, tvec = cv2.solvePnP(model_pts, image_pts, self.camera_matrix, self.dist_coeffs)
+                                    # Use a camera matrix matching current w_cam, h_cam
+                                    f = max(w_cam, h_cam)
+                                    cam_mtx = np.array([[f, 0, w_cam/2], [0, f, h_cam/2], [0, 0, 1]], dtype=np.float32)
+                                    success, rvec, tvec = cv2.solvePnP(model_pts, image_pts, cam_mtx, self.dist_coeffs)
 
                                     if success:
                                         # Project the mask points based on 3D pose
-                                        # Mask points are relative to the reference markers
-                                        mask_model_pts = np.array([ [p[0], p[1], 0] for p in mask.source_points ], dtype=np.float32)
-                                        dst_pts_raw, _ = cv2.projectPoints(mask_model_pts, rvec, tvec, self.camera_matrix, self.dist_coeffs)
-                                        dst_pts_raw = dst_pts_raw.reshape(-1, 2)
+                                        mask_model_pts = np.array([ [p[0]*cal_w, p[1]*cal_h, 0] for p in mask.source_points ], dtype=np.float32)
+                                        dst_pts_raw, _ = cv2.projectPoints(mask_model_pts, rvec, tvec, cam_mtx, self.dist_coeffs)
+                                        dst_pts_px = dst_pts_raw.reshape(-1, 2)
+                                        # Normalize back for transform_to_projector
+                                        dst_pts_norm = dst_pts_px / [w_cam, h_cam]
                                     else:
-                                        dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
+                                        # Fallback to standard Homography (maps Normalized to Normalized)
+                                        dst_pts_norm = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
                                 else:
-                                    # Fallback to standard Homography
-                                    dst_pts_raw = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
+                                    # Fallback to standard Homography (maps Normalized to Normalized)
+                                    dst_pts_norm = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), curr_homography).reshape(-1, 2)
 
                                 # Audio Scaling
                                 if self.audio_reactive_target == 'scale':
-                                    center = np.mean(dst_pts_raw, axis=0)
+                                    center = np.mean(dst_pts_norm, axis=0)
                                     scale_factor = 1.0 + self.audio_bands[0] * 0.5
-                                    dst_pts_cam = (dst_pts_raw - center) * scale_factor + center
-                                else:
-                                    dst_pts_cam = dst_pts_raw
+                                    dst_pts_norm = (dst_pts_norm - center) * scale_factor + center
                             else:
-                                # Tracking lost or not linked: stay at source points or fallback
-                                dst_pts_cam = src_pts
+                                # Tracking lost or not linked: stay at source points (already normalized)
+                                dst_pts_norm = src_pts
 
                             # Transform camera coordinates to internal render coordinates
-                            dst_pts = self.transform_to_projector(dst_pts_cam, w_cam, h_cam, target_w=w, target_h=h)
+                            dst_pts = self.transform_to_projector(dst_pts_norm, target_w=w, target_h=h)
 
                             # Warp video to the dynamic polygon
                             video_corners = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
@@ -1657,7 +1749,8 @@ class Worker(QObject):
                                 mask_img = np.full((h, w, 3), 255, dtype=np.uint8)
                             else:
                                 src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
-                                dst_pts = self.transform_to_projector(mask.source_points, w_cam, h_cam, target_w=w, target_h=h)
+                                # mask.source_points is already normalized
+                                dst_pts = self.transform_to_projector(mask.source_points, target_w=w, target_h=h)
 
                                 if len(dst_pts) == 4:
                                     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -1686,16 +1779,17 @@ class Worker(QObject):
                 if self.show_camera_on_projector:
                     # Determine current points for outline
                     if mask.type == 'dynamic' and mask.is_linked and curr_homography is not None:
+                        # curr_homography maps Normalized to Normalized
                         src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
-                        draw_pts_cam = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
+                        draw_pts_norm = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
                     else:
-                        draw_pts_cam = np.array(mask.source_points)
+                        draw_pts_norm = np.array(mask.source_points)
 
-                    draw_pts = self.transform_to_projector(draw_pts_cam, w_cam, h_cam, target_w=w, target_h=h).astype(np.int32)
+                    draw_pts = self.transform_to_projector(draw_pts_norm, target_w=w, target_h=h).astype(np.int32)
 
                     if len(draw_pts) >= 3:
                         cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
-                        cv2.putText(projector_output, f"{mask.tag or mask.name}", (draw_pts[0][0], draw_pts[0][1] - 5),
+                        cv2.putText(projector_output, f"{mask.tag or mask.name}", (int(draw_pts[0][0]), int(draw_pts[0][1] - 5)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             if self._capture_still_frame_flag:
@@ -1728,11 +1822,13 @@ class Worker(QObject):
                         if mask.is_linked and curr_homography is not None:
                             src_pts = np.float32(mask.source_points).reshape(-1, 1, 2)
                             try:
-                                draw_pts = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2).astype(np.int32)
+                                # curr_homography maps Normalized to Normalized
+                                draw_pts_norm = cv2.perspectiveTransform(src_pts, curr_homography).reshape(-1, 2)
+                                draw_pts = (draw_pts_norm * [w_cam, h_cam]).astype(np.int32)
                             except:
-                                draw_pts = np.int32(mask.source_points)
+                                draw_pts = (np.array(mask.source_points) * [w_cam, h_cam]).astype(np.int32)
                         else:
-                            draw_pts = np.int32(mask.source_points)
+                            draw_pts = (np.array(mask.source_points) * [w_cam, h_cam]).astype(np.int32)
 
                         if len(draw_pts) >= 2:
                             color = (0, 255, 0) if mask.is_linked else (0, 255, 255)
@@ -1785,11 +1881,16 @@ class Worker(QObject):
                 projector_output = cv2.convertScaleAbs(projector_output, alpha=self.master_fader)
 
             # Apply Projector Boundary Global Clip (in internal resolution)
-            if self.projector_boundary:
+            # Disable clipping during Wizard steps 0 and 1 to prevent interference with calibration
+            is_wizard = (self.projector_width == 1280 and self.projector_height == 720) # Simple heuristic or pass flag
+
+            if self.projector_boundary and not (self._run_sls_flag or self.show_calibration_pattern or self.show_calibration_verify):
                 clip_mask = np.zeros((h, w), dtype=np.uint8)
-                proj_pts = self.transform_to_projector(self.projector_boundary, w_cam, h_cam, target_w=w, target_h=h)
-                cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
-                projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
+                # self.projector_boundary is already normalized
+                proj_pts = self.transform_to_projector(self.projector_boundary, target_w=w, target_h=h)
+                if len(proj_pts) >= 3:
+                    cv2.fillPoly(clip_mask, [np.int32(proj_pts)], 255)
+                    projector_output = cv2.bitwise_and(projector_output, cv2.merge([clip_mask, clip_mask, clip_mask]))
 
             # Apply Performer Occlusion
             if self.occlusion_enabled and self.occlusion_mask is not None:
@@ -1841,7 +1942,9 @@ class Worker(QObject):
         # Emit new particles
         if tracked_points and len(self.particles) < effective_max:
             # Transform tracked points to projector space once for emission
-            proj_pts = self.transform_to_projector(tracked_points, w_cam, h_cam, target_w=w, target_h=h)
+            # Tracked points are already normalized [0-1]
+            norm_pts = np.array(tracked_points, dtype=np.float32)
+            proj_pts = self.transform_to_projector(norm_pts, target_w=w, target_h=h)
             for pt in proj_pts:
                 if np.random.random() > 0.7:
                     p = {
@@ -2120,8 +2223,7 @@ class Worker(QObject):
         self._run_boundary_detection_flag = False
         self.show_calibration_pattern = False
         self.show_calibration_verify = False
-        # Revert to performance resolution
-        self.requested_camera_res = (1280, 720)
+        # Do NOT revert resolution to avoid FOV shift/crop
 
     def run_auto_calibration(self):
         self.requested_camera_res = (9999, 9999) # Request max FOV
@@ -2151,69 +2253,58 @@ class Worker(QObject):
             return cv2.warpPerspective(frame, M, (w_target, h_target))
         return cv2.resize(frame, (w_target, h_target))
 
-    def transform_to_projector(self, pts, w_cam=640, h_cam=480, target_w=None, target_h=None):
+    def transform_to_projector(self, pts, target_w=None, target_h=None):
+        """Transform normalized camera coordinates [0-1] to projector internal coordinates."""
         if target_w is None: target_w = self.projector_width
         if target_h is None: target_h = self.projector_height
 
         scale_w = target_w / self.projector_width
         scale_h = target_h / self.projector_height
 
-        # Rescale points if current camera resolution differs from calibration resolution
+        pts_arr = np.array(pts, dtype=np.float32).reshape(-1, 2)
+
+        # Map to Calibration Resolution space for internal math
         if self.calibration_camera_res:
             cal_w, cal_h = self.calibration_camera_res
-            if cal_w != w_cam or cal_h != h_cam:
-                pts_arr = np.array(pts, dtype=np.float32).copy().reshape(-1, 2)
-                pts_arr[:, 0] *= (cal_w / w_cam)
-                pts_arr[:, 1] *= (cal_h / h_cam)
-                pts = pts_arr
-                # Update w_cam/h_cam for the rest of the function logic
-                w_cam, h_cam = cal_w, cal_h
+        else:
+            # Fallback if not calibrated: use current res
+            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (9999, 9999)
+
+        # Ensure we are using absolute pixels relative to the calibration FOV
+        pts_cal = pts_arr * [cal_w, cal_h]
 
         # Prefer Dense LUT if available
         if self.sls_lut_x is not None:
             try:
-                # Validate LUT resolution against current camera resolution
-                h_lut, w_lut = self.sls_valid_mask.shape
-                if h_lut != h_cam or w_lut != w_cam:
-                    # Invalidate LUT if camera resolution has changed
-                    self.sls_lut_x = None
-                    self.sls_lut_y = None
-                    raise ValueError("LUT resolution mismatch")
-
-                pts_arr = np.array(pts, dtype=np.float32)
                 res = []
-                for p in pts_arr.reshape(-1, 2):
+                for p in pts_cal:
                     ix, iy = int(round(p[0])), int(round(p[1]))
-                    if 0 <= ix < w_cam and 0 <= iy < h_cam and self.sls_valid_mask[iy, ix]:
+                    if 0 <= ix < cal_w and 0 <= iy < cal_h and self.sls_valid_mask[iy, ix]:
                         res.append([self.sls_lut_x[iy, ix] * scale_w, self.sls_lut_y[iy, ix] * scale_h])
                     else:
                         # Fallback to RBF for out-of-bounds or invalid pixels
                         if self.rbf_x:
-                            rx = self.rbf_x(p.reshape(1,2))[0] * scale_w
-                            ry = self.rbf_y(p.reshape(1,2))[0] * scale_h
+                            rx = self.rbf_x(p.reshape(1, 2))[0] * scale_w
+                            ry = self.rbf_y(p.reshape(1, 2))[0] * scale_h
                             res.append([rx, ry])
                         else:
                             # Proportional fallback
-                            res.append([p[0] * (target_w / w_cam), p[1] * (target_h / h_cam)])
+                            res.append([p[0] * (target_w / cal_w), p[1] * (target_h / cal_h)])
                 return np.array(res).reshape(-1, 2)
             except:
                 pass
 
         if self.rbf_x is not None:
             try:
-                pts_arr = np.array(pts, dtype=np.float32)
-                if pts_arr.ndim == 1:
-                    pts_arr = pts_arr.reshape(1, 2)
-
-                tx = self.rbf_x(pts_arr) * scale_w
-                ty = self.rbf_y(pts_arr) * scale_h
+                tx = self.rbf_x(pts_cal) * scale_w
+                ty = self.rbf_y(pts_cal) * scale_h
                 return np.stack([tx, ty], axis=1).reshape(-1, 2)
             except:
                 pass
 
         if self.h_c2p is not None:
             try:
-                pts_reshaped = np.float32(pts).reshape(-1, 1, 2)
+                pts_reshaped = np.float32(pts_cal).reshape(-1, 1, 2)
                 transformed = cv2.perspectiveTransform(pts_reshaped, self.h_c2p)
                 res = transformed.reshape(-1, 2)
                 res[:, 0] *= scale_w
@@ -2223,18 +2314,8 @@ class Worker(QObject):
                 pass
 
         # Fallback: Simple proportional scaling if not calibrated
-        # This prevents the "top-left corner" issue when calibration is missing.
-        scale_x = target_w / max(1, w_cam)
-        scale_y = target_h / max(1, h_cam)
-
-        pts_arr = np.array(pts, dtype=np.float32)
-        if pts_arr.ndim == 1:
-            return np.array([pts_arr[0] * scale_x, pts_arr[1] * scale_y])
-
-        pts_arr_c = pts_arr.copy()
-        pts_arr_c[:, 0] *= scale_x
-        pts_arr_c[:, 1] *= scale_y
-        return pts_arr_c
+        # Since pts_arr is normalized, we just scale by target dimensions
+        return pts_arr * [target_w, target_h]
 
     def set_warp_points(self, points, res=None):
         self.warp_points = points

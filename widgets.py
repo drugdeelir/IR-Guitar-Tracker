@@ -9,9 +9,11 @@ class MarkerImageLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
         self.detected_points = []
         self.selected_points = []
         self.guide_points = []
+        self.hover_snap_pt = None
         self.pix = None
 
     def set_data(self, pixmap, detected_points, guide_points=None):
@@ -19,66 +21,139 @@ class MarkerImageLabel(QLabel):
         self.detected_points = detected_points
         self.guide_points = guide_points or []
         self.selected_points = []
+        self.hover_snap_pt = None
         self.setPixmap(self.pix)
         self.update()
 
-    def mousePressEvent(self, event):
+    def mouseMoveEvent(self, event):
         if not self.pix: return
-        pos = event.pos()
+        px, py = self.map_pos_to_pixmap(event.pos())
+        pix_w = self.pix.width()
 
-        # Map to pixmap coordinates
+        snap_threshold = max(25, int(pix_w * 0.04))
+        best_pt = None
+        min_dist = snap_threshold
+
+        click_pt = QPoint(int(px), int(py))
+        for dp in self.detected_points:
+            dp_pt = QPoint(int(dp[0] * self.pix.width()), int(dp[1] * self.pix.height()))
+            dist = (click_pt - dp_pt).manhattanLength()
+            if dist < min_dist:
+                min_dist = dist
+                best_pt = dp_pt
+
+        if best_pt != self.hover_snap_pt:
+            self.hover_snap_pt = best_pt
+            self.update()
+
+    def map_pos_to_pixmap(self, pos):
         lbl_w, lbl_h = self.width(), self.height()
         pix_w, pix_h = self.pix.width(), self.pix.height()
 
-        offset_x = (lbl_w - pix_w) // 2
-        offset_y = (lbl_h - pix_h) // 2
+        sw, sh = pix_w, pix_h
+        aspect = pix_w / pix_h
+        if sw > lbl_w:
+            sw = lbl_w
+            sh = int(sw / aspect)
+        if sh > lbl_h:
+            sh = lbl_h
+            sw = int(sh * aspect)
 
-        px = pos.x() - offset_x
-        py = pos.y() - offset_y
+        offset_x = (lbl_w - sw) // 2
+        offset_y = (lbl_h - sh) // 2
+
+        if sw == 0 or sh == 0: return 0, 0
+
+        px = (pos.x() - offset_x) * pix_w / sw
+        py = (pos.y() - offset_y) * pix_h / sh
+        return px, py
+
+    def mousePressEvent(self, event):
+        if not self.pix: return
+        px, py = self.map_pos_to_pixmap(event.pos())
+        pix_w, pix_h = self.pix.width(), self.pix.height()
 
         if 0 <= px < pix_w and 0 <= py < pix_h:
-            click_pt = QPoint(px, py)
+            click_pt = QPoint(int(px), int(py))
             best_pt = click_pt
-            min_dist = 30
+
+            # Snap logic
+            snap_threshold = max(30, int(pix_w * 0.05))
             for dp in self.detected_points:
-                dp_pt = QPoint(int(dp[0]), int(dp[1]))
+                dp_pt = QPoint(int(dp[0] * pix_w), int(dp[1] * pix_h))
                 dist = (click_pt - dp_pt).manhattanLength()
-                if dist < min_dist:
-                    min_dist = dist
+                if dist < snap_threshold:
                     best_pt = dp_pt
+                    break # Take the first one in range
 
             self.selected_points.append(best_pt)
             self.point_selected.emit(best_pt)
             self.update()
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.pix: return
+        if not self.pix:
+            super().paintEvent(event)
+            return
 
         painter = QPainter(self)
         lbl_w, lbl_h = self.width(), self.height()
         pix_w, pix_h = self.pix.width(), self.pix.height()
-        offset_x = (lbl_w - pix_w) // 2
-        offset_y = (lbl_h - pix_h) // 2
 
-        painter.translate(offset_x, offset_y)
+        sw, sh = pix_w, pix_h
+        aspect = pix_w / pix_h
+        if sw > lbl_w:
+            sw = lbl_w
+            sh = int(sw / aspect)
+        if sh > lbl_h:
+            sh = lbl_h
+            sw = int(sh * aspect)
 
-        # Draw detected points as faint red circles
-        painter.setPen(QPen(Qt.red, 2, Qt.DashLine))
+        offset_x = (lbl_w - sw) // 2
+        offset_y = (lbl_h - sh) // 2
+
+        painter.drawPixmap(offset_x, offset_y, sw, sh, self.pix)
+
+        # Draw detected dots (more visible)
         for dp in self.detected_points:
-            painter.drawEllipse(QPoint(int(dp[0]), int(dp[1])), 12, 12)
+            sx = offset_x + dp[0] * sw
+            sy = offset_y + dp[1] * sh
 
-        # Draw guide points (from template) as faint cyan circles
-        painter.setPen(QPen(Qt.cyan, 2, Qt.DotLine))
+            # Glowing effect for detected dots
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 255, 0, 100)))
+            painter.drawEllipse(QPoint(int(sx), int(sy)), 15, 15)
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPoint(int(sx), int(sy)), 8, 8)
+
+        # Draw hover snap indicator
+        if self.hover_snap_pt:
+            hx = offset_x + (self.hover_snap_pt.x() * sw / pix_w)
+            hy = offset_y + (self.hover_snap_pt.y() * sh / pix_h)
+            painter.setPen(QPen(Qt.yellow, 2))
+            painter.drawEllipse(QPoint(int(hx), int(hy)), 20, 20)
+
+        # Draw guide points
+        painter.setPen(QPen(QColor(0, 255, 255, 150), 1, Qt.DotLine))
         for gp in self.guide_points:
-            painter.drawEllipse(QPoint(int(gp[0]), int(gp[1])), 15, 15)
+            sx = offset_x + gp[0] * sw
+            sy = offset_y + gp[1] * sh
+            painter.drawEllipse(QPoint(int(sx), int(sy)), 12, 12)
 
-        # Draw selected points as solid neon purple targets
-        painter.setPen(QPen(Qt.magenta, 3))
-        for sp in self.selected_points:
-            painter.drawLine(sp.x()-15, sp.y(), sp.x()+15, sp.y())
-            painter.drawLine(sp.x(), sp.y()-15, sp.x(), sp.y()+15)
-            painter.drawEllipse(sp, 5, 5)
+        # Draw selected markers
+        for i, sp in enumerate(self.selected_points):
+            sx = offset_x + (sp.x() * sw / pix_w)
+            sy = offset_y + (sp.y() * sh / pix_h)
+            pt = QPoint(int(sx), int(sy))
+
+            painter.setPen(QPen(Qt.magenta, 3))
+            painter.drawLine(pt.x()-15, pt.y(), pt.x()+15, pt.y())
+            painter.drawLine(pt.x(), pt.y()-15, pt.x(), pt.y()+15)
+            painter.drawEllipse(pt, 6, 6)
+
+            # Index number
+            painter.setPen(Qt.white)
+            painter.drawText(pt.x() + 10, pt.y() - 10, str(i + 1))
 
 class MarkerSelectionDialog(QDialog):
     def __init__(self, parent=None):
@@ -108,7 +183,7 @@ class MarkerSelectionDialog(QDialog):
         self.image_label.update()
 
 class VideoDisplay(QWidget):
-    mask_point_added = pyqtSignal(QPoint)
+    mask_point_added = pyqtSignal(QPointF)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -168,8 +243,9 @@ class VideoDisplay(QWidget):
             # Denormalize mask points for drawing
             draw_pts = []
             for p in self.mask_points:
-                dx = x + (p.x() * sw / pix_w)
-                dy = y + (p.y() * sh / pix_h)
+                # p is normalized (0-1)
+                dx = x + (p.x() * sw)
+                dy = y + (p.y() * sh)
                 draw_pts.append(QPoint(int(dx), int(dy)))
 
             poly = QPolygon(draw_pts)
@@ -193,30 +269,40 @@ class VideoDisplay(QWidget):
                 click_pt = QPoint(int(px), int(py))
 
                 # Check if we are clicking an existing point to drag
-                for i, pt in enumerate(self.mask_points):
-                    if (click_pt - pt).manhattanLength() < 15:
+                # Handle radius relative to width
+                handle_radius = max(10, int(pix_w * 0.02))
+                for i, p in enumerate(self.mask_points):
+                    # Denormalize mask point to pixmap space for distance check
+                    pt = QPoint(int(p.x() * pix_w), int(p.y() * pix_h))
+                    if (click_pt - pt).manhattanLength() < handle_radius:
                         self.dragging_idx = i
                         return
 
                 # Auto-Snapping to detected IR markers
                 snapped_pt = click_pt
                 if self.snap_to_markers:
-                    min_dist = 30 # Snapping radius in pixels
+                    # Snapping radius relative to width
+                    min_dist = max(20, int(pix_w * 0.04))
                     for marker in self.detected_markers:
-                        m_pt = QPoint(int(marker[0]), int(marker[1]))
+                        # marker is normalized
+                        m_pt = QPoint(int(marker[0] * pix_w), int(marker[1] * pix_h))
                         dist = (click_pt - m_pt).manhattanLength()
                         if dist < min_dist:
                             min_dist = dist
                             snapped_pt = m_pt
 
-                self.mask_points.append(snapped_pt)
-                self.mask_point_added.emit(snapped_pt)
+                # Store normalized point
+                norm_pt = QPointF(snapped_pt.x() / pix_w, snapped_pt.y() / pix_h)
+                self.mask_points.append(norm_pt)
+                self.mask_point_added.emit(norm_pt)
                 self.update()
 
     def mouseMoveEvent(self, event):
         if self.mask_creation_mode and self.dragging_idx != -1:
+            if not self.current_pixmap: return
+            pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
             px, py = self.map_to_pixmap(event.pos())
-            self.mask_points[self.dragging_idx] = QPoint(int(px), int(py))
+            self.mask_points[self.dragging_idx] = QPointF(px / pix_w, py / pix_h)
             self.update()
 
     def mouseReleaseEvent(self, event):
