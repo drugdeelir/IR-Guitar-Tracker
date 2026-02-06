@@ -128,7 +128,7 @@ class TrackingThread(QThread):
 
     def run(self):
         main_cap = None
-        target_fps = 20
+        target_fps = 60
         frame_time = 1.0 / target_fps
         last_attempted_res = None
 
@@ -166,6 +166,7 @@ class TrackingThread(QThread):
 
                             # Buffering: Minimize latency
                             main_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            main_cap.set(cv2.CAP_PROP_FPS, 60)
 
                         self.worker._camera_changed = False
 
@@ -210,6 +211,11 @@ class TrackingThread(QThread):
 
                 h_cam, w_cam = main_frame.shape[:2]
 
+                # REAL-TIME PREVIEW: Update camera frame immediately for UI before slow tracking
+                with QMutexLocker(self.worker.latest_main_frame_mutex):
+                    self.worker.latest_main_frame = main_frame.copy()
+                    self.worker.latest_main_frame_id += 1
+
                 # IR Tracking
                 # Optimization: Skip tracking during setup/calibration to save CPU
                 if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
@@ -238,10 +244,8 @@ class TrackingThread(QThread):
                     else:
                         self.worker.proximity_val = 1.0
 
-                # HUD Data preparation (camera side)
+                # HUD Data preparation (tracking result update)
                 with QMutexLocker(self.worker.latest_main_frame_mutex):
-                    self.worker.latest_main_frame = main_frame.copy()
-                    self.worker.latest_main_frame_id += 1
                     self.worker.latest_tracked_points_for_ui = tracked_points
 
                 # Handle Calibration Flags (some need to run in camera thread)
@@ -1202,7 +1206,12 @@ class Worker(QObject):
                     except: pass
 
         # 2. Advanced Pre-processing (GPU Accelerated)
-        th_size = max(150, int(w / 30))
+        # Performance: Use smaller Tophat kernel when locked with high confidence
+        if not force_full and self.confidence > 0.8:
+            th_size = 51
+        else:
+            th_size = max(150, int(w / 30))
+
         th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_size, th_size))
         u_tophat = cv2.morphologyEx(u_gray, cv2.MORPH_TOPHAT, th_kernel)
 
@@ -1869,8 +1878,8 @@ class Worker(QObject):
         self._warp_map_dirty = False
 
     def process_video(self):
-        """Main Rendering Loop (Target 30 FPS)"""
-        target_fps = 30
+        """Main Rendering Loop (Target 60 FPS)"""
+        target_fps = 60
         frame_time = 1.0 / target_fps
 
         while self._running:
@@ -1908,7 +1917,8 @@ class Worker(QObject):
                     if w_cam > 1920:
                         main_frame = cv2.resize(raw_main, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_NEAREST)
                     else:
-                        main_frame = raw_main.copy()
+                        # Use raw_main directly (it is already a fresh copy from TrackingThread)
+                        main_frame = raw_main
 
                 h_cam, w_cam = main_frame.shape[:2]
 
