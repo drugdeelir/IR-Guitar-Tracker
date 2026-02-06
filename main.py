@@ -38,9 +38,15 @@ class MIDIMappingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("MIDI Mapping")
+        self.setMinimumSize(500, 600)
         self.layout = QVBoxLayout(self)
-        self.form = QFormLayout()
-        self.layout.addLayout(self.form)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll_content = QWidget()
+        self.form = QFormLayout(self.scroll_content)
+        self.scroll.setWidget(self.scroll_content)
+        self.layout.addWidget(self.scroll)
 
         self.mappings = parent.midi_mappings
         self.learn_buttons = {}
@@ -1697,6 +1703,14 @@ class ProjectionMappingApp(QMainWindow):
         self.camera_combo.addItems([f"Camera {i}" for i in self.available_cameras])
         self.camera_combo.currentIndexChanged.connect(self.change_camera)
         cam_layout.addWidget(self.camera_combo)
+
+        self.lens_slider = QSlider(Qt.Horizontal)
+        self.lens_slider.setRange(-100, 100) # -1.0 to 1.0
+        self.lens_slider.setValue(0)
+        self.lens_slider.valueChanged.connect(lambda v: setattr(self.worker, 'lens_correction', v / 100.0))
+        cam_layout.addWidget(QLabel("Lens Correction (Fisheye):"))
+        cam_layout.addWidget(self.lens_slider)
+
         cam_group.setLayout(cam_layout)
         layout.addWidget(cam_group)
 
@@ -1948,6 +1962,7 @@ class ProjectionMappingApp(QMainWindow):
                 'calibration_camera_res': self.worker.calibration_camera_res,
                 'baseline_distance': self.worker.baseline_distance,
                 'projector_boundary': self.worker.projector_boundary,
+                'lens_correction': self.worker.lens_correction,
                 'pnp_enabled': self.pnp_check.isChecked(),
                 'occlusion_enabled': self.occlusion_check.isChecked(),
                 'tracking_freeze_enabled': self.worker.tracking_freeze_enabled,
@@ -2045,6 +2060,11 @@ class ProjectionMappingApp(QMainWindow):
 
                 self.auto_ir_check.setChecked(data.get('auto_ir', False))
                 self.ir_threshold_slider.setValue(data.get('ir_threshold', 200))
+
+                lens_corr = data.get('lens_correction', 0.0)
+                self.worker.lens_correction = lens_corr
+                if hasattr(self, 'lens_slider'):
+                    self.lens_slider.setValue(int(lens_corr * 100))
                 self.depth_sensitivity_slider.setValue(data.get('depth_sensitivity', 100))
                 self.smoothing_slider.setValue(data.get('smoothing', 50))
 

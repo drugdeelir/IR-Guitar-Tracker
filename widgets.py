@@ -179,8 +179,9 @@ class MarkerSelectionDialog(QDialog):
 
         self.confirm_button = QPushButton("Confirm Markers")
         self.confirm_button.clicked.connect(self.accept)
+        self.confirm_button.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 35px;")
 
-        self.layout.addWidget(self.image_label)
+        self.layout.addWidget(self.image_label, 1)
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.confirm_button)
 
@@ -213,12 +214,12 @@ class MaskDrawingDialog(QDialog):
         self.clear_btn.clicked.connect(self.video_display.clear_mask_points)
         self.confirm_btn = QPushButton("Save & Finish")
         self.confirm_btn.clicked.connect(self.accept)
-        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 40px;")
+        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 35px;")
 
         self.btn_layout.addWidget(self.clear_btn)
         self.btn_layout.addWidget(self.confirm_btn)
 
-        self.layout.addWidget(self.video_display)
+        self.layout.addWidget(self.video_display, 1)
         self.layout.addWidget(self.take_picture_button)
         self.layout.addLayout(self.btn_layout)
 
@@ -254,6 +255,9 @@ class VideoDisplay(QOpenGLWidget):
         self.detected_markers = points
 
     def set_image(self, image):
+        # Downscale for display to avoid UI lag with high-res camera feeds
+        if image.width() > 1280:
+            image = image.scaledToWidth(1280, Qt.FastTransformation)
         self.current_pixmap = QPixmap.fromImage(image)
         self.update() # Trigger paintEvent
 

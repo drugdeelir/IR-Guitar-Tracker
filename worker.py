@@ -86,6 +86,9 @@ class VideoPlayer(QThread):
 
         except Exception as e:
             print(f"VideoPlayer Critical Error ({self.video_path}): {e}")
+        finally:
+            if self.cap:
+                self.cap.release()
 
     def get_frame(self):
         with QMutexLocker(self.mutex):
@@ -102,13 +105,14 @@ class VideoPlayer(QThread):
             with QMutexLocker(self.mutex):
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    def stop(self):
+    def stop(self, wait=False):
         self._running = False
-        # Don't block forever
-        if not self.wait(2000):
-            self.terminate()
-        if self.cap:
-            self.cap.release()
+        if wait:
+            # Don't block forever
+            if not self.wait(2000):
+                self.terminate()
+            if self.cap:
+                self.cap.release()
 
 class TrackingThread(QThread):
     def __init__(self, worker):
@@ -316,6 +320,7 @@ class Worker(QObject):
         self.marker_fingerprint = []
         self.roi_padding = 100 # Increased for high-res FOV
         self.tracking_mutex = QMutex()
+        self.lens_correction = 0.0
 
         # Smoothing and Confidence
         self.kalman_filters = []
@@ -439,7 +444,7 @@ class Worker(QObject):
         self.guitar_body_angle = 0
         self.marker_templates = [] # List of visual patches for recovery
         self.visual_features = None
-        self.visual_search_radius = 50
+        self.visual_search_radius = 80
 
         # Reusable Buffers
         self.projector_buffer = None
@@ -466,6 +471,7 @@ class Worker(QObject):
         self.blend_temp1 = None
         self.blend_temp2 = None
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        self.boundary_clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(12,12))
         self.tracking_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
 
         # Global OpenCV Performance Optimizations & GPU Acceleration
@@ -1055,7 +1061,7 @@ class Worker(QObject):
 
         # Use LK Optical Flow
         next_pts_px, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, combined_pts, None,
-                                                          winSize=(31, 31), maxLevel=3)
+                                                          winSize=(51, 51), maxLevel=3)
 
         if next_pts_px is not None and np.any(status == 1):
             valid_next = next_pts_px[status == 1].reshape(-1, 2)
@@ -1193,8 +1199,10 @@ class Worker(QObject):
                         u_proj_small = cv2.warpPerspective(u_proj_last, T_scale @ M_roi_to_proj, (mask_w, mask_h))
                         u_proj_mask = cv2.resize(u_proj_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
 
-                        # Aggressive suppression (0.8) - help cancel out bright projector spots
-                        u_suppression = cv2.multiply(u_proj_mask, 0.8)
+                        # Intelligent suppression - help cancel out bright projector spots
+                        # but cap it so we don't accidentally black out the IR markers
+                        u_suppression = cv2.multiply(u_proj_mask, 0.7)
+                        cv2.threshold(u_suppression, 200, 200, cv2.THRESH_TRUNC, dst=u_suppression)
                         u_gray = cv2.subtract(u_gray, u_suppression)
                     except: pass
 
@@ -1241,8 +1249,8 @@ class Worker(QObject):
             except: pass
 
         # Min circularity: more lenient for still capture, strict for live tracking
-        # Lowered to 0.60 to handle perspective distortion on large markers
-        min_circ = 0.40 if force_full else 0.65 # Increased slightly for live
+        # Lowered to handle perspective distortion on large markers
+        min_circ = 0.40 if force_full else 0.55 # Balanced for robustness
 
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -1285,6 +1293,15 @@ class Worker(QObject):
 
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
+
+                    # Lens Correction (undistort)
+                    if self.lens_correction != 0:
+                        k = self.lens_correction
+                        nx, ny = cX - 0.5, cY - 0.5
+                        r2 = nx*nx + ny*ny
+                        f = 1.0 + k * r2
+                        cX, cY = nx * f + 0.5, ny * f + 0.5
+
                     candidate = {'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity}
 
                     # Intensity check: more inclusive for still frames/dialogs
@@ -1957,6 +1974,13 @@ class Worker(QObject):
                     self.video_umat_cache.clear()
                     self._warp_map_dirty = True
 
+                if self._run_sls_flag and self._sls_step == -1:
+                    # Generate patterns in background
+                    self.status_update.emit("Room Scan: Generating patterns...")
+                    self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
+                    self._sls_step = 0
+                    continue
+
                 if self._run_boundary_detection_flag:
                     # Ensure resolution is stable before capturing
                     if self.requested_camera_res[0] > 5000 or \
@@ -2009,11 +2033,12 @@ class Worker(QObject):
                         diff[marker_mask > 0] = 0
 
                         # Pre-process diff to enhance dim areas (far backgrounds)
-                        diff_boosted = self.clahe.apply(diff)
+                        diff_boosted = self.boundary_clahe.apply(diff)
 
                         # Try adaptive thresholding first for better detail in uneven lighting
+                        # Larger block size (51) to capture broader structures in dark environments
                         thresh = cv2.adaptiveThreshold(diff_boosted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                       cv2.THRESH_BINARY, 31, -3)
+                                                       cv2.THRESH_BINARY, 51, -2)
 
                         # Combined with Otsu for global structure
                         _, otsu = cv2.threshold(diff_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -3168,7 +3193,7 @@ class Worker(QObject):
         print("Worker: Purging all video players...")
         with QMutexLocker(self.player_mutex):
             for path in list(self.video_players.keys()):
-                self.video_players[path].stop()
+                self.video_players[path].stop(wait=True)
                 del self.video_players[path]
 
         if self.splash_player:
@@ -3202,12 +3227,11 @@ class Worker(QObject):
 
     def run_room_scan(self):
         self.requested_camera_res = (9999, 9999) # Request max FOV
-        self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
-        self._sls_step = 0
+        self._run_sls_flag = True
+        self._sls_step = -1 # Trigger pattern generation in worker thread
         self._sls_captures_x = []
         self._sls_captures_y = []
         self._sls_curr_wait = 0
-        self._run_sls_flag = True
 
     def warp_full_frame_to_projector(self, frame, w_cam, h_cam, w_target, h_target):
         if frame is None:
@@ -3318,7 +3342,7 @@ class Worker(QObject):
             for path in list(self.video_players.keys()):
                 if path not in needed_cues:
                     print(f"Purging player for: {path}")
-                    self.video_players[path].stop()
+                    self.video_players[path].stop(wait=False)
                     del self.video_players[path]
                     # Clear VRAM cache for this specific path
                     for key in list(self.video_umat_cache.keys()):
