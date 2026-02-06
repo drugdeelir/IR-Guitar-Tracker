@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 import time
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker, QTimer
 from PyQt5.QtGui import QImage
 from itertools import combinations, permutations
 from scipy.interpolate import interp1d, RBFInterpolator
@@ -126,12 +126,17 @@ class TrackingThread(QThread):
         main_cap = None
         target_fps = 20
         frame_time = 1.0 / target_fps
+        last_attempted_res = None
 
         while self._running:
             try:
                 start_time = time.time()
 
-                if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
+                req_res = self.worker.requested_camera_res
+                # Only attempt resolution change if requested resolution is different from current AND wasn't just attempted.
+                # Also always allow change if the camera device itself changed.
+                if self.worker._camera_changed or (req_res != self.worker._current_camera_res and req_res != last_attempted_res):
+                    last_attempted_res = req_res
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
 
@@ -151,7 +156,7 @@ class TrackingThread(QThread):
                             # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-                            w_req, h_req = self.worker.requested_camera_res
+                            w_req, h_req = req_res
                             main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                             main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
@@ -161,27 +166,29 @@ class TrackingThread(QThread):
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
-
-                        # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
-                        # Note: behavior is backend dependent. 1/0.25 usually means manual.
-                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-                        main_cap.set(cv2.CAP_PROP_GAIN, 0)
-
                         # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        self.worker._current_camera_res = (act_w, act_h)
 
-                        # Clear frame buffer to avoid resolution mismatch
-                        with QMutexLocker(self.worker.latest_main_frame_mutex):
-                             self.worker.latest_main_frame = None
+                        # Only re-configure if resolution is actually different or device just opened
+                        if (act_w, act_h) != self.worker._current_camera_res:
+                            # Disable Auto Exposure and Auto Gain to prevent brightness swings
+                            main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                            main_cap.set(cv2.CAP_PROP_GAIN, 0)
 
-                        # Update requested res to match reality to prevent infinite re-initialization
-                        # if the camera doesn't support the requested resolution.
-                        self.worker.requested_camera_res = (act_w, act_h)
+                            self.worker._current_camera_res = (act_w, act_h)
+                            # Update requested res to match reality to prevent infinite re-initialization
+                            self.worker.requested_camera_res = (act_w, act_h)
 
-                        self.worker.camera_matrix = None # Reset estimation
-                        print(f"Camera Resolution Switched to: {act_w}x{act_h}")
+                            # Clear frame buffer to avoid resolution mismatch
+                            with QMutexLocker(self.worker.latest_main_frame_mutex):
+                                 self.worker.latest_main_frame = None
+
+                            self.worker.camera_matrix = None # Reset estimation
+                            print(f"Camera Resolution Settled: {act_w}x{act_h}")
+                        else:
+                            # Already settled, just update requested to avoid re-triggering
+                            self.worker.requested_camera_res = (act_w, act_h)
                     else:
                         if self.worker._camera_changed:
                             self.worker.camera_error.emit(self.worker.video_source)
@@ -425,6 +432,14 @@ class Worker(QObject):
         self.video_umat_cache = {}  # (path, frame_id) -> UMat
         self.u_generator_buffer = None
         self.u_gen_buffer_res = (0, 0)
+
+        # Visual/AI Tracking Assist
+        self.visual_tracker_active = False
+        self.guitar_body_roi = None
+        self.guitar_body_angle = 0
+        self.marker_templates = [] # List of visual patches for recovery
+        self.visual_features = None
+        self.visual_search_radius = 50
 
         # Reusable Buffers
         self.projector_buffer = None
@@ -1020,46 +1035,88 @@ class Worker(QObject):
         self._design_cache[cache_key] = mask
         return mask
 
+    def _track_visual_features(self, gray_frame, prev_gray, prev_pts):
+        """Track high-contrast visual features on the guitar body (AI Fallback)."""
+        if prev_gray is None or prev_pts is None or len(prev_pts) < 3:
+            return None, 0
+
+        # Convert normalized points to pixels
+        h, w = gray_frame.shape[:2]
+        pts_px = (np.array(prev_pts, dtype=np.float32) * [w, h]).reshape(-1, 1, 2)
+
+        # AI ENHANCEMENT: Also track additional visual features on the body if available
+        body_pts = []
+        if hasattr(self, 'visual_features') and self.visual_features is not None:
+            body_pts = self.visual_features
+
+        combined_pts = pts_px
+        if len(body_pts) > 0:
+            combined_pts = np.vstack([pts_px, body_pts])
+
+        # Use LK Optical Flow
+        next_pts_px, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, combined_pts, None,
+                                                          winSize=(31, 31), maxLevel=3)
+
+        if next_pts_px is not None and np.any(status == 1):
+            valid_next = next_pts_px[status == 1].reshape(-1, 2)
+            valid_prev = combined_pts[status == 1].reshape(-1, 2)
+
+            if len(valid_next) >= 3:
+                # Estimate movement (Rigid Body)
+                M, inliers = cv2.estimateAffinePartial2D(valid_prev, valid_next)
+                if M is not None and np.sum(inliers) >= 3:
+                    # Update visual features for next frame
+                    self.visual_features = next_pts_px[status == 1].reshape(-1, 1, 2)[:20] # Keep top 20
+
+                    # Return the full transformation matrix
+                    full_M = np.eye(3)
+                    full_M[:2, :] = M
+                    return full_M, np.mean(err[inliers == 1])
+
+        # If tracking failed, try to rediscover features on the silhouette
+        if self.occlusion_enabled and hasattr(self, 'u_fg_mask') and self.u_fg_mask is not None:
+            try:
+                fg = self.u_fg_mask.get()
+                new_feats = cv2.goodFeaturesToTrack(gray_frame, mask=fg, maxCorners=30, qualityLevel=0.01, minDistance=10)
+                if new_feats is not None:
+                    self.visual_features = new_feats
+            except: pass
+
+        return None, 0
+
     def get_tracked_points(self, frame, force_full=False, return_rejected=False):
         # Already called from TrackingThread, but let's ensure we use tracking_mutex for shared state
         if frame is None: return ([], []) if return_rejected else []
 
         # Defensive catch-all to prevent thread crashes
         try:
+            # 1. PRIMARY: IR Dot Detection
             res = self._get_tracked_points_internal(frame, force_full, return_rejected)
 
-            # ELITE SECONDARY TRACKING: Optical Flow Fallback
-            # If IR detection failed or confidence is low, try to track existing points using OF
-            if not force_full and self.confidence < 0.8 and self.last_tracked_points and self.prev_gray_frame is not None:
+            # 2. ENHANCED VISUAL ASSIST (AI-style object tracking)
+            # If IR detection is shaky or we have low confidence, use visual flow
+            # ELITE SECONDARY TRACKING: Visual Flow Fallback
+            # If IR detection failed or confidence is low, try to track the guitar visually
+            if not force_full and self.confidence < 0.9 and self.last_tracked_points and self.prev_gray_frame is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                curr_pts = np.float32(self.last_tracked_points).reshape(-1, 1, 2)
-                h, w = frame.shape[:2]
-                curr_pts_px = curr_pts * [w, h]
 
-                # Use Lucas-Kanade Optical Flow
-                next_pts_px, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray_frame, gray, curr_pts_px, None,
-                                                                  winSize=(21, 21), maxLevel=3,
-                                                                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+                # Use Visual Feature Tracking (Hybrid AI logic)
+                visual_M, visual_err = self._track_visual_features(gray, self.prev_gray_frame, self.last_tracked_points)
 
-                if next_pts_px is not None:
-                    next_pts_norm = next_pts_px / [w, h]
-                    of_result = [tuple(p[0]) for p in next_pts_norm]
+                if visual_M is not None and visual_err < 10.0:
+                    # Apply visual transformation to last known points
+                    src_pts = np.float32(self.last_tracked_points).reshape(-1, 1, 2)
+                    dst_pts = cv2.perspectiveTransform(src_pts, visual_M).reshape(-1, 2)
+                    of_result = [tuple(p) for p in dst_pts]
 
-                    # Merge logic: if IR found points, favor them. If not, use OF for continuity.
-                    if not res or len(res[0] if return_rejected else res) < len(self.marker_config or []):
-                         # If IR detected fewer points than expected, fill gaps with OF or replace
-                         # For now, if IR fails, let's trust OF if it's high quality
-                         avg_err = np.mean(err[status == 1]) if np.any(status == 1) else 1000
-                         if avg_err < 8.0:
-                             # Rigid Body Validation for Optical Flow
-                             # Ensure the points still roughly form the same guitar shape
-                             src_pts = np.float32(self.last_tracked_points)
-                             dst_pts = np.float32(of_result)
-                             # Partial affine (rotation, scale, translation) is perfect for a moving guitar
-                             _, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=0.02)
-                             if inliers is not None and np.sum(inliers) >= 3:
-                                 # print(f"Tracking: Using Validated Optical Flow (err: {avg_err:.2f})")
-                                 res = of_result if not return_rejected else (of_result, res[1])
+                    # Merge logic: if IR found fewer points than expected, use visual fallback
+                    target_count = len(self.marker_config or [])
+                    current_ir_points = res[0] if return_rejected else res
+
+                    if not current_ir_points or len(current_ir_points) < target_count:
+                        # IR is failing, trust the visual tracker to "hold" the position
+                        res = of_result if not return_rejected else (of_result, res[1] if return_rejected else [])
+                        # print(f"Tracking: Using Visual Fallback (err: {visual_err:.2f})")
 
                 self.prev_gray_frame = gray
             else:
@@ -1176,6 +1233,13 @@ class Worker(QObject):
         detected_points_raw = []
         rejected_points_raw = []
 
+        # Download foreground mask from GPU for gating if available
+        fg_mask_cpu = None
+        if not force_full and self.occlusion_enabled and hasattr(self, 'u_fg_mask') and self.u_fg_mask is not None:
+            try:
+                fg_mask_cpu = self.u_fg_mask.get()
+            except: pass
+
         # Min circularity: more lenient for still capture, strict for live tracking
         # Lowered to 0.60 to handle perspective distortion on large markers
         min_circ = 0.40 if force_full else 0.65 # Increased slightly for live
@@ -1235,6 +1299,16 @@ class Worker(QObject):
                         is_compact = False
 
                     if circularity >= min_circ and intensity >= intensity_thresh and is_compact:
+                        # SILHOUETTE GATING: Only accept markers that are on the performer
+                        if fg_mask_cpu is not None:
+                            # Sample FG mask at marker position
+                            mx, my = int(cX * w), int(cY * h)
+                            if 0 <= mx < w and 0 <= my < h:
+                                if fg_mask_cpu[my, mx] == 0:
+                                    # Marker is outside the performer silhouette! Reject as reflection.
+                                    rejected_points_raw.append(candidate)
+                                    continue
+
                         detected_points_raw.append(candidate)
                     else:
                         rejected_points_raw.append(candidate)
@@ -1934,12 +2008,15 @@ class Worker(QObject):
                         marker_mask = cv2.dilate(marker_mask, kernel_small, iterations=5)
                         diff[marker_mask > 0] = 0
 
+                        # Pre-process diff to enhance dim areas (far backgrounds)
+                        diff_boosted = self.clahe.apply(diff)
+
                         # Try adaptive thresholding first for better detail in uneven lighting
-                        thresh = cv2.adaptiveThreshold(diff, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                       cv2.THRESH_BINARY, 21, -5)
+                        thresh = cv2.adaptiveThreshold(diff_boosted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                       cv2.THRESH_BINARY, 31, -3)
 
                         # Combined with Otsu for global structure
-                        _, otsu = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        _, otsu = cv2.threshold(diff_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         thresh = cv2.bitwise_or(thresh, otsu)
 
                         # Clean up
@@ -3262,8 +3339,8 @@ class Worker(QObject):
         # Invalidate static cache to force refresh of dimensions and paths
         self.static_warp_cache.clear()
 
-        self.update_video_speeds()
-        self.cleanup_resources()
+        # Performance: Don't do heavy cleanup on UI thread to avoid freezes
+        QTimer.singleShot(100, self.cleanup_resources)
 
     def set_pnp_enabled(self, enabled):
         self.pnp_enabled = enabled

@@ -246,7 +246,7 @@ class ProjectionMappingApp(QMainWindow):
         self.main_container.addWidget(self.log_area)
 
         self.video_display = VideoDisplay()
-        self.video_display.setMinimumWidth(600) # Reduced to prevent UI cut-off on narrow screens
+        self.video_display.setMinimumWidth(400) # Reduced to prevent UI cut-off on narrow screens
         self.projector_window = ProjectorWindow()
 
         self.available_cameras = get_available_cameras()
@@ -1109,7 +1109,7 @@ class ProjectionMappingApp(QMainWindow):
         # Let's try hiding the sidebar (tabs)
         self.tabs.hide()
         # In performance mode, we want as much space as possible
-        self.video_display.setMinimumWidth(1000)
+        self.video_display.setMinimumWidth(600)
 
         # Add a floating button or status bar button to exit
         self.exit_perf_btn = QPushButton("EXIT PERFORMANCE MODE")
@@ -1125,7 +1125,7 @@ class ProjectionMappingApp(QMainWindow):
             self.layout.removeWidget(self.exit_perf_btn)
             self.exit_perf_btn.deleteLater()
             del self.exit_perf_btn
-        self.video_display.setMinimumWidth(800)
+        self.video_display.setMinimumWidth(400)
         self.statusBar().showMessage("Configuration Mode", 3000)
 
     def create_workspace_tab(self):

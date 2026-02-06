@@ -169,9 +169,11 @@ class MarkerSelectionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select IR Markers")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(600, 450)
 
         self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(5)
         self.image_label = MarkerImageLabel()
         self.take_picture_button = QPushButton("Take Picture")
 
@@ -196,9 +198,11 @@ class MaskDrawingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Draw Detailed Mask")
-        self.setMinimumSize(1000, 800)
+        self.setMinimumSize(600, 450)
 
         self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(5)
         self.video_display = VideoDisplay()
         self.video_display.set_mask_creation_mode(True)
 
@@ -209,7 +213,7 @@ class MaskDrawingDialog(QDialog):
         self.clear_btn.clicked.connect(self.video_display.clear_mask_points)
         self.confirm_btn = QPushButton("Save & Finish")
         self.confirm_btn.clicked.connect(self.accept)
-        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold;")
+        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 40px;")
 
         self.btn_layout.addWidget(self.clear_btn)
         self.btn_layout.addWidget(self.confirm_btn)
