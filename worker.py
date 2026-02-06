@@ -206,8 +206,8 @@ class TrackingThread(QThread):
                         self.worker.requested_camera_res = (act_w, act_h)
                         self.worker.camera_matrix = None # Reset estimation
                         print(f"Camera Optimized: {act_w}x{act_h} @ {main_cap.get(cv2.CAP_PROP_FPS)} FPS")
-                    # PERFORMANCE: Reduced stabilization delay for faster startup/switching
-                    QThread.msleep(100)
+                        # PERFORMANCE: Reduced stabilization delay for faster startup/switching
+                        QThread.msleep(100)
                     else:
                         if self.worker._camera_changed:
                             self.worker.camera_error.emit(self.worker.video_source)
