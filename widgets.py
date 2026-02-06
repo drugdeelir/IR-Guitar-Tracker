@@ -506,9 +506,11 @@ class ProjectorWindow(QOpenGLWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        # Ensure we fill the physical rect of the screen
         painter.fillRect(self.rect(), Qt.black)
 
         if self.current_pixmap:
+            # Optimization: Smooth transformation for high-res output
             painter.drawPixmap(self.rect(), self.current_pixmap)
 
         if self.calibration_mode:

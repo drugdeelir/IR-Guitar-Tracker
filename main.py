@@ -2395,22 +2395,28 @@ class ProjectionMappingApp(QMainWindow):
 
         # Specific handling for Setup Wizard tags - only apply if currently in the wizard tab
         if self.tabs.currentIndex() == 0:
-            if self.setup_step == 1: # Background step
-                mask.tag = 'background'
-                mask.type = 'static'
-                if not mask.name or mask.name.startswith("Mask"):
+            target_tag = None
+            if self.setup_step == 1: target_tag = 'background'
+            elif self.setup_step == 3: target_tag = 'instrument'
+            elif self.setup_step == 4: target_tag = 'amp'
+
+            if target_tag:
+                # ENFORCE UNIQUE TAG: Ensure only ONE mask has this system tag
+                for m in self.masks:
+                    if m.tag == target_tag and m != mask:
+                        m.tag = 'none'
+                mask.tag = target_tag
+
+                if target_tag == 'background':
+                    mask.type = 'static'
                     mask.name = 'Background'
-            elif self.setup_step == 3: # Guitar Mask step
-                mask.tag = 'instrument'
-                mask.type = 'dynamic'
-                mask.name = 'Guitar'
-                # Automatically link to markers if they exist
-                if self.selected_markers and not mask.is_linked:
-                     self.link_mask_to_markers(mask)
-            elif self.setup_step == 4: # Amp Mask step
-                mask.tag = 'amp'
-                mask.type = 'static'
-                if not mask.name or mask.name.startswith("Mask"):
+                elif target_tag == 'instrument':
+                    mask.type = 'dynamic'
+                    mask.name = 'Guitar'
+                    if self.selected_markers and not mask.is_linked:
+                        self.link_mask_to_markers(mask)
+                elif target_tag == 'amp':
+                    mask.type = 'static'
                     mask.name = 'Amp'
 
         self.update_cue_table()
@@ -2623,26 +2629,36 @@ class ProjectionMappingApp(QMainWindow):
     def change_projector(self, index):
         if index < len(self.screens):
             screen = self.screens[index]
+            # Use virtual geometry to handle multi-monitor coordinate space correctly
             geom = screen.geometry()
 
-            # Optimization: Ensure we are using physical pixels if possible,
-            # but Qt logical pixels are usually what setGeometry expects.
-            self.worker.projector_width = geom.width()
-            self.worker.projector_height = geom.height()
+            # Physical Resolution for projection math
+            # Using size() instead of geometry() to get physical dimensions if High DPI is on
+            self.worker.projector_width = screen.size().width()
+            self.worker.projector_height = screen.size().height()
             self.worker._warp_map_dirty = True
 
             self.projector_window.hide()
-            # On Windows, Frameless + FullScreen works best if flags are set before show()
+            # Force Frameless and AlwaysOnTop to prevent OS offsets.
+            # BypassWindowManagerHint can sometimes cause alignment issues on Windows, so we use standard hints.
             self.projector_window.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
 
+            # Physical Pixel Support
+            self.projector_window.setAttribute(Qt.WA_NoSystemBackground)
+            self.projector_window.setAttribute(Qt.WA_OpaquePaintEvent)
+
             self.projector_window.show()
+            # Move to the correct monitor's logical coordinates
+            self.projector_window.setGeometry(geom)
+
             handle = self.projector_window.windowHandle()
             if handle:
                 handle.setScreen(screen)
 
-            # Use geometry of the selected screen
-            self.projector_window.setGeometry(geom)
             self.projector_window.showFullScreen()
+            # On some Windows setups, showFullScreen still leaves a taskbar offset.
+            # We force geometry to the physical screen size.
+            self.projector_window.setGeometry(geom)
 
     def remove_cue(self):
         current_item = self.cue_list_widget.currentItem()

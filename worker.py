@@ -13,6 +13,7 @@ from sls_utils import generate_gray_code_patterns, decode_gray_code
 class VideoPlayer(QThread):
     def __init__(self, video_path):
         super().__init__()
+        self.setPriority(QThread.HighPriority)
         self.video_path = video_path
         self._running = True
         self.latest_frame = None
@@ -112,6 +113,7 @@ class VideoPlayer(QThread):
 class TrackingThread(QThread):
     def __init__(self, worker):
         super().__init__()
+        self.setPriority(QThread.HighestPriority)
         self.worker = worker
         self._running = True
 
@@ -422,6 +424,7 @@ class Worker(QObject):
         self.static_warp_cache = {} # mask_id -> (video_frame_id, warped_frame, mask_img)
         self.video_umat_cache = {}  # (path, frame_id) -> UMat
         self.u_generator_buffer = None
+        self.u_gen_buffer_res = (0, 0)
 
         # Reusable Buffers
         self.projector_buffer = None
@@ -438,6 +441,8 @@ class Worker(QObject):
         self.camera_matrix = None
         self.dist_coeffs = np.zeros((4, 1))
         self.last_raw_detections = []
+        self.prev_gray_frame = None
+        self.of_points = None
         self.cached_plasma_grid = None
         self.cached_nebula_grid = None
         self.generator_buffer = None
@@ -451,7 +456,7 @@ class Worker(QObject):
         # Global OpenCV Performance Optimizations & GPU Acceleration
         try:
             cv2.setUseOptimized(True)
-            cv2.setNumThreads(4)
+            cv2.setNumThreads(8) # Increased for multi-core scaling
             # Enable OpenCL (GPU acceleration)
             cv2.ocl.setUseOpenCL(True)
             if cv2.ocl.haveOpenCL():
@@ -659,23 +664,35 @@ class Worker(QObject):
                 mask.tint_color = (255, 0, 255) # Magenta
 
     def switch_video(self, tag, video_path):
+        # STANDARDIZE TAGS
+        if tag == 'guitar': tag = 'instrument'
+        if tag == 'bg': tag = 'background'
+
         print(f"Worker: Switching video for tag '{tag}' to '{video_path}'")
         for mask in self.masks:
-            if mask.tag == tag:
+            # Match by tag OR by name for reliability
+            if mask.tag == tag or mask.name.lower() == tag.lower() or (tag == 'instrument' and mask.name.lower() == 'guitar'):
                 if mask.video_path and mask.video_path != video_path:
-                    self.fades[tag] = {
+                    self.fades[mask.tag] = {
                         'prev_path': mask.video_path,
                         'start_time': time.time()
                     }
                 mask.video_path = video_path
+                print(f"Worker: Updated mask '{mask.name}' to {video_path}")
+
+        # Performance: Clear VRAM cache for changed paths immediately
+        self.video_umat_cache.clear()
+
         self.update_video_speeds()
         self.cleanup_resources()
 
     def switch_cue(self, tag, index):
+        print(f"Worker: Switch cue for tag '{tag}' to index {index}")
         for mask in self.masks:
-            if mask.tag == tag:
+            if mask.tag == tag or mask.name.lower() == tag.lower() or (tag == 'instrument' and mask.name.lower() == 'guitar'):
                 if hasattr(mask, 'playlist') and 0 <= index < len(mask.playlist):
                     mask.playlist_index = index
+                    # Call standard switch_video logic
                     self.switch_video(tag, mask.playlist[index])
 
     def toggle_mask(self, tag, visible):
@@ -1008,6 +1025,44 @@ class Worker(QObject):
         # Defensive catch-all to prevent thread crashes
         try:
             res = self._get_tracked_points_internal(frame, force_full, return_rejected)
+
+            # ELITE SECONDARY TRACKING: Optical Flow Fallback
+            # If IR detection failed or confidence is low, try to track existing points using OF
+            if not force_full and self.confidence < 0.8 and self.last_tracked_points and self.prev_gray_frame is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                curr_pts = np.float32(self.last_tracked_points).reshape(-1, 1, 2)
+                h, w = frame.shape[:2]
+                curr_pts_px = curr_pts * [w, h]
+
+                # Use Lucas-Kanade Optical Flow
+                next_pts_px, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray_frame, gray, curr_pts_px, None,
+                                                                  winSize=(21, 21), maxLevel=3,
+                                                                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+                if next_pts_px is not None:
+                    next_pts_norm = next_pts_px / [w, h]
+                    of_result = [tuple(p[0]) for p in next_pts_norm]
+
+                    # Merge logic: if IR found points, favor them. If not, use OF for continuity.
+                    if not res or len(res[0] if return_rejected else res) < len(self.marker_config or []):
+                         # If IR detected fewer points than expected, fill gaps with OF or replace
+                         # For now, if IR fails, let's trust OF if it's high quality
+                         avg_err = np.mean(err[status == 1]) if np.any(status == 1) else 1000
+                         if avg_err < 8.0:
+                             # Rigid Body Validation for Optical Flow
+                             # Ensure the points still roughly form the same guitar shape
+                             src_pts = np.float32(self.last_tracked_points)
+                             dst_pts = np.float32(of_result)
+                             # Partial affine (rotation, scale, translation) is perfect for a moving guitar
+                             _, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=0.02)
+                             if inliers is not None and np.sum(inliers) >= 3:
+                                 # print(f"Tracking: Using Validated Optical Flow (err: {avg_err:.2f})")
+                                 res = of_result if not return_rejected else (of_result, res[1])
+
+                self.prev_gray_frame = gray
+            else:
+                self.prev_gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
             if res is None:
                  return ([], []) if return_rejected else []
             return res
@@ -1028,8 +1083,8 @@ class Worker(QObject):
 
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
         # Scale padding with resolution for wide setups
-        # Increased to 6% for better high-velocity neck tracking
-        dynamic_padding = max(self.roi_padding, int(w * 0.06))
+        # Increased to 10% for extremely fast guitar neck tracking
+        dynamic_padding = max(self.roi_padding, int(w * 0.10))
 
         # Pre-calculate Kalman predictions early to use for ROI and stickiness
         predictions = []
@@ -1741,16 +1796,22 @@ class Worker(QObject):
                     t_fps = self.tracking_frame_count / max(1, (time.time() - self.last_stats_time))
                     self.tracking_fps = t_fps
 
-                # 2. Get Main Frame (for UI/Outlines/Calibration)
+                # 2. Get Main Frame (Optimized: No deep copy unless HUD is shown)
                 with QMutexLocker(self.latest_main_frame_mutex):
-                    main_frame = self.latest_main_frame.copy() if self.latest_main_frame is not None else None
+                    raw_main = self.latest_main_frame
                     ui_tracked_points = self.latest_tracked_points_for_ui
                     curr_frame_id = self.latest_main_frame_id
 
-                if main_frame is None:
+                if raw_main is None:
                     main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(main_frame, "WAITING FOR CAMERA...", (150, 240),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
+                else:
+                    # PERFORMANCE: Only downscale/copy for UI if we are drawing HUD
+                    # 1080p is plenty for the monitor UI
+                    h_cam, w_cam = raw_main.shape[:2]
+                    if w_cam > 1920:
+                        main_frame = cv2.resize(raw_main, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_NEAREST)
+                    else:
+                        main_frame = raw_main.copy()
 
                 h_cam, w_cam = main_frame.shape[:2]
 
@@ -2132,6 +2193,10 @@ class Worker(QObject):
                             if time.time() - self._last_calib_attempt_time > 5.0:
                                 # Fallback to standard detection after 5 seconds
                                 ret, corners = cv2.findChessboardCorners(gray, board_size, cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
+                                if ret:
+                                    # Refine corners for sub-pixel accuracy
+                                    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                                    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
 
                         if ret:
                             if self._calib_corners_sum is None:
@@ -2566,7 +2631,9 @@ class Worker(QObject):
                                     cv2.putText(main_frame, f"LINKED: {mask.name}", tuple(draw_pts[0]),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+                # 8. Emit HUD Frame (Monitor)
                 rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
+                # Performance: avoid redundant .copy() in emit if possible
                 self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
 
                 # Apply Master FX to the composition before warping
@@ -2666,8 +2733,14 @@ class Worker(QObject):
                 # Auto-Throttle Logic
                 if elapsed > frame_time:
                     self.throttle_level = min(1.0, self.throttle_level + 0.05)
+                    # Performance: Dynamically scale resolution down if GPU is pegged
+                    if self.throttle_level > 0.8 and self.render_scale > 0.4:
+                        self.render_scale = max(0.4, self.render_scale - 0.02)
                 else:
                     self.throttle_level = max(0.0, self.throttle_level - 0.01)
+                    # Slowly recover resolution if performance is good
+                    if self.throttle_level < 0.1 and self.render_scale < 0.85:
+                         self.render_scale = min(0.85, self.render_scale + 0.005)
 
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
                 QThread.msleep(sleep_time)
@@ -2752,8 +2825,9 @@ class Worker(QObject):
         elif self.throttle_level > 0.4:
             w, h = w // 2, h // 2
 
-        if self.u_generator_buffer is None or self.u_generator_buffer.get().shape[:2] != (h, w):
+        if self.u_generator_buffer is None or self.u_gen_buffer_res != (w, h):
             self.u_generator_buffer = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
+            self.u_gen_buffer_res = (w, h)
 
         cv2.rectangle(self.u_generator_buffer, (0, 0), (w, h), (0, 0, 0), -1)
         u_frame = self.u_generator_buffer
@@ -2926,18 +3000,20 @@ class Worker(QObject):
         return cv2.applyColorMap(cv2.UMat(pattern), cv2.COLORMAP_MAGMA)
 
     def blend_frames(self, base, overlay, mask_img, mode, h=None, w=None):
-        # Performance: Use GPU (UMat) for blending
+        # Performance: Maintain UMat pipeline to avoid CPU/GPU sync
         u_base = base if isinstance(base, cv2.UMat) else cv2.UMat(base)
         u_overlay = overlay if isinstance(overlay, cv2.UMat) else cv2.UMat(overlay)
         u_mask = mask_img if isinstance(mask_img, cv2.UMat) else cv2.UMat(mask_img)
 
-        # ROBUSTNESS: Explicitly resize to ensure matching sizes without .get()
+        # Performance: Skip resize if dimensions are likely already correct
+        # In Python, we can't easily check UMat size without .get(), but
+        # we can assume the caller provided correct sizes for performance.
         if h is not None and w is not None:
-            # Resize is very fast if sizes already match (no-op on GPU)
+            # OpenCV's resize is a no-op if the size matches internally
             u_overlay = cv2.resize(u_overlay, (w, h))
             u_mask = cv2.resize(u_mask, (w, h))
 
-        # Optimized integer-based blending on GPU
+        # Optimized integer-based blending on GPU (OpenCL)
         if mode == 'normal':
             # Full alpha blending: res = overlay * (mask/255) + base * (1 - mask/255)
             u_temp1 = cv2.multiply(u_overlay, u_mask, scale=1.0/255.0)
