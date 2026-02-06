@@ -179,9 +179,8 @@ class MarkerSelectionDialog(QDialog):
 
         self.confirm_button = QPushButton("Confirm Markers")
         self.confirm_button.clicked.connect(self.accept)
-        self.confirm_button.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 35px;")
 
-        self.layout.addWidget(self.image_label, 1)
+        self.layout.addWidget(self.image_label)
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.confirm_button)
 
@@ -214,12 +213,12 @@ class MaskDrawingDialog(QDialog):
         self.clear_btn.clicked.connect(self.video_display.clear_mask_points)
         self.confirm_btn = QPushButton("Save & Finish")
         self.confirm_btn.clicked.connect(self.accept)
-        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 35px;")
+        self.confirm_btn.setStyleSheet("background-color: #00c853; color: white; font-weight: bold; min-height: 40px;")
 
         self.btn_layout.addWidget(self.clear_btn)
         self.btn_layout.addWidget(self.confirm_btn)
 
-        self.layout.addWidget(self.video_display, 1)
+        self.layout.addWidget(self.video_display)
         self.layout.addWidget(self.take_picture_button)
         self.layout.addLayout(self.btn_layout)
 
@@ -255,9 +254,6 @@ class VideoDisplay(QOpenGLWidget):
         self.detected_markers = points
 
     def set_image(self, image):
-        # Downscale for display to avoid UI lag with high-res camera feeds
-        if image.width() > 1280:
-            image = image.scaledToWidth(1280, Qt.FastTransformation)
         self.current_pixmap = QPixmap.fromImage(image)
         self.update() # Trigger paintEvent
 
@@ -527,25 +523,12 @@ class ProjectorWindow(QOpenGLWidget):
         painter.fillRect(self.rect(), Qt.black)
 
         if self.current_pixmap:
-            # Aspect Ratio Protection: Ensure we don't squish if rendered frame differs from window
-            # For projection mapping, we usually want to fill the screen, but if there's a mismatch
-            # due to clamping, we should center it.
-            pix_w = self.current_pixmap.width()
-            pix_h = self.current_pixmap.height()
-            win_w = self.width()
-            win_h = self.height()
-
-            pix_aspect = pix_w / pix_h
-            win_aspect = win_w / win_h
-
-            if abs(pix_aspect - win_aspect) > 0.01:
-                # If there's a significant aspect ratio mismatch, scale with protection
-                target_rect = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio).rect()
-                target_rect.moveCenter(self.rect().center())
-                painter.drawPixmap(target_rect, self.current_pixmap)
-            else:
-                # 1:1 or very close, just fill
-                painter.drawPixmap(self.rect(), self.current_pixmap)
+            # Aspect Ratio Protection: Ensure we don't squish the projection.
+            # We use KeepAspectRatio to prevent distortion, centering the content if the
+            # projector's aspect ratio differs from the internal render buffer.
+            target_rect = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation).rect()
+            target_rect.moveCenter(self.rect().center())
+            painter.drawPixmap(target_rect, self.current_pixmap)
 
         if self.calibration_mode:
             pen = QPen(Qt.red, 10)

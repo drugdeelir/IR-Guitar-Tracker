@@ -416,13 +416,13 @@ class ProjectionMappingApp(QMainWindow):
             mask = self.masks[row]
             if mask.visible:
                 self.play_cue_btn.setText("■ STOP CUE")
-                self.play_cue_btn.setStyleSheet("height: 35px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 5px;")
+                self.play_cue_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 5px;")
             else:
                 self.play_cue_btn.setText("▶ START CUE")
-                self.play_cue_btn.setStyleSheet("height: 35px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
+                self.play_cue_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
         else:
             self.play_cue_btn.setText("▶ START CUE")
-            self.play_cue_btn.setStyleSheet("height: 35px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
+            self.play_cue_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
 
     def update_cue_table(self):
         self.cue_table.setRowCount(len(self.masks))
@@ -824,7 +824,7 @@ class ProjectionMappingApp(QMainWindow):
                 status = "LOCKED" if conf > 0.5 else "TRACKING..." if conf > 0.1 else "LOST / SEARCHING"
                 color = "#00e676" if conf > 0.5 else "#ffeb3b" if conf > 0.1 else "#ff1744"
                 self.stage_status_label.setText(f"STATUS: {status}")
-                self.stage_status_label.setStyleSheet(f"font-size: 28px; color: {color}; font-weight: bold; margin-top: 10px;")
+                self.stage_status_label.setStyleSheet(f"font-size: 20px; color: {color}; font-weight: bold; margin-top: 5px;")
         except (RuntimeError, AttributeError):
             pass
 
@@ -914,7 +914,7 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_group_layout.addWidget(self.verify_align_btn)
 
             self.edit_bg_mask_btn = QPushButton("EDIT BACKGROUND BOUNDARY")
-            self.edit_bg_mask_btn.setMinimumHeight(40)
+            self.edit_bg_mask_btn.setMinimumHeight(60)
             self.edit_bg_mask_btn.setStyleSheet("background-color: #311b92; color: white; font-weight: bold;")
             self.edit_bg_mask_btn.clicked.connect(self.start_setup_bg_mask_dialog)
             self.setup_group_layout.addWidget(self.edit_bg_mask_btn)
@@ -937,13 +937,13 @@ class ProjectionMappingApp(QMainWindow):
 
             marker_btn = QPushButton("CALIBRATE MARKERS")
             marker_btn.clicked.connect(self.open_marker_selection_dialog)
-            marker_btn.setMinimumHeight(40)
+            marker_btn.setMinimumHeight(60)
             marker_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(marker_btn)
 
             self.baseline_btn = QPushButton("SET BASELINE DEPTH (Hold guitar at normal playing distance)")
             self.baseline_btn.clicked.connect(self.worker.calibrate_depth)
-            self.baseline_btn.setMinimumHeight(40)
+            self.baseline_btn.setMinimumHeight(50)
             self.setup_group_layout.addWidget(self.baseline_btn)
 
         elif self.setup_step == 3: # Guitar Mask
@@ -952,7 +952,7 @@ class ProjectionMappingApp(QMainWindow):
 
             mask_btn = QPushButton("DRAW TRACKED GUITAR MASK")
             mask_btn.clicked.connect(self.start_setup_guitar_mask)
-            mask_btn.setMinimumHeight(40)
+            mask_btn.setMinimumHeight(60)
             mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(mask_btn)
 
@@ -967,7 +967,7 @@ class ProjectionMappingApp(QMainWindow):
 
             mask_btn = QPushButton("DRAW STATIONARY AMP MASK")
             mask_btn.clicked.connect(self.start_setup_amp_mask)
-            mask_btn.setMinimumHeight(40)
+            mask_btn.setMinimumHeight(60)
             mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(mask_btn)
 
@@ -1407,7 +1407,7 @@ class ProjectionMappingApp(QMainWindow):
         tracking_layout.addWidget(self.stage_conf_bar)
 
         self.stage_status_label = QLabel("STATUS: STANDBY")
-        self.stage_status_label.setStyleSheet("font-size: 28px; color: #ffeb3b; font-weight: bold; margin-top: 10px;")
+        self.stage_status_label.setStyleSheet("font-size: 20px; color: #ffeb3b; font-weight: bold; margin-top: 5px;")
         tracking_layout.addWidget(self.stage_status_label)
 
         tracking_group.setLayout(tracking_layout)
@@ -1424,8 +1424,6 @@ class ProjectionMappingApp(QMainWindow):
         self.media_scroll.setWidget(tab)
 
         layout = QHBoxLayout(tab)
-        layout.setSpacing(10)
-        layout.setContentsMargins(10, 10, 10, 10)
 
         # Left: Media Library
         lib_group = QGroupBox("Media Library")
@@ -1463,12 +1461,12 @@ class ProjectionMappingApp(QMainWindow):
         cue_layout.addWidget(self.cue_table)
 
         assign_btn = QPushButton("Assign Selected Media to Mask Playlist")
-        assign_btn.setStyleSheet("height: 30px; font-weight: bold;")
+        assign_btn.setStyleSheet("height: 40px; font-weight: bold;")
         assign_btn.clicked.connect(self.assign_media_to_mask)
         cue_layout.addWidget(assign_btn)
 
         self.edit_playlist_btn = QPushButton("Edit Playlist Order / Manage Cue")
-        self.edit_playlist_btn.setStyleSheet("height: 30px; font-weight: bold; background-color: #311b92;")
+        self.edit_playlist_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #311b92;")
         self.edit_playlist_btn.clicked.connect(self.open_playlist_editor)
         cue_layout.addWidget(self.edit_playlist_btn)
 
@@ -1488,7 +1486,7 @@ class ProjectionMappingApp(QMainWindow):
         btn_right = QPushButton("▶ RIGHT")
 
         for b in [btn_up, btn_down, btn_left, btn_right]:
-            b.setStyleSheet("height: 32px; font-weight: bold; background-color: #455a64;")
+            b.setStyleSheet("height: 45px; font-weight: bold; background-color: #455a64;")
 
         btn_up.clicked.connect(lambda: self.nudge_mask("up"))
         btn_down.clicked.connect(lambda: self.nudge_mask("down"))
@@ -1703,14 +1701,6 @@ class ProjectionMappingApp(QMainWindow):
         self.camera_combo.addItems([f"Camera {i}" for i in self.available_cameras])
         self.camera_combo.currentIndexChanged.connect(self.change_camera)
         cam_layout.addWidget(self.camera_combo)
-
-        self.lens_slider = QSlider(Qt.Horizontal)
-        self.lens_slider.setRange(-100, 100) # -1.0 to 1.0
-        self.lens_slider.setValue(0)
-        self.lens_slider.valueChanged.connect(lambda v: setattr(self.worker, 'lens_correction', v / 100.0))
-        cam_layout.addWidget(QLabel("Lens Correction (Fisheye):"))
-        cam_layout.addWidget(self.lens_slider)
-
         cam_group.setLayout(cam_layout)
         layout.addWidget(cam_group)
 
@@ -1904,10 +1894,10 @@ class ProjectionMappingApp(QMainWindow):
             if mask.visible:
                 self.worker.restart_mask_video(mask.video_path)
                 self.play_cue_btn.setText("■ STOP CUE")
-                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 10px;")
+                self.play_cue_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 5px;")
             else:
                 self.play_cue_btn.setText("▶ START CUE")
-                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+                self.play_cue_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
 
             self.update_cue_table()
         else:
@@ -1962,7 +1952,6 @@ class ProjectionMappingApp(QMainWindow):
                 'calibration_camera_res': self.worker.calibration_camera_res,
                 'baseline_distance': self.worker.baseline_distance,
                 'projector_boundary': self.worker.projector_boundary,
-                'lens_correction': self.worker.lens_correction,
                 'pnp_enabled': self.pnp_check.isChecked(),
                 'occlusion_enabled': self.occlusion_check.isChecked(),
                 'tracking_freeze_enabled': self.worker.tracking_freeze_enabled,
@@ -2060,11 +2049,6 @@ class ProjectionMappingApp(QMainWindow):
 
                 self.auto_ir_check.setChecked(data.get('auto_ir', False))
                 self.ir_threshold_slider.setValue(data.get('ir_threshold', 200))
-
-                lens_corr = data.get('lens_correction', 0.0)
-                self.worker.lens_correction = lens_corr
-                if hasattr(self, 'lens_slider'):
-                    self.lens_slider.setValue(int(lens_corr * 100))
                 self.depth_sensitivity_slider.setValue(data.get('depth_sensitivity', 100))
                 self.smoothing_slider.setValue(data.get('smoothing', 50))
 
@@ -2314,11 +2298,11 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.blackout_active = not self.worker.blackout_active
         if self.worker.blackout_active:
             self.blackout_btn.setText("DISABLE BLACKOUT")
-            self.blackout_btn.setStyleSheet("background-color: #ff5252; color: white; font-weight: bold; height: 35px;")
+            self.blackout_btn.setStyleSheet("background-color: #ff5252; color: white; font-weight: bold; height: 40px;")
             self.statusBar().showMessage("BLACKOUT ENABLED (PANIC)", 0)
         else:
             self.blackout_btn.setText("BLACKOUT (PANIC)")
-            self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 35px;")
+            self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
             self.statusBar().showMessage("BLACKOUT DISABLED", 3000)
 
     def toggle_splash_mode(self, checked):

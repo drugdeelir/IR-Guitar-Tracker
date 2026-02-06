@@ -15,14 +15,14 @@ def verify():
     main_win.show()
 
     # 1. Verify Wizard Step 1
-    main_win.grab().save("wizard_step1_bounds.png")
-    print("Saved wizard_step1_bounds.png")
+    main_win.tabs.grab().save("wizard_step1_tabs.png")
+    print("Saved wizard_step1_tabs.png")
 
-    # 2. Switch to Boundary Tab
+    # 2. Switch to Stage Tab
     # Tabs: Setup Wizard (0), Stage (1), Media & Cues (2), Calibration (3), Boundary (4), System (5), Connectivity (6)
-    main_win.tabs.setCurrentIndex(4)
-    main_win.grab().save("boundary_tab.png")
-    print("Saved boundary_tab.png")
+    main_win.tabs.setCurrentIndex(1)
+    main_win.tabs.grab().save("stage_tab_grab.png")
+    print("Saved stage_tab_grab.png")
 
     # 3. Test Manual Edit mode
     main_win.edit_bounds_btn.setChecked(True)

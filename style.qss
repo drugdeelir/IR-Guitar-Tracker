@@ -1,13 +1,14 @@
+
 QMainWindow {
     background-color: #000000;
     color: #ffffff;
-    font-size: 14px;
+    font-size: 13px;
 }
 
 QWidget {
     background-color: #000000;
     color: #ffffff;
-    font-size: 14px;
+    font-size: 13px;
 }
 
 QTabWidget::pane {
@@ -18,9 +19,9 @@ QTabWidget::pane {
 QTabBar::tab {
     background: #050505;
     border: 1px solid #000000;
-    padding: 8px 12px;
+    padding: 4px 8px;
     color: #ffffff;
-    font-size: 14px;
+    font-size: 12px;
     font-weight: bold;
 }
 
@@ -31,11 +32,11 @@ QTabBar::tab:selected {
 
 QGroupBox {
     border: 1px solid #1a1a1a;
-    border-radius: 6px;
-    margin-top: 20px;
-    padding-top: 15px;
+    border-radius: 4px;
+    margin-top: 12px;
+    padding-top: 10px;
     font-weight: bold;
-    font-size: 15px;
+    font-size: 13px;
     color: #d500f9;
     background-color: #000000;
 }
@@ -50,11 +51,11 @@ QPushButton {
     background-color: #0a0a0a;
     border: 1px solid #1a1a1a;
     border-radius: 4px;
-    padding: 6px 12px;
-    min-height: 32px;
+    padding: 4px 8px;
+    min-height: 28px;
     color: #ffffff;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 12px;
 }
 
 QPushButton:hover {
@@ -77,10 +78,10 @@ QComboBox {
     background-color: #0a0a0a;
     border: 1px solid #1a1a1a;
     border-radius: 4px;
-    padding: 4px 8px;
-    min-height: 30px;
+    padding: 2px 6px;
+    min-height: 24px;
     color: #ffffff;
-    font-size: 14px;
+    font-size: 12px;
 }
 
 QComboBox::drop-down {
@@ -132,18 +133,18 @@ QStatusBar {
 
 QLabel {
     color: #ffffff;
-    font-size: 14px;
+    font-size: 12px;
 }
 
 h1 {
     color: #d500f9;
-    font-size: 24px;
+    font-size: 18px;
     font-weight: bold;
 }
 
 h2 {
     color: #d500f9;
-    font-size: 18px;
+    font-size: 14px;
     font-weight: bold;
 }
 

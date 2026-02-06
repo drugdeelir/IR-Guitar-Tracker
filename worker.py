@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 import time
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
 from itertools import combinations, permutations
 from scipy.interpolate import interp1d, RBFInterpolator
@@ -160,7 +160,7 @@ class TrackingThread(QThread):
                             # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-                            w_req, h_req = req_res
+                            w_req, h_req = self.worker.requested_camera_res
                             main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                             main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
@@ -170,29 +170,27 @@ class TrackingThread(QThread):
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
+
+                        # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
+                        # Note: behavior is backend dependent. 1/0.25 usually means manual.
+                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                        # main_cap.set(cv2.CAP_PROP_GAIN, 0) # Disabled to allow better IR marker visibility
+
                         # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        self.worker._current_camera_res = (act_w, act_h)
 
-                        # Only re-configure if resolution is actually different or device just opened
-                        if (act_w, act_h) != self.worker._current_camera_res:
-                            # Disable Auto Exposure and Auto Gain to prevent brightness swings
-                            main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-                            main_cap.set(cv2.CAP_PROP_GAIN, 0)
+                        # Clear frame buffer to avoid resolution mismatch
+                        with QMutexLocker(self.worker.latest_main_frame_mutex):
+                             self.worker.latest_main_frame = None
 
-                            self.worker._current_camera_res = (act_w, act_h)
-                            # Update requested res to match reality to prevent infinite re-initialization
-                            self.worker.requested_camera_res = (act_w, act_h)
+                        # Update requested res to match reality to prevent infinite re-initialization
+                        # if the camera doesn't support the requested resolution.
+                        self.worker.requested_camera_res = (act_w, act_h)
 
-                            # Clear frame buffer to avoid resolution mismatch
-                            with QMutexLocker(self.worker.latest_main_frame_mutex):
-                                 self.worker.latest_main_frame = None
-
-                            self.worker.camera_matrix = None # Reset estimation
-                            print(f"Camera Resolution Settled: {act_w}x{act_h}")
-                        else:
-                            # Already settled, just update requested to avoid re-triggering
-                            self.worker.requested_camera_res = (act_w, act_h)
+                        self.worker.camera_matrix = None # Reset estimation
+                        print(f"Camera Resolution Switched to: {act_w}x{act_h}")
                     else:
                         if self.worker._camera_changed:
                             self.worker.camera_error.emit(self.worker.video_source)
@@ -320,7 +318,6 @@ class Worker(QObject):
         self.marker_fingerprint = []
         self.roi_padding = 100 # Increased for high-res FOV
         self.tracking_mutex = QMutex()
-        self.lens_correction = 0.0
 
         # Smoothing and Confidence
         self.kalman_filters = []
@@ -444,7 +441,7 @@ class Worker(QObject):
         self.guitar_body_angle = 0
         self.marker_templates = [] # List of visual patches for recovery
         self.visual_features = None
-        self.visual_search_radius = 80
+        self.visual_search_radius = 50
 
         # Reusable Buffers
         self.projector_buffer = None
@@ -471,7 +468,6 @@ class Worker(QObject):
         self.blend_temp1 = None
         self.blend_temp2 = None
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        self.boundary_clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(12,12))
         self.tracking_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
 
         # Global OpenCV Performance Optimizations & GPU Acceleration
@@ -1061,7 +1057,7 @@ class Worker(QObject):
 
         # Use LK Optical Flow
         next_pts_px, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, combined_pts, None,
-                                                          winSize=(51, 51), maxLevel=3)
+                                                          winSize=(31, 31), maxLevel=3)
 
         if next_pts_px is not None and np.any(status == 1):
             valid_next = next_pts_px[status == 1].reshape(-1, 2)
@@ -1199,10 +1195,9 @@ class Worker(QObject):
                         u_proj_small = cv2.warpPerspective(u_proj_last, T_scale @ M_roi_to_proj, (mask_w, mask_h))
                         u_proj_mask = cv2.resize(u_proj_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
 
-                        # Intelligent suppression - help cancel out bright projector spots
-                        # but cap it so we don't accidentally black out the IR markers
-                        u_suppression = cv2.multiply(u_proj_mask, 0.7)
-                        cv2.threshold(u_suppression, 200, 200, cv2.THRESH_TRUNC, dst=u_suppression)
+                        # Moderate suppression (0.4) - help cancel out bright projector spots
+                        # without completely erasing IR markers.
+                        u_suppression = cv2.multiply(u_proj_mask, 0.4)
                         u_gray = cv2.subtract(u_gray, u_suppression)
                     except: pass
 
@@ -1249,14 +1244,13 @@ class Worker(QObject):
             except: pass
 
         # Min circularity: more lenient for still capture, strict for live tracking
-        # Lowered to handle perspective distortion on large markers
-        min_circ = 0.40 if force_full else 0.55 # Balanced for robustness
+        # Lowered to 0.45 to handle perspective distortion on large markers and fast movement
+        min_circ = 0.40 if force_full else 0.45
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            # Increased min_area to 4 to filter out sensor noise/tiny glints
             # Increased max_area to 15000 for high-res 4K+ camera feeds
-            if 4 <= area < 15000:
+            if 1 <= area < 15000:
                 # Calculate circularity
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
@@ -1293,31 +1287,16 @@ class Worker(QObject):
 
                     cX = (cx_px + roi_x) / w
                     cY = (cy_px + roi_y) / h
-
-                    # Lens Correction (undistort)
-                    if self.lens_correction != 0:
-                        k = self.lens_correction
-                        nx, ny = cX - 0.5, cY - 0.5
-                        r2 = nx*nx + ny*ny
-                        f = 1.0 + k * r2
-                        cX, cY = nx * f + 0.5, ny * f + 0.5
-
                     candidate = {'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity}
 
                     # Intensity check: more inclusive for still frames/dialogs
                     # Unified threshold to 0.8x for both modes to ensure dots seen in capture
                     # remain visible and trackable in live mode.
                     intensity_thresh = self.ir_threshold * 0.8
-
-                    # Heuristic: Real IR markers are usually compact.
-                    # If it's very large but not circular, it's probably projector glare.
-                    is_compact = True
-                    if area > 500 and circularity < 0.75:
-                        is_compact = False
-
-                    if circularity >= min_circ and intensity >= intensity_thresh and is_compact:
+                    if circularity >= min_circ and intensity >= intensity_thresh:
                         # SILHOUETTE GATING: Only accept markers that are on the performer
-                        if fg_mask_cpu is not None:
+                        # RELAXED: Only gate if we already have a lock to prevent initial acquisition failure
+                        if fg_mask_cpu is not None and self.confidence > 0.5:
                             # Sample FG mask at marker position
                             mx, my = int(cX * w), int(cY * h)
                             if 0 <= mx < w and 0 <= my < h:
@@ -1350,16 +1329,18 @@ class Worker(QObject):
         # Dot Persistence: only keep dots that were present in the last frame to filter out transient flashes
         detected_points = []
         # Radius for temporal persistence (normalized units)
-        persistence_radius = np.clip(0.012 + move_mag * 2.5, 0.012, 0.06)
+        # RELAXED: Increased base radius for easier initial lock acquisition
+        persistence_radius = np.clip(0.018 + move_mag * 2.5, 0.018, 0.08)
 
         for p in detected_points_all:
             # Check against ALL detections from the previous frame
             is_persistent = any(np.linalg.norm(np.array(p) - np.array(prev_p)) < persistence_radius for prev_p in self.last_raw_detections)
 
             # Check against last known tracked positions (with larger radius for movement)
-            is_near_tracked = any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.05 for lp in (self.last_tracked_points or []))
+            is_near_tracked = any(np.linalg.norm(np.array(p) - np.array(lp)) < 0.06 for lp in (self.last_tracked_points or []))
 
-            if is_persistent or is_near_tracked:
+            if is_persistent or is_near_tracked or self.confidence < 0.1:
+                # If searching (low confidence), be inclusive to allow lock acquisition
                 detected_points.append(p)
             elif force_full:
                 # Still frames for calibration should include everything
@@ -1475,8 +1456,8 @@ class Worker(QObject):
                         m2 = np.mean(combo_fp)
                         if m1 > 0.0001 and m2 > 0.0001:
                             fp_err = np.mean([abs((a/m2) - (b/m1)) for a, b in zip(combo_fp, ref_fp)])
-                            # Relaxed from 0.12 to 0.18 for better tolerance on wide setups
-                            if fp_err > 0.18: continue
+                            # Relaxed from 0.18 to 0.25 for better tolerance on wide setups and perspective
+                            if fp_err > 0.25: continue
                         else:
                             continue
 
@@ -1593,7 +1574,7 @@ class Worker(QObject):
                                             config_bias += np.linalg.norm(np.array(p[i]) - np.array(marker_cfg[i]))
 
                                     # Increased stickiness weight to prioritize temporal continuity over visual exactness
-                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0) + (config_bias * 20.0) + intensity_cost + motion_cost
+                                    total_cost = err + (fp_err * 8.0) + (stickiness_err * 12.0) + (config_bias * 25.0) + intensity_cost + motion_cost
 
                                     if total_cost < best_overall_error:
                                         best_overall_error = total_cost
@@ -1674,7 +1655,7 @@ class Worker(QObject):
                         if best_match: break
                 if best_match: break
 
-            if best_match and best_overall_error < 0.1: # More relaxed to ensure capture in noisy environments
+            if best_match and best_overall_error < 0.2: # More relaxed to ensure capture in noisy environments
                 # Sanity Check: Filter out sudden jumps (reflections)
                 if self.last_tracked_points is not None and self.confidence > 0.3:
                     prev_center = np.mean(self.last_tracked_points, axis=0)
@@ -1807,6 +1788,7 @@ class Worker(QObject):
             self.history_points = []
             self.smoothed_points = None
             self.last_homography = None
+            self.last_tracked_points = None
             # Decisive Reset of Kalman filters to prevent old state from polluting new lock
             if self.marker_config:
                 self.init_kalman(len(self.marker_config))
@@ -2032,16 +2014,12 @@ class Worker(QObject):
                         marker_mask = cv2.dilate(marker_mask, kernel_small, iterations=5)
                         diff[marker_mask > 0] = 0
 
-                        # Pre-process diff to enhance dim areas (far backgrounds)
-                        diff_boosted = self.boundary_clahe.apply(diff)
-
                         # Try adaptive thresholding first for better detail in uneven lighting
-                        # Larger block size (51) to capture broader structures in dark environments
-                        thresh = cv2.adaptiveThreshold(diff_boosted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                       cv2.THRESH_BINARY, 51, -2)
+                        thresh = cv2.adaptiveThreshold(diff, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                       cv2.THRESH_BINARY, 21, -5)
 
                         # Combined with Otsu for global structure
-                        _, otsu = cv2.threshold(diff_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        _, otsu = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         thresh = cv2.bitwise_or(thresh, otsu)
 
                         # Clean up
@@ -2439,6 +2417,9 @@ class Worker(QObject):
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                     u_fg_mask = cv2.morphologyEx(u_fg_mask, cv2.MORPH_OPEN, kernel)
                     u_fg_mask = cv2.dilate(u_fg_mask, kernel, iterations=2)
+
+                    # Store for tracking thread use
+                    self.u_fg_mask = u_fg_mask
 
                     # Exclude the guitar area from occlusion if tracking (on GPU)
                     if curr_confidence > 0.5 and tracked_points:
@@ -3364,6 +3345,7 @@ class Worker(QObject):
         self.static_warp_cache.clear()
 
         # Performance: Don't do heavy cleanup on UI thread to avoid freezes
+        from PyQt5.QtCore import QTimer
         QTimer.singleShot(100, self.cleanup_resources)
 
     def set_pnp_enabled(self, enabled):
