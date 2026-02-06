@@ -2403,8 +2403,7 @@ class ProjectionMappingApp(QMainWindow):
             elif self.setup_step == 3: # Guitar Mask step
                 mask.tag = 'instrument'
                 mask.type = 'dynamic'
-                if not mask.name or mask.name.startswith("Mask"):
-                    mask.name = 'Guitar'
+                mask.name = 'Guitar'
                 # Automatically link to markers if they exist
                 if self.selected_markers and not mask.is_linked:
                      self.link_mask_to_markers(mask)

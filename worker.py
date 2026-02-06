@@ -659,6 +659,7 @@ class Worker(QObject):
                 mask.tint_color = (255, 0, 255) # Magenta
 
     def switch_video(self, tag, video_path):
+        print(f"Worker: Switching video for tag '{tag}' to '{video_path}'")
         for mask in self.masks:
             if mask.tag == tag:
                 if mask.video_path and mask.video_path != video_path:
@@ -1061,7 +1062,9 @@ class Worker(QObject):
         if self.h_c2p is not None and not force_full:
             with QMutexLocker(self.last_projected_frame_mutex):
                 if self.last_projected_frame_for_masking is not None:
-                    ph, pw = self.last_projected_frame_for_masking.shape[:2]
+                    # Performance: Retrieve dimensions from UMat correctly (Python fix)
+                    _gs = self.last_projected_frame_for_masking.get().shape
+                    ph, pw = _gs[0], _gs[1]
                     S = np.array([[float(pw), 0, 0], [0, float(ph), 0], [0, 0, 1]], dtype=np.float32)
                     M_cam_to_proj = S @ self.h_c2p
                     T_roi = np.array([[1, 0, roi_x], [0, 1, roi_y], [0, 0, 1]], dtype=np.float32)
@@ -1071,8 +1074,8 @@ class Worker(QObject):
                         mask_w, mask_h = max(32, roi_w // 4), max(32, roi_h // 4)
                         T_scale = np.array([[mask_w/roi_w, 0, 0], [0, mask_h/roi_h, 0], [0, 0, 1]], dtype=np.float32)
 
-                        # Use UMat for warped masking
-                        u_proj_last = cv2.UMat(self.last_projected_frame_for_masking)
+                        # Use existing UMat for warped masking
+                        u_proj_last = self.last_projected_frame_for_masking
                         u_proj_small = cv2.warpPerspective(u_proj_last, T_scale @ M_roi_to_proj, (mask_w, mask_h))
                         u_proj_mask = cv2.resize(u_proj_small, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
 
@@ -2800,12 +2803,15 @@ class Worker(QObject):
 
         elif pattern == 'vortex':
             center = (w // 2, h // 2)
-            angles = np.radians(np.arange(0, 360, 15) + t * 80)
-            cos_a, sin_a = np.cos(angles), np.sin(angles)
-            max_d = max(w, h)
-            for i in range(len(angles)):
-                end_x, end_y = int(center[0] + max_d * cos_a[i]), int(center[1] + max_d * sin_a[i])
-                cv2.line(u_frame, center, (end_x, end_y), (255, 255, 0), 2, cv2.LINE_AA)
+            # Vectorized angles and line endpoints
+            angles = np.radians(np.arange(0, 360, 15, dtype=np.float32) + t * 80.0)
+            max_d = float(max(w, h))
+            end_pts = np.column_stack([
+                center[0] + max_d * np.cos(angles),
+                center[1] + max_d * np.sin(angles)
+            ]).astype(np.int32)
+            for pt in end_pts:
+                cv2.line(u_frame, center, tuple(pt), (255, 255, 0), 2, cv2.LINE_AA)
 
         elif pattern == 'waves':
             if not hasattr(self, 'cached_waves_grid') or self.cached_waves_grid[0].shape != (h, w):
@@ -2829,16 +2835,31 @@ class Worker(QObject):
                 cv2.polylines(u_frame, [np.array(pts, np.int32)], True, (200, 0, 255), 2, cv2.LINE_AA)
 
         elif pattern == 'stardust':
-            for i in range(30):
-                seed = (i * 12345)
-                speed = 0.2 + (seed % 10) / 10.0
-                offset = (t * speed + i * 0.03) % 1.0
-                if offset < 0.01: continue
-                size, dist, ang = int(offset * 20), offset * max(w, h) * 0.8, (seed % 360) * (np.pi / 180)
-                x, y = int(w // 2 + dist * np.cos(ang)), int(h // 2 + dist * np.sin(ang))
-                star_pts = [[int(x + size * np.cos(t * 5 + s * 2 * np.pi / 3)),
-                             int(y + size * np.sin(t * 5 + s * 2 * np.pi / 3))] for s in range(3)]
-                cv2.polylines(u_frame, [np.array(star_pts, np.int32)], True, (255, 255, 255), 1, cv2.LINE_AA)
+            # Vectorized stardust - calculate all star positions first
+            i_stars = np.arange(30, dtype=np.float32)
+            seeds = i_stars * 12345.0
+            speeds = 0.2 + (seeds % 10.0) / 10.0
+            offsets = (t * speeds + i_stars * 0.03) % 1.0
+            mask_stars = offsets > 0.01
+
+            if np.any(mask_stars):
+                off = offsets[mask_stars]
+                sd = seeds[mask_stars]
+                sizes = (off * 20.0).astype(np.int32)
+                dists = off * max(w, h) * 0.8
+                angs = (sd % 360.0) * (np.pi / 180.0)
+
+                xs = (w // 2 + dists * np.cos(angs)).astype(np.int32)
+                ys = (h // 2 + dists * np.sin(angs)).astype(np.int32)
+
+                s_angs_base = np.array([0, 2*np.pi/3, 4*np.pi/3], dtype=np.float32)
+                for idx in range(len(xs)):
+                    s_angs = t * 5.0 + s_angs_base
+                    pts = np.column_stack([
+                        xs[idx] + sizes[idx] * np.cos(s_angs),
+                        ys[idx] + sizes[idx] * np.sin(s_angs)
+                    ]).astype(np.int32)
+                    cv2.polylines(u_frame, [pts], True, (255, 255, 255), 1, cv2.LINE_AA)
 
         elif pattern == 'hypergrid':
             horizon, num_lines = h // 2, 15
@@ -3113,6 +3134,10 @@ class Worker(QObject):
                     print(f"Purging player for: {path}")
                     self.video_players[path].stop()
                     del self.video_players[path]
+                    # Clear VRAM cache for this specific path
+                    for key in list(self.video_umat_cache.keys()):
+                        if key[0] == path:
+                            del self.video_umat_cache[key]
 
         # Cleanup trail buffers for removed masks
         mask_ids = {id(mask) for mask in self.masks}
@@ -3124,6 +3149,10 @@ class Worker(QObject):
         with QMutexLocker(self.mask_mutex):
             # Sort masks by Z-order once when they are updated
             self.masks = sorted(masks, key=lambda m: m.z_order)
+
+        # Invalidate static cache to force refresh of dimensions and paths
+        self.static_warp_cache.clear()
+
         self.update_video_speeds()
         self.cleanup_resources()
 
