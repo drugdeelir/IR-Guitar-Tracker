@@ -205,6 +205,8 @@ class TrackingThread(QThread):
                         self.worker.requested_camera_res = (act_w, act_h)
                         self.worker.camera_matrix = None # Reset estimation
                         print(f"Camera Optimized: {act_w}x{act_h} @ {main_cap.get(cv2.CAP_PROP_FPS)} FPS")
+                        # Give the hardware time to stabilize after optimization
+                        QThread.msleep(500)
                     else:
                         if self.worker._camera_changed:
                             self.worker.camera_error.emit(self.worker.video_source)
@@ -332,7 +334,7 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
-        self.requested_camera_res = (3840, 3840) # Default to max FOV for stability
+        self.requested_camera_res = (3840, 2160) # Default to max FOV for stability
         self._current_camera_res = (0, 0)
         self.calibration_camera_res = None
         self.baseline_distance = 0
@@ -430,7 +432,7 @@ class Worker(QObject):
         self._sls_patterns_y = []
         self._sls_captures_x = []
         self._sls_captures_y = []
-        self._sls_wait_frames = 30
+        self._sls_wait_frames = 45
         self._sls_curr_wait = 0
 
         # Projector Boundary Detection
@@ -605,7 +607,7 @@ class Worker(QObject):
 
     def capture_still_frame(self):
         # Set to max FOV for capture
-        self.requested_camera_res = (3840, 3840)
+        self.requested_camera_res = (3840, 2160)
         self._capture_still_frame_flag = True
 
     def calibrate_depth(self):
@@ -2124,6 +2126,12 @@ class Worker(QObject):
                         self._boundary_step = 0
                         self._boundary_captures = []
                 elif self._run_sls_flag:
+                    # Structured Light Scanning takes priority
+                    if not self._sls_patterns_x:
+                        self._sls_step = -1
+                        QThread.msleep(10)
+                        continue
+
                     # Ensure resolution is stable before capturing
                     actual_w, actual_h = self._current_camera_res
                     if self.requested_camera_res[0] > 3840 or \
@@ -2132,11 +2140,6 @@ class Worker(QObject):
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
                         QThread.msleep(10)
-                        continue
-
-                    # Structured Light Scanning takes priority
-                    if not self._sls_patterns_x:
-                        self._sls_step = -1
                         continue
 
                     total_x = len(self._sls_patterns_x)
@@ -3249,7 +3252,7 @@ class Worker(QObject):
     def run_boundary_detection(self):
         # We MUST keep resolution consistent across all setup steps
         # Use (3840,3840) as a trigger for max available res in TrackingThread
-        self.requested_camera_res = (3840, 3840)
+        self.requested_camera_res = (3840, 2160)
         self._boundary_step = 0
         self._boundary_captures = []
         self._sls_curr_wait = 0
@@ -3265,7 +3268,7 @@ class Worker(QObject):
         # FOV stability is paramount for projection mapping
 
     def run_auto_calibration(self):
-        self.requested_camera_res = (3840, 3840)
+        self.requested_camera_res = (3840, 2160)
         self._run_calibration_flag = True
 
     def run_one_click_sync(self):
@@ -3273,7 +3276,7 @@ class Worker(QObject):
         self.run_room_scan()
 
     def run_room_scan(self):
-        self.requested_camera_res = (3840, 3840) # Request max FOV
+        self.requested_camera_res = (3840, 2160) # Request max FOV
         self._run_sls_flag = True
         self._sls_step = -1 # Trigger pattern generation in worker thread
         self._sls_captures_x = []
@@ -3312,7 +3315,7 @@ class Worker(QObject):
             cal_w, cal_h = self.calibration_camera_res
         else:
             # Fallback if not calibrated: use current res
-            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (3840, 3840)
+            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (3840, 2160)
 
         # Ensure we are using absolute pixels relative to the calibration FOV
         pts_cal = pts_arr * [cal_w, cal_h]
