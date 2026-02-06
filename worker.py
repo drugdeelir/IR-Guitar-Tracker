@@ -172,9 +172,12 @@ class TrackingThread(QThread):
 
                     if main_cap and main_cap.isOpened():
 
-                        # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
-                        # Note: behavior is backend dependent. 1/0.25 usually means manual.
+                        # Disable all auto-adjustments to prevent lag and "hunting"
+                        # Values are backend dependent (1/0.25 usually means manual)
                         main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                        main_cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                        main_cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+                        main_cap.set(cv2.CAP_PROP_FPS, 60)
 
                         # Attempt to "lock" current settings by reading and re-setting them
                         # This can prevent some drivers from reverting to auto mode when the camera moves.
@@ -227,7 +230,11 @@ class TrackingThread(QThread):
                 # REAL-TIME PREVIEW: Update camera frame immediately for UI before slow tracking
                 with QMutexLocker(self.worker.latest_main_frame_mutex):
                     # Optimization: Downscale preview if larger than 1080p to save memory bandwidth
-                    if w_cam > 1920:
+                    # BUT ONLY if not in high-res setup modes that need full resolution
+                    in_setup = self.worker._run_sls_flag or self.worker._run_calibration_flag or \
+                               self.worker._run_boundary_detection_flag or self.worker._capture_still_frame_flag
+
+                    if w_cam > 1920 and not in_setup:
                         self.worker.latest_main_frame = cv2.resize(main_frame, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_LINEAR)
                     else:
                         self.worker.latest_main_frame = main_frame.copy()
@@ -1992,17 +1999,26 @@ class Worker(QObject):
                     self._warp_map_dirty = True
 
                 if self._run_sls_flag and self._sls_step == -1:
-                    # Generate patterns in background
-                    self.status_update.emit("Room Scan: Generating patterns...")
-                    self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
+                    # Generate patterns if not already cached or if resolution changed
+                    self.status_update.emit("Room Scan: Preparing patterns...")
+                    needs_gen = not self._sls_patterns_x or not self._sls_patterns_y
+                    if not needs_gen:
+                        # Check if cached patterns match current projector resolution
+                        ph, pw = self._sls_patterns_x[0].shape[:2]
+                        if pw != self.projector_width or ph != self.projector_height:
+                            needs_gen = True
+
+                    if needs_gen:
+                        self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
                     self._sls_step = 0
-                    continue
 
                 if self._run_boundary_detection_flag:
                     # Ensure resolution is stable before capturing
+                    # Optimization: Compare hardware resolution against requested resolution
+                    actual_w, actual_h = self._current_camera_res
                     if self.requested_camera_res[0] > 5000 or \
-                       main_frame.shape[1] != self.requested_camera_res[0] or \
-                       main_frame.shape[0] != self.requested_camera_res[1]:
+                       actual_w != self.requested_camera_res[0] or \
+                       actual_h != self.requested_camera_res[1]:
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
                         continue
@@ -2102,9 +2118,10 @@ class Worker(QObject):
                         self._boundary_captures = []
                 elif self._run_sls_flag:
                     # Ensure resolution is stable before capturing
+                    actual_w, actual_h = self._current_camera_res
                     if self.requested_camera_res[0] > 5000 or \
-                       main_frame.shape[1] != self.requested_camera_res[0] or \
-                       main_frame.shape[0] != self.requested_camera_res[1]:
+                       actual_w != self.requested_camera_res[0] or \
+                       actual_h != self.requested_camera_res[1]:
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
                         continue
@@ -2322,9 +2339,10 @@ class Worker(QObject):
                 # Handle Auto-Calibration logic (Multi-frame averaging)
                 if self._run_calibration_flag:
                     # Ensure resolution is stable before capturing
+                    actual_w, actual_h = self._current_camera_res
                     if self.requested_camera_res[0] > 5000 or \
-                       main_frame.shape[1] != self.requested_camera_res[0] or \
-                       main_frame.shape[0] != self.requested_camera_res[1]:
+                       actual_w != self.requested_camera_res[0] or \
+                       actual_h != self.requested_camera_res[1]:
                         continue
 
                     if curr_frame_id > self._last_captured_frame_id:
