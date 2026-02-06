@@ -1056,7 +1056,7 @@ class ProjectionMappingApp(QMainWindow):
         if self.mask_drawing_dialog.exec_():
             points = self.mask_drawing_dialog.get_points()
             mask.source_points = [(p.x(), p.y()) for p in points]
-            mask.tag = 'amp'
+            mask.tag = 'instrument'
             mask.type = 'dynamic'
             if self.selected_markers and not mask.is_linked:
                 self.link_mask_to_markers(mask)
@@ -1092,7 +1092,7 @@ class ProjectionMappingApp(QMainWindow):
         if self.mask_drawing_dialog.exec_():
             points = self.mask_drawing_dialog.get_points()
             mask.source_points = [(p.x(), p.y()) for p in points]
-            mask.tag = 'background'
+            mask.tag = 'amp'
             mask.type = 'static'
 
             self.update_cue_table()
@@ -1698,6 +1698,24 @@ class ProjectionMappingApp(QMainWindow):
         cam_group.setLayout(cam_layout)
         layout.addWidget(cam_group)
 
+        # Performance
+        perf_group = QGroupBox("GPU & Performance")
+        perf_layout = QVBoxLayout()
+        self.gpu_check = QCheckBox("Enable GPU Acceleration (OpenCL)")
+        self.gpu_check.setChecked(cv2.ocl.useOpenCL())
+        self.gpu_check.toggled.connect(self.toggle_gpu_acceleration)
+        perf_layout.addWidget(self.gpu_check)
+
+        self.render_scale_slider = QSlider(Qt.Horizontal)
+        self.render_scale_slider.setRange(20, 100)
+        self.render_scale_slider.setValue(int(self.worker.render_scale * 100))
+        self.render_scale_slider.valueChanged.connect(self.update_render_scale)
+        perf_layout.addWidget(QLabel("Internal Render Scale (Lower = Faster):"))
+        perf_layout.addWidget(self.render_scale_slider)
+
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+
         # Display
         disp_group = QGroupBox("Projector Display")
         disp_layout = QVBoxLayout()
@@ -1783,30 +1801,40 @@ class ProjectionMappingApp(QMainWindow):
         self.osc_handler.start()
 
     def handle_osc_message(self, address, args):
-        self.log_message(f"OSC: {address} {args}")
-        parts = address.strip('/').split('/')
-        if not parts: return
+        try:
+            self.log_message(f"OSC: {address} {args}")
+            parts = address.strip('/').split('/')
+            if not parts: return
 
-        if parts[0] == 'mask' and len(parts) >= 3:
-            tag = parts[1]
-            if tag == 'bg': tag = 'background' # Standardize
-            if tag == 'gt': tag = 'instrument' # Standardize
-            action = parts[2]
-            val = args[0] if args else 0
+            if parts[0] == 'mask' and len(parts) >= 3:
+                tag = parts[1]
+                if tag == 'bg': tag = 'background' # Standardize
+                if tag == 'gt': tag = 'instrument' # Standardize
+                action = parts[2]
 
-            if action == 'visible':
-                self.worker.toggle_mask(tag, val > 0.5)
-            elif action == 'fx' and len(parts) >= 4:
-                fx_name = parts[3]
-                self.worker.set_fx(tag, fx_name, val > 0.5)
-            elif action == 'video' and args:
-                self.worker.switch_video(tag, str(args[0]))
-            elif action == 'cue' and args:
-                self.worker.switch_cue(tag, int(args[0]))
-        elif parts[0] == 'style' and args:
-            self.worker.set_style(str(args[0]))
-        elif parts[0] == 'snapshot' and args:
-            self.load_snapshot(int(args[0]))
+                # Robust type handling for OSC arguments
+                try:
+                    val = float(args[0]) if args else 0.0
+                except (ValueError, TypeError):
+                    val = 0.0
+
+                if action == 'visible':
+                    self.worker.toggle_mask(tag, val > 0.5)
+                elif action == 'fx' and len(parts) >= 4:
+                    fx_name = parts[3]
+                    self.worker.set_fx(tag, fx_name, val > 0.5)
+                elif action == 'video' and args:
+                    self.worker.switch_video(tag, str(args[0]))
+                elif action == 'cue' and args:
+                    try: self.worker.switch_cue(tag, int(val))
+                    except: pass
+            elif parts[0] == 'style' and args:
+                self.worker.set_style(str(args[0]))
+            elif parts[0] == 'snapshot' and args:
+                try: self.load_snapshot(int(float(args[0])))
+                except: pass
+        except Exception as e:
+            print(f"Error handling OSC message: {e}")
 
     def change_audio_device(self, index):
         if hasattr(self, 'audio_handler'):
@@ -1884,10 +1912,14 @@ class ProjectionMappingApp(QMainWindow):
             import base64
             import os
             import shutil
-            # Create a backup of the existing project file
+            # Robust Rolling Backups (keep 3 history files)
             if os.path.exists(filename):
                 try:
-                    shutil.copy2(filename, filename + ".bak")
+                    for i in range(2, 0, -1):
+                        b_old = f"{filename}.bak{i}"
+                        b_new = f"{filename}.bak{i+1}"
+                        if os.path.exists(b_old): os.replace(b_old, b_new)
+                    shutil.copy2(filename, filename + ".bak1")
                 except Exception as e:
                     print(f"Backup failed: {e}")
             self.current_project_path = filename
@@ -1963,17 +1995,32 @@ class ProjectionMappingApp(QMainWindow):
         else:
             self.statusBar().showMessage("No setup reference frame found in this project.", 3000)
 
+    def validate_project_data(self, data):
+        """Strict validation of project file schema to prevent crashes during load."""
+        required_keys = ['masks', 'media_library', 'warp_points']
+        for key in required_keys:
+            if key not in data:
+                raise ValueError(f"Missing required project key: {key}")
+
+        if not isinstance(data['masks'], list):
+            raise TypeError("Project 'masks' must be a list")
+
+        return True
+
     def load_project(self, filename=None):
         print(f"[DEBUG] Attempting to load project. Filename: {filename}")
         if not filename:
             filename, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "Project Files (*.json)")
 
         if filename:
-            self.current_project_path = filename
             try:
                 with open(filename, 'r') as f:
                     data = json.load(f)
 
+                # Validate schema before applying
+                self.validate_project_data(data)
+
+                self.current_project_path = filename
                 self.setup_reference_b64 = data.get('setup_reference')
                 self.masks = [Mask.from_dict(d) for d in data.get('masks', [])]
                 self.media_library = data.get('media_library', [])
@@ -2120,6 +2167,13 @@ class ProjectionMappingApp(QMainWindow):
             self.send_midi_feedback(f"{prefix}{i}", val)
 
     def execute_midi_action(self, key, value):
+        # Robust MIDI value normalization (0-127)
+        try:
+            v_norm = int(value)
+            v_norm = max(0, min(127, v_norm))
+        except:
+            v_norm = 0
+
         if key.startswith('cue_instrument_'):
             idx = int(key.split('_')[-1])
             self.worker.switch_cue('instrument', idx)
@@ -2133,24 +2187,24 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.switch_cue('background', idx)
             self.send_midi_feedback_for_group('cue_background_', idx, 8)
         elif key == 'toggle_instrument':
-            self.worker.toggle_mask('instrument', value > 0)
-            self.send_midi_feedback('toggle_instrument', 127 if value > 0 else 0)
+            self.worker.toggle_mask('instrument', v_norm > 0)
+            self.send_midi_feedback('toggle_instrument', 127 if v_norm > 0 else 0)
         elif key == 'toggle_amp':
-            self.worker.toggle_mask('amp', value > 0)
-            self.send_midi_feedback('toggle_amp', 127 if value > 0 else 0)
+            self.worker.toggle_mask('amp', v_norm > 0)
+            self.send_midi_feedback('toggle_amp', 127 if v_norm > 0 else 0)
         elif key == 'toggle_background':
-            self.worker.toggle_mask('background', value > 0)
-            self.send_midi_feedback('toggle_background', 127 if value > 0 else 0)
+            self.worker.toggle_mask('background', v_norm > 0)
+            self.send_midi_feedback('toggle_background', 127 if v_norm > 0 else 0)
         elif key.startswith('fx_'):
             parts = key.split('_')
             tag = parts[1]
             fx_name = "_".join(parts[2:])
-            self.worker.set_fx(tag, fx_name, value > 64)
+            self.worker.set_fx(tag, fx_name, v_norm > 64)
         elif key.startswith('design_'):
             parts = key.split('_')
             tag = parts[1]
             design_name = parts[2]
-            if value > 64:
+            if v_norm > 64:
                 for mask in self.masks:
                     if mask.tag == tag:
                         mask.design_overlay = design_name
@@ -2161,15 +2215,15 @@ class ProjectionMappingApp(QMainWindow):
             for mask in self.masks:
                 if mask.tag == tag:
                     if param == 'toggle':
-                        mask.fx_params['lfo_enabled'] = (value > 64)
+                        mask.fx_params['lfo_enabled'] = (v_norm > 64)
                     elif param == 'speed':
-                        mask.fx_params['lfo_speed'] = (value / 64.0)
-                    elif param == 'cycle' and value > 64:
+                        mask.fx_params['lfo_speed'] = (v_norm / 64.0)
+                    elif param == 'cycle' and v_norm > 64:
                         targets = ["none", "blur", "tint", "rgb_shift", "hue"]
                         curr = mask.fx_params.get('lfo_target', 'none')
                         idx = (targets.index(curr) + 1) % len(targets)
                         mask.fx_params['lfo_target'] = targets[idx]
-                    elif param == 'shape' and value > 64:
+                    elif param == 'shape' and v_norm > 64:
                         shapes = ["sine", "square", "triangle", "sawtooth"]
                         curr = mask.fx_params.get('lfo_shape', 'sine')
                         idx = (shapes.index(curr) + 1) % len(shapes)
@@ -2178,36 +2232,36 @@ class ProjectionMappingApp(QMainWindow):
             tag = key.split('_')[1]
             for mask in self.masks:
                 if mask.tag == tag:
-                    mask.bezier_enabled = (value > 64)
+                    mask.bezier_enabled = (v_norm > 64)
         elif key.startswith('style_'):
             style_name = key.split('_')[1]
-            if value > 64:
+            if v_norm > 64:
                 self.worker.set_style(style_name)
         elif key.startswith('part_'):
             part_name = key.split('_')[1]
-            if value > 64:
+            if v_norm > 64:
                 self.worker.set_particle_preset(part_name)
         elif key == 'auto_pilot_toggle':
-            if value > 64:
+            if v_norm > 64:
                 self.auto_pilot_check.setChecked(not self.auto_pilot_check.isChecked())
         elif key == 'hud_toggle':
-            if value > 64:
+            if v_norm > 64:
                 self.hud_check.setChecked(not self.hud_check.isChecked())
         elif key == 'safety_toggle':
-            if value > 64:
+            if v_norm > 64:
                 self.safety_check.setChecked(not self.safety_check.isChecked())
         elif key == 'toggle_projector_splash':
-            if value > 64:
+            if v_norm > 64:
                 self.splash_check.setChecked(not self.splash_check.isChecked())
         elif key == 'blackout_toggle':
-            if value > 64:
+            if v_norm > 64:
                 self.toggle_blackout()
         elif key.startswith('snap_save_'):
             idx = int(key.split('_')[-1])
-            if value > 64: self.save_snapshot(idx)
+            if v_norm > 64: self.save_snapshot(idx)
         elif key.startswith('snap_load_'):
             idx = int(key.split('_')[-1])
-            if value > 64: self.load_snapshot(idx)
+            if v_norm > 64: self.load_snapshot(idx)
 
     def handle_bpm(self, bpm):
         self.bpm_label.setText(f"BPM: {bpm:.1f}")
@@ -2549,6 +2603,19 @@ class ProjectionMappingApp(QMainWindow):
                 self.media_library.append(path)
                 self.media_list.addItem(f"GEN: {pattern}")
 
+    def toggle_gpu_acceleration(self, enabled):
+        cv2.ocl.setUseOpenCL(enabled)
+        self.worker.gpu_error_count = 0 # Reset health check
+        self.worker.video_umat_cache.clear()
+        self.worker.static_warp_cache.clear()
+        self.log(f"GPU Acceleration (OpenCL) {'Enabled' if enabled else 'Disabled'}")
+
+    def update_render_scale(self, value):
+        self.worker.render_scale = value / 100.0
+        # Clear caches because dimensions changed
+        self.worker.static_warp_cache.clear()
+        self.log(f"Internal Render Scale set to {self.worker.render_scale:.2f}")
+
     def change_camera(self, index):
         if self.available_cameras:
             new_camera_index = self.available_cameras[index]
@@ -2637,6 +2704,10 @@ class ProjectionMappingApp(QMainWindow):
 
 
 if __name__ == '__main__':
+    # Optimization: High DPI Support
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
     
     splash = SplashScreen()

@@ -22,6 +22,12 @@ class VideoPlayer(QThread):
         self.mutex = QMutex()
         self.is_image = video_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))
 
+        import os
+        if not os.path.exists(video_path) and not video_path.startswith("generator:"):
+            print(f"VideoPlayer Warning: File not found {video_path}")
+            self._running = False
+            return
+
         if self.is_image:
             self.cap = None
             self.fps = 1.0
@@ -44,7 +50,7 @@ class VideoPlayer(QThread):
         try:
             if self.is_image:
                 while self._running:
-                    time.sleep(1.0) # Just keep the thread alive
+                    self.msleep(500) # Use QThread.msleep for better integration
                 return
 
             while self._running:
@@ -74,8 +80,8 @@ class VideoPlayer(QThread):
                             self.frame_buffer.append(frame)
 
                 # Dynamic sleep to keep buffer full but not peg CPU
-                sleep_time = 0.005 if buffer_count < self.max_buffer_size // 2 else 0.02
-                time.sleep(sleep_time)
+                sleep_time = 5 if buffer_count < self.max_buffer_size // 2 else 20
+                self.msleep(sleep_time)
 
         except Exception as e:
             print(f"VideoPlayer Critical Error ({self.video_path}): {e}")
@@ -97,7 +103,9 @@ class VideoPlayer(QThread):
 
     def stop(self):
         self._running = False
-        self.wait()
+        # Don't block forever
+        if not self.wait(2000):
+            self.terminate()
         if self.cap:
             self.cap.release()
 
@@ -109,6 +117,8 @@ class TrackingThread(QThread):
 
     def stop(self):
         self._running = False
+        if not self.wait(2000):
+            self.terminate()
 
     def run(self):
         main_cap = None
@@ -122,12 +132,20 @@ class TrackingThread(QThread):
                 if self.worker._camera_changed or self.worker.requested_camera_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
-                        # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
-                        main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
-                        if not main_cap.isOpened():
-                            main_cap = cv2.VideoCapture(self.worker.video_source)
 
-                        if main_cap.isOpened():
+                        # ROBUSTNESS: Retry loop for camera initialization
+                        for attempt in range(3):
+                            # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
+                            main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
+                            if not main_cap.isOpened():
+                                main_cap = cv2.VideoCapture(self.worker.video_source)
+
+                            if main_cap.isOpened():
+                                break
+                            print(f"TrackingThread: Camera init attempt {attempt+1} failed. Retrying...")
+                            self.msleep(1000)
+
+                        if main_cap and main_cap.isOpened():
                             # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
@@ -403,6 +421,7 @@ class Worker(QObject):
         # Caching
         self.static_warp_cache = {} # mask_id -> (video_frame_id, warped_frame, mask_img)
         self.video_umat_cache = {}  # (path, frame_id) -> UMat
+        self.u_generator_buffer = None
 
         # Reusable Buffers
         self.projector_buffer = None
@@ -422,6 +441,8 @@ class Worker(QObject):
         self.cached_plasma_grid = None
         self.cached_nebula_grid = None
         self.generator_buffer = None
+        self.gpu_error_count = 0
+        self.max_gpu_errors = 10
         self.blend_temp1 = None
         self.blend_temp2 = None
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -701,19 +722,19 @@ class Worker(QObject):
             return frame
 
         # Performance: skip FX if heavily throttled and not essential
-        if self.throttle_level > 0.9 and not live_only:
+        if self.throttle_level > 0.95 and not live_only:
              return frame
 
         # Performance: Use GPU for FX (Maintain UMat if already on GPU)
         is_umat = isinstance(frame, cv2.UMat)
         u_frame = frame if is_umat else cv2.UMat(frame)
 
-        # Get dimensions (works for both UMat and numpy)
+        # Get dimensions - Minimize .get() calls
         if h is None or w is None:
-            if is_umat:
-                h, w = u_frame.get().shape[:2]
-            else:
-                h, w = frame.shape[:2]
+            # Fallback only if absolutely necessary
+            _gs = u_frame.get().shape
+            h, w = _gs[0], _gs[1]
+
         res_scale = np.sqrt((w * h) / (1280 * 720))
 
         # 1. Transform/Mirror FX (GPU Accelerated)
@@ -816,10 +837,6 @@ class Worker(QObject):
 
         # 3. Static/Heavy FX (GPU Accelerated)
         if not live_only:
-            # Ensure dimensions for following operations
-            h, w = u_frame.get().shape[:2]
-            res_scale = np.sqrt((w * h) / (1280 * 720))
-
             if 'blur' in mask.active_fx:
                 mod = 1.0
                 if 'blur' in self.audio_param_mappings:
@@ -849,8 +866,8 @@ class Worker(QObject):
                 # Performance: cv2.rectangle on UMat is used as fill
                 u_tint = cv2.UMat(h, w, cv2.CV_8UC3)
                 cv2.rectangle(u_tint, (0, 0), (w, h), mask.tint_color, -1)
-                if u_frame.get().shape == u_tint.get().shape:
-                    u_frame = cv2.addWeighted(u_frame, 1.0 - alpha, u_tint, alpha, 0)
+                # Skip .get().shape check for speed, assume h/w are correct
+                u_frame = cv2.addWeighted(u_frame, 1.0 - alpha, u_tint, alpha, 0)
 
             if 'duotone' in mask.active_fx:
                 u_gray = cv2.cvtColor(u_frame, cv2.COLOR_BGR2GRAY)
@@ -925,7 +942,7 @@ class Worker(QObject):
                 # But we can approximate with a scaling
                 u_frame = cv2.convertScaleAbs(u_frame, alpha=0.9)
 
-        return u_frame.get()
+        return u_frame
 
     def get_design_mask(self, design_name, h, w):
         if not hasattr(self, '_design_cache'): self._design_cache = {}
@@ -2204,21 +2221,21 @@ class Worker(QObject):
 
                 # Performer Occlusion Logic
                 if self.occlusion_enabled and not (self._run_sls_flag or self._run_calibration_flag or self._run_boundary_detection_flag):
-                    # Offload background subtraction to GPU by passing UMat
+                    # Offload background subtraction to GPU
                     u_main = cv2.UMat(main_frame)
-                    fg_mask = self.back_subtractor.apply(u_main).get()
-                    # Cleanup mask
+                    u_fg_mask = self.back_subtractor.apply(u_main)
+                    # Cleanup mask on GPU
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-                    fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+                    u_fg_mask = cv2.morphologyEx(u_fg_mask, cv2.MORPH_OPEN, kernel)
+                    u_fg_mask = cv2.dilate(u_fg_mask, kernel, iterations=2)
 
-                    # Exclude the guitar area from occlusion if tracking
+                    # Exclude the guitar area from occlusion if tracking (on GPU)
                     if curr_confidence > 0.5 and tracked_points:
-                        pts = np.array(tracked_points, dtype=np.int32)
-                        cv2.fillPoly(fg_mask, [cv2.convexHull(pts)], 0)
+                        pts = (np.array(tracked_points, dtype=np.float32) * [w_cam, h_cam]).astype(np.int32)
+                        cv2.fillPoly(u_fg_mask, [cv2.convexHull(pts)], 0)
 
                     # Transform occlusion mask to internal render space
-                    self.occlusion_mask = self.warp_full_frame_to_projector(fg_mask, w_cam, h_cam, w, h)
+                    self.occlusion_mask = self.warp_full_frame_to_projector(u_fg_mask, w_cam, h_cam, w, h)
 
                 with QMutexLocker(self.mask_mutex):
                     iterable_masks = [m for m in self.masks] # Snapshot for this frame
@@ -2281,7 +2298,7 @@ class Worker(QObject):
                                         frame_cue_raw = cv2.resize(frame_cue_raw, (w, h), interpolation=cv2.INTER_LINEAR)
 
                                     u_frame_cue = cv2.UMat(frame_cue_raw)
-                                    if len(self.video_umat_cache) > 1000: # Maximize VRAM usage for buttery smooth playback
+                                    if len(self.video_umat_cache) > 2000: # Maximize VRAM usage as requested
                                         self.video_umat_cache.pop(next(iter(self.video_umat_cache)))
                                     self.video_umat_cache[cache_key_umat] = u_frame_cue
 
@@ -2603,7 +2620,12 @@ class Worker(QObject):
                 # 9-point grid warping (piecewise perspective optimization)
                 # Optimized: Already using GPU (u_projector_output)
 
-                if self._warp_is_identity:
+                # BYPASS warping during SLS/Calibration/Boundary to ensure 1:1 pixel mapping
+                is_calib = (self._run_sls_flag or self._run_calibration_flag or
+                            self._run_boundary_detection_flag or self.show_calibration_pattern or
+                            self.show_calibration_verify or self.show_splash)
+
+                if self._warp_is_identity or is_calib:
                     if (w, h) != (w_proj, h_proj):
                         u_warped_output = cv2.resize(u_projector_output, (w_proj, h_proj), interpolation=cv2.INTER_LINEAR)
                     else:
@@ -2625,8 +2647,8 @@ class Worker(QObject):
                 # ignore areas that are bright due to the projector.
                 # stay on GPU for grayscale conversion
                 with QMutexLocker(self.last_projected_frame_mutex):
-                    u_gray_mask = cv2.cvtColor(u_warped_output, cv2.COLOR_BGR2GRAY)
-                    self.last_projected_frame_for_masking = u_gray_mask.get()
+                    # Store as UMat to avoid download/upload cycle between threads
+                    self.last_projected_frame_for_masking = cv2.cvtColor(u_warped_output, cv2.COLOR_BGR2GRAY)
 
                 elapsed = time.time() - start_time
 
@@ -2640,11 +2662,21 @@ class Worker(QObject):
                 QThread.msleep(sleep_time)
             except Exception as e:
                 print(f"Critical Error in Rendering Loop: {e}")
+
+                # GPU Fallback Logic
+                if cv2.ocl.useOpenCL():
+                    self.gpu_error_count += 1
+                    if self.gpu_error_count >= self.max_gpu_errors:
+                        print("CRITICAL: Disabling GPU acceleration due to persistent errors.")
+                        cv2.ocl.setUseOpenCL(False)
+                        self.system_warning.emit("GPU Acceleration Disabled: Fallback to CPU Mode.")
+                        # Clear caches to avoid UMat issues
+                        self.video_umat_cache.clear()
+                        self.static_warp_cache.clear()
+
                 QThread.msleep(500)
 
-        self.tracking_thread.stop()
-        self.tracking_thread.wait()
-        for player in self.video_players.values(): player.stop()
+        self.stop()
 
     def update_particles(self, tracked_points, h, w, w_cam, h_cam):
         if self.particle_preset == 'none':
@@ -2685,16 +2717,21 @@ class Worker(QObject):
             if p['life'] <= 0 or p['x'] < 0 or p['x'] >= w or p['y'] < 0 or p['y'] >= h:
                 self.particles.remove(p)
 
-    def draw_particles(self, frame):
-        if self.particle_preset == 'none': return
-        h, w = frame.shape[:2]
+    def draw_particles(self, u_frame):
+        if self.particle_preset == 'none' or not self.particles: return
+        # Performance: Draw all particles on a CPU buffer then upload once to GPU
+        # This is much faster than 500+ individual OCL kernel calls from Python
+        h, w = self.render_height, self.render_width
+        particle_layer = np.zeros((h, w, 3), dtype=np.uint8)
         res_scale = np.sqrt((w * h) / (1280 * 720))
+
         for p in self.particles:
             color = (0, 255, 0) if self.particle_preset == 'rain' else (255, 255, 200)
-            alpha = int(p['life'] * 255)
             p_size = max(1, int(2 * res_scale))
-            # Use anti-aliasing for smoother particles
-            cv2.circle(frame, (int(p['x']), int(p['y'])), p_size, color, -1, cv2.LINE_AA)
+            cv2.circle(particle_layer, (int(p['x']), int(p['y'])), p_size, color, -1)
+
+        u_particle_layer = cv2.UMat(particle_layer)
+        cv2.add(u_frame, u_particle_layer, dst=u_frame)
 
     def get_vj_generator(self, pattern, h, w):
         # Performance: Render generators at lower resolution if throttled
@@ -2704,221 +2741,139 @@ class Worker(QObject):
         elif self.throttle_level > 0.4:
             w, h = w // 2, h // 2
 
-        if self.generator_buffer is None or self.generator_buffer.shape[:2] != (h, w):
-            self.generator_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+        if self.u_generator_buffer is None or self.u_generator_buffer.get().shape[:2] != (h, w):
+            self.u_generator_buffer = cv2.UMat(h, w, cv2.CV_8UC3)
 
-        self.generator_buffer.fill(0)
-        frame = self.generator_buffer
+        cv2.rectangle(self.u_generator_buffer, (0, 0), (w, h), (0, 0, 0), -1)
+        u_frame = self.u_generator_buffer
 
         t = time.time() * (self.bpm / 60.0)
 
         if pattern == 'grid':
-            # Vectorized Grid using NumPy
+            # Grid remains slightly more efficient in NumPy due to slicing
+            grid = np.zeros((h, w, 3), dtype=np.uint8)
             spacing = 40
             offset_x = int((t * 20) % spacing)
             offset_y = int((t * 15) % spacing)
-
-            # Draw vertical lines
             x_indices = np.arange(offset_x, w, spacing)
-            if len(x_indices) > 0:
-                frame[:, x_indices, 1] = 255 # Green Channel
-
-            # Draw horizontal lines
+            if len(x_indices) > 0: grid[:, x_indices, 1] = 255
             y_indices = np.arange(offset_y, h, spacing)
-            if len(y_indices) > 0:
-                frame[y_indices, :, 1] = 255
+            if len(y_indices) > 0: grid[y_indices, :, 1] = 255
+            u_frame = cv2.UMat(grid)
 
         elif pattern == 'scan':
-            # Vectorized Scan Line
+            scan = np.zeros((h, w, 3), dtype=np.uint8)
             y = int((t * 150) % h)
             thickness = 10
-            y1 = max(0, y - thickness)
-            y2 = min(h, y + thickness)
-            frame[y1:y2, :, :] = 255
+            y1, y2 = max(0, y - thickness), min(h, y + thickness)
+            scan[y1:y2, :, :] = 255
+            u_frame = cv2.UMat(scan)
+
         elif pattern == 'radial':
             center = (w // 2, h // 2)
-            # GPU Optimized: Draw directly on UMat if possible
-            u_frame = cv2.UMat(frame)
             for r in range(int((t * 50) % 100), max(w, h), 100):
                 cv2.circle(u_frame, center, r, (255, 0, 0), 3)
-            frame = u_frame.get()
+
         elif pattern == 'tunnel':
             center = (w // 2, h // 2)
-            u_frame = cv2.UMat(frame)
             for i in range(10):
                 r = int(((t + i * 0.1) % 1.0) * max(w, h))
                 cv2.rectangle(u_frame, (center[0]-r, center[1]-r), (center[0]+r, center[1]+r), (255, 255, 255), 2)
-            frame = u_frame.get()
+
         elif pattern == 'plasma':
-            # Fast plasma-like effect using sine waves
             if self.cached_plasma_grid is None or self.cached_plasma_grid[0].shape != (h, w):
                 x = np.linspace(0, 10, w, dtype=np.float32)
                 y = np.linspace(0, 10, h, dtype=np.float32)
                 self.cached_plasma_grid = np.meshgrid(x, y)
-
             X, Y = self.cached_plasma_grid
             res = np.sin(X + t) + np.sin(Y + t*0.5) + np.sin((X + Y + t)*0.5)
             res = ((res + 3) / 6 * 255).astype(np.uint8)
-            # Offload colormap to GPU
-            u_res = cv2.UMat(res)
-            u_plasma = cv2.applyColorMap(u_res, cv2.COLORMAP_JET)
-            frame = u_plasma.get()
+            u_frame = cv2.applyColorMap(cv2.UMat(res), cv2.COLORMAP_JET)
+
         elif pattern == 'vortex':
             center = (w // 2, h // 2)
-            u_frame = cv2.UMat(frame)
-            # Semi-vectorized: precalculate angles
             angles = np.radians(np.arange(0, 360, 15) + t * 80)
-            cos_a = np.cos(angles)
-            sin_a = np.sin(angles)
+            cos_a, sin_a = np.cos(angles), np.sin(angles)
             max_d = max(w, h)
             for i in range(len(angles)):
-                end_x = int(center[0] + max_d * cos_a[i])
-                end_y = int(center[1] + max_d * sin_a[i])
+                end_x, end_y = int(center[0] + max_d * cos_a[i]), int(center[1] + max_d * sin_a[i])
                 cv2.line(u_frame, center, (end_x, end_y), (255, 255, 0), 2, cv2.LINE_AA)
-            frame = u_frame.get()
-        elif pattern == 'waves':
-            # Vectorized Waves using NumPy
-            x = np.arange(w)
-            y = np.arange(h)
-            X, Y = np.meshgrid(x, y)
 
-            # Simple wave interference
-            wave1 = np.sin(X * 0.05 + t * 2)
-            wave2 = np.sin(Y * 0.04 + t * 1.5)
+        elif pattern == 'waves':
+            x, y = np.arange(w), np.arange(h)
+            X, Y = np.meshgrid(x, y)
+            wave1, wave2 = np.sin(X * 0.05 + t * 2), np.sin(Y * 0.04 + t * 1.5)
             res = ((wave1 + wave2 + 2) / 4 * 255).astype(np.uint8)
-            # Offload colormap to GPU
-            u_res = cv2.UMat(res)
-            u_waves = cv2.applyColorMap(u_res, cv2.COLORMAP_OCEAN)
-            frame = u_waves.get()
+            u_frame = cv2.applyColorMap(cv2.UMat(res), cv2.COLORMAP_OCEAN)
+
         elif pattern == 'polytunnel':
             center = (w // 2, h // 2)
-            u_frame = cv2.UMat(frame)
             for i in range(12):
                 z = (t * 0.5 + i * 0.1) % 1.2
                 if z < 0.1: continue
-                size = int((1.0 / z) * 50)
-                rot = t * 2 + i * 0.5
-                pts = []
-                num_sides = 6
-                for s in range(num_sides):
-                    ang = rot + s * (2 * np.pi / num_sides)
-                    pts.append([center[0] + size * np.cos(ang), center[1] + size * np.sin(ang)])
+                size, rot = int((1.0 / z) * 50), t * 2 + i * 0.5
+                pts = [[int(center[0] + size * np.cos(rot + s * 2 * np.pi / 6)),
+                        int(center[1] + size * np.sin(rot + s * 2 * np.pi / 6))] for s in range(6)]
                 cv2.polylines(u_frame, [np.array(pts, np.int32)], True, (200, 0, 255), 2, cv2.LINE_AA)
-            frame = u_frame.get()
+
         elif pattern == 'stardust':
-            # 3D-like forward motion of polygonal stars
-            u_frame = cv2.UMat(frame)
             for i in range(30):
                 seed = (i * 12345)
                 speed = 0.2 + (seed % 10) / 10.0
                 offset = (t * speed + i * 0.03) % 1.0
                 if offset < 0.01: continue
-                # Project from center
-                size = int(offset * 20)
-                dist = offset * max(w, h) * 0.8
-                ang = (seed % 360) * (np.pi / 180)
-                x = int(w // 2 + dist * np.cos(ang))
-                y = int(h // 2 + dist * np.sin(ang))
-
-                # Small triangle star
-                star_pts = []
-                for s in range(3):
-                    sang = t * 5 + s * (2 * np.pi / 3)
-                    star_pts.append([x + size * np.cos(sang), y + size * np.sin(sang)])
+                size, dist, ang = int(offset * 20), offset * max(w, h) * 0.8, (seed % 360) * (np.pi / 180)
+                x, y = int(w // 2 + dist * np.cos(ang)), int(h // 2 + dist * np.sin(ang))
+                star_pts = [[int(x + size * np.cos(t * 5 + s * 2 * np.pi / 3)),
+                             int(y + size * np.sin(t * 5 + s * 2 * np.pi / 3))] for s in range(3)]
                 cv2.polylines(u_frame, [np.array(star_pts, np.int32)], True, (255, 255, 255), 1, cv2.LINE_AA)
-            frame = u_frame.get()
+
         elif pattern == 'hypergrid':
-            # Perspective moving grid
-            u_frame = cv2.UMat(frame)
-            horizon = h // 2
-            num_lines = 15
+            horizon, num_lines = h // 2, 15
             for i in range(num_lines):
-                # Vertical perspective lines
                 x_start = int(w // 2 + (i - num_lines // 2) * (w // 20))
                 cv2.line(u_frame, (w // 2, horizon), (x_start * 2 - w // 2, h), (100, 0, 200), 1, cv2.LINE_AA)
-
-            # Horizontal moving lines
             for i in range(8):
-                y_off = (t * 50 + i * (h // 8)) % (h // 2)
-                y = horizon + int(y_off)
-                # Map y to width (simulated perspective)
+                y = horizon + int((t * 50 + i * (h // 8)) % (h // 2))
                 scale = (y - horizon) / (h // 2.0)
                 if scale > 0:
                     width = int(w * scale)
                     cv2.line(u_frame, (w // 2 - width // 2, y), (w // 2 + width // 2, y), (150, 0, 255), 1, cv2.LINE_AA)
-            frame = u_frame.get()
+
         elif pattern == 'prism_move':
-            # Floating prisms moving through space
-            u_frame = cv2.UMat(frame)
             for i in range(5):
-                path_t = t * 0.2 + i * 0.4
-                x = int((np.cos(path_t * 3) * 0.4 + 0.5) * w)
-                y = int((np.sin(path_t * 2) * 0.4 + 0.5) * h)
-                z_scale = 0.5 + 0.5 * np.sin(path_t * 5)
-                size = int(30 + 70 * z_scale)
+                pt = t * 0.2 + i * 0.4
+                x, y = int((np.cos(pt * 3) * 0.4 + 0.5) * w), int((np.sin(pt * 2) * 0.4 + 0.5) * h)
+                size = int(30 + 70 * (0.5 + 0.5 * np.sin(pt * 5)))
+                pts_t = [[int(x + size * np.cos(t+i + s * 2 * np.pi / 6)), int(y + size * np.sin(t+i + s * 2 * np.pi / 6))] for s in range(6)]
+                pts_b = [[int(x + (size+20) * np.cos(t+i + s * 2 * np.pi / 6)), int(y + (size+20) * np.sin(t+i + s * 2 * np.pi / 6))] for s in range(6)]
+                cv2.polylines(u_frame, [np.array(pts_t, np.int32)], True, (255, 0, 255), 2, cv2.LINE_AA)
+                cv2.polylines(u_frame, [np.array(pts_b, np.int32)], True, (255, 0, 255), 1, cv2.LINE_AA)
+                for s in range(6): cv2.line(u_frame, tuple(pts_t[s]), tuple(pts_b[s]), (255, 0, 255), 1, cv2.LINE_AA)
 
-                # Draw a hexagonal prism wireframe
-                pts_top = []
-                pts_bot = []
-                num_sides = 6
-                rot = t + i
-                for s in range(num_sides):
-                    ang = rot + s * (2 * np.pi / num_sides)
-                    pts_top.append([x + size * np.cos(ang), y + size * np.sin(ang)])
-                    pts_bot.append([x + (size+20) * np.cos(ang), y + (size+20) * np.sin(ang)])
-
-                color = (255, 0, 255)
-                cv2.polylines(u_frame, [np.array(pts_top, np.int32)], True, color, 2, cv2.LINE_AA)
-                cv2.polylines(u_frame, [np.array(pts_bot, np.int32)], True, color, 1, cv2.LINE_AA)
-                for s in range(num_sides):
-                    cv2.line(u_frame, tuple(np.int32(pts_top[s])), tuple(np.int32(pts_bot[s])), color, 1, cv2.LINE_AA)
-            frame = u_frame.get()
         elif pattern == 'nebula':
-            # Multi-layered noise nebula
             if self.cached_nebula_grid is None or self.cached_nebula_grid[0].shape != (h, w):
-                x = np.linspace(0, 4, w, dtype=np.float32)
-                y = np.linspace(0, 4, h, dtype=np.float32)
+                x, y = np.linspace(0, 4, w, dtype=np.float32), np.linspace(0, 4, h, dtype=np.float32)
                 self.cached_nebula_grid = np.meshgrid(x, y)
-
             X, Y = self.cached_nebula_grid
+            res = np.sin(X + t * 0.2) * np.cos(Y - t * 0.3) + np.sin(X * 2 - t * 0.5) * np.sin(Y * 2 + t * 0.4)
+            res = ((res + 2) / 4 * 255).astype(np.uint8)
+            u_frame = cv2.convertScaleAbs(cv2.applyColorMap(cv2.UMat(res), cv2.COLORMAP_MAGMA), alpha=0.6)
 
-            # Layer 1
-            n1 = np.sin(X + t * 0.2) * np.cos(Y - t * 0.3)
-            # Layer 2 (Faster, smaller)
-            n2 = np.sin(X * 2 - t * 0.5) * np.sin(Y * 2 + t * 0.4)
-
-            res = ((n1 + n2 + 2) / 4 * 255).astype(np.uint8)
-            # Offload colormap to GPU
-            u_res = cv2.UMat(res)
-            u_nebula = cv2.applyColorMap(u_res, cv2.COLORMAP_MAGMA)
-            # Darken for space feel on GPU
-            u_frame = cv2.convertScaleAbs(u_nebula, alpha=0.6)
-            frame = u_frame.get()
         elif pattern == 'blackhole':
             center = (w // 2, h // 2)
-            u_frame = cv2.UMat(frame)
-            # Central event horizon
             cv2.circle(u_frame, center, int(30 + 5 * np.sin(t*5)), (0, 0, 0), -1)
-            # Accretion disk particles
             for i in range(40):
                 angle = (t * 2 + i * (2 * np.pi / 40))
                 dist = (1.5 - ((t * 0.5 + i * 0.05) % 1.0)) * max(w, h) * 0.3 + 40
                 if dist < 40: continue
-
-                # Whirlpool effect
-                x = int(center[0] + dist * np.cos(angle + 100/dist))
-                y = int(center[1] + dist * np.sin(angle + 100/dist))
-
-                color = (200, 100, 255)
-                cv2.circle(u_frame, (x, y), 2, color, -1, cv2.LINE_AA)
-                # Connecting lines for flow
-                nx = int(center[0] + (dist-10) * np.cos(angle + 100/(dist-10)))
-                ny = int(center[1] + (dist-10) * np.sin(angle + 100/(dist-10)))
+                x, y = int(center[0] + dist * np.cos(angle + 100/dist)), int(center[1] + dist * np.sin(angle + 100/dist))
+                cv2.circle(u_frame, (x, y), 2, (200, 100, 255), -1, cv2.LINE_AA)
+                nx, ny = int(center[0] + (dist-10) * np.cos(angle + 100/(dist-10))), int(center[1] + (dist-10) * np.sin(angle + 100/(dist-10)))
                 cv2.line(u_frame, (x, y), (nx, ny), (100, 50, 150), 1, cv2.LINE_AA)
-            frame = u_frame.get()
 
         # Stay on GPU for final resize
-        u_final = cv2.UMat(frame)
+        u_final = u_frame
         if (w, h) != (orig_w, orig_h):
             u_final = cv2.resize(u_final, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
         return u_final
@@ -2926,33 +2881,24 @@ class Worker(QObject):
     def get_generative_frame(self, h, w):
         self.noise_offset += 0.05
         # Create a moving cloud pattern using NumPy for math
-        x = np.linspace(0, 5, w)
-        y = np.linspace(0, 5, h)
+        x = np.linspace(0, 5, w, dtype=np.float32)
+        y = np.linspace(0, 5, h, dtype=np.float32)
         X, Y = np.meshgrid(x, y)
         pattern = np.sin(X + self.noise_offset) * np.cos(Y + self.noise_offset * 0.5)
         pattern = ((pattern + 1) * 127).astype(np.uint8)
-        # Offload colormap to GPU
-        u_pattern = cv2.UMat(pattern)
-        u_colored = cv2.applyColorMap(u_pattern, cv2.COLORMAP_MAGMA)
-        return u_colored
+        # Stay on GPU for colormap
+        return cv2.applyColorMap(cv2.UMat(pattern), cv2.COLORMAP_MAGMA)
 
     def blend_frames(self, base, overlay, mask_img, mode, h=None, w=None):
         # Performance: Use GPU (UMat) for blending
-        is_umat = isinstance(base, cv2.UMat)
-        u_base = base if is_umat else cv2.UMat(base)
+        u_base = base if isinstance(base, cv2.UMat) else cv2.UMat(base)
         u_overlay = overlay if isinstance(overlay, cv2.UMat) else cv2.UMat(overlay)
         u_mask = mask_img if isinstance(mask_img, cv2.UMat) else cv2.UMat(mask_img)
 
-        # ROBUSTNESS: Ensure all images have matching sizes
-        if h is None or w is None:
-            # Only call .get() if dimensions are not provided to minimize sync overhead
-            h, w = u_base.get().shape[:2]
-
-        # Use inexpensive shape comparison on UMat if possible (via metadata if we had it,
-        # but in Python we at least avoid resizing if already correct)
-        if u_overlay.get().shape[:2] != (h, w):
+        # ROBUSTNESS: Explicitly resize to ensure matching sizes without .get()
+        if h is not None and w is not None:
+            # Resize is very fast if sizes already match (no-op on GPU)
             u_overlay = cv2.resize(u_overlay, (w, h))
-        if u_mask.get().shape[:2] != (h, w):
             u_mask = cv2.resize(u_mask, (w, h))
 
         # Optimized integer-based blending on GPU
@@ -2975,9 +2921,9 @@ class Worker(QObject):
             u_inv_mask = cv2.bitwise_not(u_mask)
             u_res = cv2.multiply(u_base, cv2.add(u_temp1, u_inv_mask), scale=1.0/255.0)
         else:
-            return base
+            return u_base
 
-        return u_res if is_umat else u_res.get()
+        return u_res
 
     def normalize_points_to_reference(self, points):
         """Converts points from current frame space to marker-config reference space."""
@@ -2991,7 +2937,20 @@ class Worker(QObject):
                 print(f"Normalization error: {e}")
         return points
 
-    def stop(self): self._running = False
+    def stop(self):
+        """Graceful shutdown of all worker threads and resources."""
+        self._running = False
+        print("Worker: Shutting down tracking thread...")
+        self.tracking_thread.stop()
+
+        print("Worker: Purging all video players...")
+        with QMutexLocker(self.player_mutex):
+            for path in list(self.video_players.keys()):
+                self.video_players[path].stop()
+                del self.video_players[path]
+
+        if self.splash_player:
+            self.splash_player.stop()
 
     def run_boundary_detection(self):
         # We MUST keep resolution consistent across all setup steps
