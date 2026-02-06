@@ -761,7 +761,8 @@ class Worker(QObject):
             else:
                 period = 60.0 / self.bpm
                 if (time.time() % period) < (period / 2.0): trigger = True
-            if trigger: u_frame = cv2.UMat(np.zeros_like(frame))
+            if trigger:
+                u_frame = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
 
         if 'rgb_shift' in mask.active_fx:
             mod = 1.0
@@ -804,7 +805,7 @@ class Worker(QObject):
                     u_frame = cv2.addWeighted(u_frame, 0.4, u_trail, 0.6, 0)
 
             # Store copy on GPU to avoid download/upload
-            u_copy = cv2.UMat(h, w, cv2.CV_8UC3)
+            u_copy = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
             u_frame.copyTo(u_copy)
             self.trail_buffers[mask_id] = (u_copy, h, w)
 
@@ -822,7 +823,7 @@ class Worker(QObject):
                     u_prev_w = cv2.warpAffine(u_prev, M, (w, h))
                     u_frame = cv2.addWeighted(u_frame, 0.7, u_prev_w, 0.3, 0)
 
-            u_copy = cv2.UMat(h, w, cv2.CV_8UC3)
+            u_copy = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
             u_frame.copyTo(u_copy)
             self.trail_buffers[mask_id] = (u_copy, h, w)
 
@@ -864,9 +865,8 @@ class Worker(QObject):
                     mod *= (self.audio_bands[self.audio_param_mappings['tint']] * 3)
                 alpha = 0.3 * mod * (lfo_val if mask.fx_params.get('lfo_target') == 'tint' else 1.0)
                 # Performance: cv2.rectangle on UMat is used as fill
-                u_tint = cv2.UMat(h, w, cv2.CV_8UC3)
+                u_tint = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
                 cv2.rectangle(u_tint, (0, 0), (w, h), mask.tint_color, -1)
-                # Skip .get().shape check for speed, assume h/w are correct
                 u_frame = cv2.addWeighted(u_frame, 1.0 - alpha, u_tint, alpha, 0)
 
             if 'duotone' in mask.active_fx:
@@ -1057,7 +1057,8 @@ class Worker(QObject):
 
         # 1. Projector Interference Masking (Feed-Forward)
         # Identify areas likely hit by bright projector light and suppress them.
-        if self.h_c2p is not None:
+        # BYPASS during still capture to ensure markers aren't accidentally masked
+        if self.h_c2p is not None and not force_full:
             with QMutexLocker(self.last_projected_frame_mutex):
                 if self.last_projected_frame_for_masking is not None:
                     ph, pw = self.last_projected_frame_for_masking.shape[:2]
@@ -1085,8 +1086,13 @@ class Worker(QObject):
         th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_size, th_size))
         u_tophat = cv2.morphologyEx(u_gray, cv2.MORPH_TOPHAT, th_kernel)
 
-        u_gray_boosted = cv2.addWeighted(u_gray, 0.4, u_tophat, 0.6, 0)
-        u_gray_boosted = self.tracking_clahe.apply(u_gray_boosted)
+        # Robust Boosting: Combine original and tophat
+        if force_full:
+            # For still frame, we prefer the raw grayscale with CLAHE for manual selection clarity
+            u_gray_boosted = self.tracking_clahe.apply(u_gray)
+        else:
+            u_gray_boosted = cv2.addWeighted(u_gray, 0.4, u_tophat, 0.6, 0)
+            u_gray_boosted = self.tracking_clahe.apply(u_gray_boosted)
 
         if self.auto_threshold:
             _, u_t_global = cv2.threshold(u_gray_boosted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -1156,7 +1162,9 @@ class Worker(QObject):
                     cY = (cy_px + roi_y) / h
                     candidate = {'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity}
 
-                    if circularity >= min_circ and intensity >= (self.ir_threshold * 0.9):
+                    # Intensity check: more inclusive for still frames/dialogs
+                    intensity_thresh = self.ir_threshold * 0.7 if force_full else self.ir_threshold * 0.9
+                    if circularity >= min_circ and intensity >= intensity_thresh:
                         detected_points_raw.append(candidate)
                     else:
                         rejected_points_raw.append(candidate)
@@ -2457,7 +2465,7 @@ class Worker(QObject):
                                     # Use UMat for resize
                                     u_warped_cue = cv2.resize(u_effective_frame_cue, (w, h))
                                     # Use cv2.rectangle on GPU for fill
-                                    u_mask_img = cv2.UMat(h, w, cv2.CV_8UC3)
+                                    u_mask_img = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
                                     cv2.rectangle(u_mask_img, (0, 0), (w, h), (255, 255, 255), -1)
                                 else:
                                     src_pts_static = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
@@ -2742,7 +2750,7 @@ class Worker(QObject):
             w, h = w // 2, h // 2
 
         if self.u_generator_buffer is None or self.u_generator_buffer.get().shape[:2] != (h, w):
-            self.u_generator_buffer = cv2.UMat(h, w, cv2.CV_8UC3)
+            self.u_generator_buffer = cv2.UMat(np.zeros((h, w, 3), dtype=np.uint8))
 
         cv2.rectangle(self.u_generator_buffer, (0, 0), (w, h), (0, 0, 0), -1)
         u_frame = self.u_generator_buffer
@@ -2800,10 +2808,14 @@ class Worker(QObject):
                 cv2.line(u_frame, center, (end_x, end_y), (255, 255, 0), 2, cv2.LINE_AA)
 
         elif pattern == 'waves':
-            x, y = np.arange(w), np.arange(h)
-            X, Y = np.meshgrid(x, y)
-            wave1, wave2 = np.sin(X * 0.05 + t * 2), np.sin(Y * 0.04 + t * 1.5)
-            res = ((wave1 + wave2 + 2) / 4 * 255).astype(np.uint8)
+            if not hasattr(self, 'cached_waves_grid') or self.cached_waves_grid[0].shape != (h, w):
+                x = np.linspace(0, w, w, dtype=np.float32)
+                y = np.linspace(0, h, h, dtype=np.float32)
+                self.cached_waves_grid = np.meshgrid(x, y)
+            X, Y = self.cached_waves_grid
+            wave1 = np.sin(X * 0.05 + t * 2.0)
+            wave2 = np.sin(Y * 0.04 + t * 1.5)
+            res = ((wave1 + wave2 + 2.0) * 63.75).astype(np.uint8)
             u_frame = cv2.applyColorMap(cv2.UMat(res), cv2.COLORMAP_OCEAN)
 
         elif pattern == 'polytunnel':
@@ -2880,12 +2892,15 @@ class Worker(QObject):
 
     def get_generative_frame(self, h, w):
         self.noise_offset += 0.05
-        # Create a moving cloud pattern using NumPy for math
-        x = np.linspace(0, 5, w, dtype=np.float32)
-        y = np.linspace(0, 5, h, dtype=np.float32)
-        X, Y = np.meshgrid(x, y)
+        # Optimization: Pre-calculate grid
+        if not hasattr(self, 'cached_gen_grid') or self.cached_gen_grid[0].shape != (h, w):
+            x = np.linspace(0, 5, w, dtype=np.float32)
+            y = np.linspace(0, 5, h, dtype=np.float32)
+            self.cached_gen_grid = np.meshgrid(x, y)
+
+        X, Y = self.cached_gen_grid
         pattern = np.sin(X + self.noise_offset) * np.cos(Y + self.noise_offset * 0.5)
-        pattern = ((pattern + 1) * 127).astype(np.uint8)
+        pattern = ((pattern + 1.0) * 127.5).astype(np.uint8)
         # Stay on GPU for colormap
         return cv2.applyColorMap(cv2.UMat(pattern), cv2.COLORMAP_MAGMA)
 
