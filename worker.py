@@ -171,27 +171,26 @@ class TrackingThread(QThread):
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
+                        # Set resolution FIRST
+                        w_req, h_req = self.worker.requested_camera_res
+                        if w_req > 0:
+                            main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
+                            main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
-                        # Disable all auto-adjustments to prevent lag and "hunting"
-                        # Values are backend dependent (1/0.25 usually means manual)
-                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-                        main_cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-                        main_cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-                        main_cap.set(cv2.CAP_PROP_FPS, 60)
-
-                        # Attempt to "lock" current settings by reading and re-setting them
-                        # This can prevent some drivers from reverting to auto mode when the camera moves.
+                        # Disable auto-adjustments AFTER resolution change (drivers often reset them)
                         try:
+                            # Values are backend dependent (1/0.25 usually means manual)
+                            main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                            main_cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                            main_cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+                            main_cap.set(cv2.CAP_PROP_FPS, 60)
+
+                            # Attempt to "lock" current settings
                             curr_exp = main_cap.get(cv2.CAP_PROP_EXPOSURE)
-                            if curr_exp != 0:
-                                main_cap.set(cv2.CAP_PROP_EXPOSURE, curr_exp)
-
+                            if curr_exp != 0: main_cap.set(cv2.CAP_PROP_EXPOSURE, curr_exp)
                             curr_gain = main_cap.get(cv2.CAP_PROP_GAIN)
-                            if curr_gain > 0:
-                                main_cap.set(cv2.CAP_PROP_GAIN, curr_gain)
+                            if curr_gain > 0: main_cap.set(cv2.CAP_PROP_GAIN, curr_gain)
                         except: pass
-
-                        # main_cap.set(cv2.CAP_PROP_GAIN, 0) # Disabled to allow better IR marker visibility
 
                         # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -203,11 +202,9 @@ class TrackingThread(QThread):
                              self.worker.latest_main_frame = None
 
                         # Update requested res to match reality to prevent infinite re-initialization
-                        # if the camera doesn't support the requested resolution.
                         self.worker.requested_camera_res = (act_w, act_h)
-
                         self.worker.camera_matrix = None # Reset estimation
-                        print(f"Camera Resolution Switched to: {act_w}x{act_h}")
+                        print(f"Camera Optimized: {act_w}x{act_h} @ {main_cap.get(cv2.CAP_PROP_FPS)} FPS")
                     else:
                         if self.worker._camera_changed:
                             self.worker.camera_error.emit(self.worker.video_source)
@@ -335,7 +332,7 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
-        self.requested_camera_res = (9999, 9999) # Default to max FOV for stability
+        self.requested_camera_res = (3840, 3840) # Default to max FOV for stability
         self._current_camera_res = (0, 0)
         self.calibration_camera_res = None
         self.baseline_distance = 0
@@ -608,7 +605,7 @@ class Worker(QObject):
 
     def capture_still_frame(self):
         # Set to max FOV for capture
-        self.requested_camera_res = (9999, 9999)
+        self.requested_camera_res = (3840, 3840)
         self._capture_still_frame_flag = True
 
     def calibrate_depth(self):
@@ -2004,23 +2001,33 @@ class Worker(QObject):
                     needs_gen = not self._sls_patterns_x or not self._sls_patterns_y
                     if not needs_gen:
                         # Check if cached patterns match current projector resolution
-                        ph, pw = self._sls_patterns_x[0].shape[:2]
-                        if pw != self.projector_width or ph != self.projector_height:
+                        try:
+                            ph, pw = self._sls_patterns_x[0].shape[:2]
+                            if pw != self.projector_width or ph != self.projector_height:
+                                needs_gen = True
+                        except:
                             needs_gen = True
 
                     if needs_gen:
                         self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
-                    self._sls_step = 0
+
+                    if self._sls_patterns_x:
+                        self.status_update.emit("Room Scan: Ready to capture.")
+                        self._sls_step = 0
+                    else:
+                        self.status_update.emit("Room Scan Error: Pattern generation failed.")
+                        self._run_sls_flag = False
 
                 if self._run_boundary_detection_flag:
                     # Ensure resolution is stable before capturing
                     # Optimization: Compare hardware resolution against requested resolution
                     actual_w, actual_h = self._current_camera_res
-                    if self.requested_camera_res[0] > 5000 or \
+                    if self.requested_camera_res[0] > 3840 or \
                        actual_w != self.requested_camera_res[0] or \
                        actual_h != self.requested_camera_res[1]:
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
+                        QThread.msleep(10)
                         continue
 
                     if self._boundary_step == 0:
@@ -2119,14 +2126,19 @@ class Worker(QObject):
                 elif self._run_sls_flag:
                     # Ensure resolution is stable before capturing
                     actual_w, actual_h = self._current_camera_res
-                    if self.requested_camera_res[0] > 5000 or \
+                    if self.requested_camera_res[0] > 3840 or \
                        actual_w != self.requested_camera_res[0] or \
                        actual_h != self.requested_camera_res[1]:
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
+                        QThread.msleep(10)
                         continue
 
                     # Structured Light Scanning takes priority
+                    if not self._sls_patterns_x:
+                        self._sls_step = -1
+                        continue
+
                     total_x = len(self._sls_patterns_x)
                     total_y = len(self._sls_patterns_y)
 
@@ -2340,9 +2352,10 @@ class Worker(QObject):
                 if self._run_calibration_flag:
                     # Ensure resolution is stable before capturing
                     actual_w, actual_h = self._current_camera_res
-                    if self.requested_camera_res[0] > 5000 or \
+                    if self.requested_camera_res[0] > 3840 or \
                        actual_w != self.requested_camera_res[0] or \
                        actual_h != self.requested_camera_res[1]:
+                        QThread.msleep(10)
                         continue
 
                     if curr_frame_id > self._last_captured_frame_id:
@@ -3235,8 +3248,8 @@ class Worker(QObject):
 
     def run_boundary_detection(self):
         # We MUST keep resolution consistent across all setup steps
-        # Use (9999,9999) as a trigger for max available res in TrackingThread
-        self.requested_camera_res = (9999, 9999)
+        # Use (3840,3840) as a trigger for max available res in TrackingThread
+        self.requested_camera_res = (3840, 3840)
         self._boundary_step = 0
         self._boundary_captures = []
         self._sls_curr_wait = 0
@@ -3252,7 +3265,7 @@ class Worker(QObject):
         # FOV stability is paramount for projection mapping
 
     def run_auto_calibration(self):
-        self.requested_camera_res = (9999, 9999)
+        self.requested_camera_res = (3840, 3840)
         self._run_calibration_flag = True
 
     def run_one_click_sync(self):
@@ -3260,7 +3273,7 @@ class Worker(QObject):
         self.run_room_scan()
 
     def run_room_scan(self):
-        self.requested_camera_res = (9999, 9999) # Request max FOV
+        self.requested_camera_res = (3840, 3840) # Request max FOV
         self._run_sls_flag = True
         self._sls_step = -1 # Trigger pattern generation in worker thread
         self._sls_captures_x = []
@@ -3299,7 +3312,7 @@ class Worker(QObject):
             cal_w, cal_h = self.calibration_camera_res
         else:
             # Fallback if not calibrated: use current res
-            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (9999, 9999)
+            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (3840, 3840)
 
         # Ensure we are using absolute pixels relative to the calibration FOV
         pts_cal = pts_arr * [cal_w, cal_h]
