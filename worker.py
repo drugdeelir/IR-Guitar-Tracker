@@ -175,6 +175,19 @@ class TrackingThread(QThread):
                         # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
                         # Note: behavior is backend dependent. 1/0.25 usually means manual.
                         main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+
+                        # Attempt to "lock" current settings by reading and re-setting them
+                        # This can prevent some drivers from reverting to auto mode when the camera moves.
+                        try:
+                            curr_exp = main_cap.get(cv2.CAP_PROP_EXPOSURE)
+                            if curr_exp != 0:
+                                main_cap.set(cv2.CAP_PROP_EXPOSURE, curr_exp)
+
+                            curr_gain = main_cap.get(cv2.CAP_PROP_GAIN)
+                            if curr_gain > 0:
+                                main_cap.set(cv2.CAP_PROP_GAIN, curr_gain)
+                        except: pass
+
                         # main_cap.set(cv2.CAP_PROP_GAIN, 0) # Disabled to allow better IR marker visibility
 
                         # Read back actual resolution
@@ -213,13 +226,25 @@ class TrackingThread(QThread):
 
                 # REAL-TIME PREVIEW: Update camera frame immediately for UI before slow tracking
                 with QMutexLocker(self.worker.latest_main_frame_mutex):
-                    self.worker.latest_main_frame = main_frame.copy()
+                    # Optimization: Downscale preview if larger than 1080p to save memory bandwidth
+                    if w_cam > 1920:
+                        self.worker.latest_main_frame = cv2.resize(main_frame, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        self.worker.latest_main_frame = main_frame.copy()
                     self.worker.latest_main_frame_id += 1
 
                 # IR Tracking
                 # Optimization: Skip tracking during setup/calibration to save CPU
                 if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
-                    tracked_points = self.worker.get_tracked_points(main_frame)
+                    # Optimization: Downscale tracking frame for performance if very high res (e.g. 4K)
+                    # 1280px is plenty for dot tracking and significantly faster for Tophat morphology
+                    if w_cam > 1280:
+                        tracking_w = 1280
+                        tracking_h = int(1280 * h_cam / w_cam)
+                        tracking_frame = cv2.resize(main_frame, (tracking_w, tracking_h), interpolation=cv2.INTER_LINEAR)
+                        tracked_points = self.worker.get_tracked_points(tracking_frame)
+                    else:
+                        tracked_points = self.worker.get_tracked_points(main_frame)
                 else:
                     tracked_points = []
 
@@ -401,7 +426,7 @@ class Worker(QObject):
         self._sls_patterns_y = []
         self._sls_captures_x = []
         self._sls_captures_y = []
-        self._sls_wait_frames = 12
+        self._sls_wait_frames = 30
         self._sls_curr_wait = 0
 
         # Projector Boundary Detection
