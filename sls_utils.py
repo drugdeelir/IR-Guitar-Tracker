@@ -78,6 +78,8 @@ def decode_gray_code(captures, target_range, threshold=8):
     total_valid = np.ones(base_shape, dtype=bool)
 
     for i, (bit, valid) in enumerate(bits):
+        if bit.shape != base_shape or valid.shape != base_shape:
+            continue
         val = (val << 1) | bit.astype(np.int32)
         total_valid &= valid
 
