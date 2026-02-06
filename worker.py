@@ -513,6 +513,8 @@ class Worker(QObject):
             self.smoothed_points = None
             self.last_homography = None
             self.confidence = 0.0
+            # Pre-seed last_raw_detections with the new config to help first-frame persistence
+            self.last_raw_detections = [(p.x(), p.y()) if hasattr(p, 'x') else (p[0], p[1]) for p in points]
 
             new_config = []
             for p in points:
@@ -1176,12 +1178,13 @@ class Worker(QObject):
 
         # Min circularity: more lenient for still capture, strict for live tracking
         # Lowered to 0.60 to handle perspective distortion on large markers
-        min_circ = 0.40 if force_full else 0.60
+        min_circ = 0.40 if force_full else 0.65 # Increased slightly for live
 
         for contour in contours:
             area = cv2.contourArea(contour)
+            # Increased min_area to 4 to filter out sensor noise/tiny glints
             # Increased max_area to 15000 for high-res 4K+ camera feeds
-            if 1 <= area < 15000:
+            if 4 <= area < 15000:
                 # Calculate circularity
                 peri = cv2.arcLength(contour, True)
                 circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
@@ -1222,7 +1225,14 @@ class Worker(QObject):
 
                     # Intensity check: more inclusive for still frames/dialogs
                     intensity_thresh = self.ir_threshold * 0.7 if force_full else self.ir_threshold * 0.9
-                    if circularity >= min_circ and intensity >= intensity_thresh:
+
+                    # Heuristic: Real IR markers are usually compact.
+                    # If it's very large but not circular, it's probably projector glare.
+                    is_compact = True
+                    if area > 500 and circularity < 0.75:
+                        is_compact = False
+
+                    if circularity >= min_circ and intensity >= intensity_thresh and is_compact:
                         detected_points_raw.append(candidate)
                     else:
                         rejected_points_raw.append(candidate)
@@ -1371,7 +1381,8 @@ class Worker(QObject):
                         m2 = np.mean(combo_fp)
                         if m1 > 0.0001 and m2 > 0.0001:
                             fp_err = np.mean([abs((a/m2) - (b/m1)) for a, b in zip(combo_fp, ref_fp)])
-                            if fp_err > 0.12: continue # Reject combinations with wrong geometry early
+                            # Relaxed from 0.12 to 0.18 for better tolerance on wide setups
+                            if fp_err > 0.18: continue
                         else:
                             continue
 
@@ -1699,9 +1710,12 @@ class Worker(QObject):
             if self.marker_config:
                 self.init_kalman(len(self.marker_config))
 
-        if (self.confidence > 0.1 or self.tracking_freeze_enabled) and self.last_tracked_points is not None:
+        # If we have a lock, return smoothed points.
+        # If searching (low confidence), return raw detected points so they don't "disappear"
+        if self.confidence > 0.5 or (self.tracking_freeze_enabled and self.last_tracked_points is not None):
             return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
+        # When confidence is dropping but not zero, we show raw dots but maybe signal "searching"
         return (detected_points, rejected_points) if return_rejected else detected_points
 
     def _update_warp_maps(self, w_render, h_render, w_proj, h_proj):
@@ -1828,8 +1842,17 @@ class Worker(QObject):
                     target_h = int(h_proj * self.render_scale)
 
                     # Clamp to reasonable limits for performance - Bumped to 4K to utilize more GPU/VRAM
-                    self.render_width = max(640, min(target_w, 3840))
-                    self.render_height = max(360, min(target_h, 2160))
+                    # We MUST preserve aspect ratio during clamping to avoid "squishing"
+                    max_w, max_h = 3840, 2160
+                    if target_w > max_w:
+                        target_h = int(target_h * max_w / target_w)
+                        target_w = max_w
+                    if target_h > max_h:
+                        target_w = int(target_w * max_h / target_h)
+                        target_h = max_h
+
+                    self.render_width = max(640, target_w)
+                    self.render_height = max(360, target_h)
                     w, h = self.render_width, self.render_height
 
                 if self.camera_matrix is None:

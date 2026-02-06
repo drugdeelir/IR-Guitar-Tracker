@@ -278,12 +278,21 @@ class VideoDisplay(QOpenGLWidget):
             painter.drawPixmap(x, y, scaled_pixmap)
 
             # Draw detected IR markers as subtle hints
-            painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
-            painter.setBrush(QBrush(QColor(0, 255, 0, 40)))
+            # We want to know if it's "locked" tracking or just "searching" raw dots
+            # But VideoDisplay doesn't have confidence score. We can estimate based on number of dots.
+            is_locked = (len(self.detected_markers) > 0 and len(self.detected_markers) <= 6) # Heuristic
+
+            dot_color = QColor(0, 255, 0, 80) if is_locked else QColor(255, 255, 0, 80)
+            painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+            painter.setBrush(QBrush(dot_color))
             for marker in self.detected_markers:
                 mx = x + marker[0] * sw
                 my = y + marker[1] * sh
                 painter.drawEllipse(QPointF(mx, my), 8, 8)
+                if not is_locked:
+                    # Draw a small crosshair for "searching" dots
+                    painter.drawLine(int(mx-4), int(my), int(mx+4), int(my))
+                    painter.drawLine(int(mx), int(my-4), int(mx), int(my+4))
 
             # Draw snap preview
             if self.mask_creation_mode and self.snap_to_markers and self.hover_pos:
@@ -510,8 +519,25 @@ class ProjectorWindow(QOpenGLWidget):
         painter.fillRect(self.rect(), Qt.black)
 
         if self.current_pixmap:
-            # Optimization: Smooth transformation for high-res output
-            painter.drawPixmap(self.rect(), self.current_pixmap)
+            # Aspect Ratio Protection: Ensure we don't squish if rendered frame differs from window
+            # For projection mapping, we usually want to fill the screen, but if there's a mismatch
+            # due to clamping, we should center it.
+            pix_w = self.current_pixmap.width()
+            pix_h = self.current_pixmap.height()
+            win_w = self.width()
+            win_h = self.height()
+
+            pix_aspect = pix_w / pix_h
+            win_aspect = win_w / win_h
+
+            if abs(pix_aspect - win_aspect) > 0.01:
+                # If there's a significant aspect ratio mismatch, scale with protection
+                target_rect = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio).rect()
+                target_rect.moveCenter(self.rect().center())
+                painter.drawPixmap(target_rect, self.current_pixmap)
+            else:
+                # 1:1 or very close, just fill
+                painter.drawPixmap(self.rect(), self.current_pixmap)
 
         if self.calibration_mode:
             pen = QPen(Qt.red, 10)

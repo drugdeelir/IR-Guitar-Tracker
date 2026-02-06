@@ -235,12 +235,12 @@ class ProjectionMappingApp(QMainWindow):
         # Live Log at Bottom
         self.log_area = QPlainTextEdit()
         self.log_area.setReadOnly(True)
-        self.log_area.setMaximumHeight(180)
+        self.log_area.setMaximumHeight(120)
         self.log_area.setStyleSheet("""
             background-color: #0d0d0d;
             color: #00e676;
             font-family: 'Consolas', 'Monaco', monospace;
-            font-size: 16px;
+            font-size: 13px;
             border: 1px solid #333;
         """)
         self.main_container.addWidget(self.log_area)
@@ -410,13 +410,13 @@ class ProjectionMappingApp(QMainWindow):
             mask = self.masks[row]
             if mask.visible:
                 self.play_cue_btn.setText("■ STOP CUE")
-                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 10px;")
+                self.play_cue_btn.setStyleSheet("height: 35px; font-weight: bold; background-color: #ff5252; color: white; margin-top: 5px;")
             else:
                 self.play_cue_btn.setText("▶ START CUE")
-                self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+                self.play_cue_btn.setStyleSheet("height: 35px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
         else:
             self.play_cue_btn.setText("▶ START CUE")
-            self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+            self.play_cue_btn.setStyleSheet("height: 35px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
 
     def update_cue_table(self):
         self.cue_table.setRowCount(len(self.masks))
@@ -609,8 +609,8 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_scroll.setWidget(self.setup_tab)
 
         self.setup_layout = QVBoxLayout(self.setup_tab)
-        self.setup_layout.setSpacing(40)
-        self.setup_layout.setContentsMargins(30, 30, 30, 30)
+        self.setup_layout.setSpacing(15)
+        self.setup_layout.setContentsMargins(15, 15, 15, 15)
 
         self.setup_title = QLabel("<h1>Guided Setup</h1>")
         self.setup_desc = QLabel("<h2>Welcome! Let's get your projection mapped. Follow the steps below.</h2>")
@@ -646,8 +646,8 @@ class ProjectionMappingApp(QMainWindow):
 
         # One-Click Sync
         self.sync_btn = QPushButton("ONE-CLICK SYNC (ALIGN & BOUNDS)")
-        self.sync_btn.setMinimumHeight(100)
-        self.sync_btn.setStyleSheet("background-color: #d500f9; color: white; font-weight: bold; font-size: 16px; margin-top: 10px;")
+        self.sync_btn.setMinimumHeight(50)
+        self.sync_btn.setStyleSheet("background-color: #d500f9; color: white; font-weight: bold; font-size: 14px; margin-top: 5px;")
         self.sync_btn.clicked.connect(self.start_one_click_sync)
         self.setup_group_layout.addWidget(self.sync_btn)
 
@@ -677,12 +677,12 @@ class ProjectionMappingApp(QMainWindow):
 
         nav_layout = QHBoxLayout()
         self.setup_back_btn = QPushButton("Previous Step")
-        self.setup_back_btn.setMinimumHeight(80)
+        self.setup_back_btn.setMinimumHeight(40)
         self.setup_back_btn.clicked.connect(self.prev_setup_step)
         self.setup_back_btn.setEnabled(False)
 
         self.setup_next_btn = QPushButton("Next Step")
-        self.setup_next_btn.setMinimumHeight(80)
+        self.setup_next_btn.setMinimumHeight(40)
         self.setup_next_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
         self.setup_next_btn.clicked.connect(self.next_setup_step)
 
@@ -908,7 +908,7 @@ class ProjectionMappingApp(QMainWindow):
             self.setup_group_layout.addWidget(self.verify_align_btn)
 
             self.edit_bg_mask_btn = QPushButton("EDIT BACKGROUND BOUNDARY")
-            self.edit_bg_mask_btn.setMinimumHeight(60)
+            self.edit_bg_mask_btn.setMinimumHeight(40)
             self.edit_bg_mask_btn.setStyleSheet("background-color: #311b92; color: white; font-weight: bold;")
             self.edit_bg_mask_btn.clicked.connect(self.start_setup_bg_mask_dialog)
             self.setup_group_layout.addWidget(self.edit_bg_mask_btn)
@@ -931,13 +931,13 @@ class ProjectionMappingApp(QMainWindow):
 
             marker_btn = QPushButton("CALIBRATE MARKERS")
             marker_btn.clicked.connect(self.open_marker_selection_dialog)
-            marker_btn.setMinimumHeight(60)
+            marker_btn.setMinimumHeight(40)
             marker_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(marker_btn)
 
             self.baseline_btn = QPushButton("SET BASELINE DEPTH (Hold guitar at normal playing distance)")
             self.baseline_btn.clicked.connect(self.worker.calibrate_depth)
-            self.baseline_btn.setMinimumHeight(50)
+            self.baseline_btn.setMinimumHeight(40)
             self.setup_group_layout.addWidget(self.baseline_btn)
 
         elif self.setup_step == 3: # Guitar Mask
@@ -946,7 +946,7 @@ class ProjectionMappingApp(QMainWindow):
 
             mask_btn = QPushButton("DRAW TRACKED GUITAR MASK")
             mask_btn.clicked.connect(self.start_setup_guitar_mask)
-            mask_btn.setMinimumHeight(60)
+            mask_btn.setMinimumHeight(40)
             mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(mask_btn)
 
@@ -961,7 +961,7 @@ class ProjectionMappingApp(QMainWindow):
 
             mask_btn = QPushButton("DRAW STATIONARY AMP MASK")
             mask_btn.clicked.connect(self.start_setup_amp_mask)
-            mask_btn.setMinimumHeight(60)
+            mask_btn.setMinimumHeight(40)
             mask_btn.setStyleSheet("background-color: #00c853; color: black; font-weight: bold;")
             self.setup_group_layout.addWidget(mask_btn)
 
@@ -1136,8 +1136,8 @@ class ProjectionMappingApp(QMainWindow):
         self.workspace_scroll.setWidget(tab)
 
         layout = QVBoxLayout(tab)
-        layout.setSpacing(25)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         # Project controls
         proj_group = QGroupBox("Project")
@@ -1226,18 +1226,18 @@ class ProjectionMappingApp(QMainWindow):
         self.workspace_conf_bar = QProgressBar()
         self.workspace_conf_bar.setRange(0, 100)
         self.workspace_conf_bar.setTextVisible(False)
-        self.workspace_conf_bar.setFixedHeight(10)
+        self.workspace_conf_bar.setFixedHeight(8)
         self.workspace_conf_bar.setStyleSheet("QProgressBar::chunk { background-color: #d500f9; }")
         link_layout.addWidget(self.workspace_conf_bar)
 
         self.workspace_link_mask_combo = QComboBox()
-        self.workspace_link_mask_combo.setMinimumHeight(30)
+        self.workspace_link_mask_combo.setMinimumHeight(28)
         self.workspace_link_mask_combo.currentIndexChanged.connect(self.refresh_link_status_labels)
         link_layout.addWidget(QLabel("Select Mask to Link:"))
         link_layout.addWidget(self.workspace_link_mask_combo)
 
         self.workspace_link_btn = QPushButton("Link Selected Mask to Tracking")
-        self.workspace_link_btn.setStyleSheet("background-color: #311b92; color: white; min-height: 35px;")
+        self.workspace_link_btn.setStyleSheet("background-color: #311b92; color: white; min-height: 30px;")
         self.workspace_link_btn.clicked.connect(self.link_mask_to_markers)
         link_layout.addWidget(self.workspace_link_btn)
 
@@ -1328,7 +1328,7 @@ class ProjectionMappingApp(QMainWindow):
         fx_layout.addWidget(self.occlusion_check)
 
         self.blackout_btn = QPushButton("BLACKOUT (PANIC)")
-        self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
+        self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 35px;")
         self.blackout_btn.clicked.connect(self.toggle_blackout)
         fx_layout.addWidget(self.blackout_btn)
 
@@ -1418,6 +1418,8 @@ class ProjectionMappingApp(QMainWindow):
         self.media_scroll.setWidget(tab)
 
         layout = QHBoxLayout(tab)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         # Left: Media Library
         lib_group = QGroupBox("Media Library")
@@ -1455,17 +1457,17 @@ class ProjectionMappingApp(QMainWindow):
         cue_layout.addWidget(self.cue_table)
 
         assign_btn = QPushButton("Assign Selected Media to Mask Playlist")
-        assign_btn.setStyleSheet("height: 40px; font-weight: bold;")
+        assign_btn.setStyleSheet("height: 30px; font-weight: bold;")
         assign_btn.clicked.connect(self.assign_media_to_mask)
         cue_layout.addWidget(assign_btn)
 
         self.edit_playlist_btn = QPushButton("Edit Playlist Order / Manage Cue")
-        self.edit_playlist_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #311b92;")
+        self.edit_playlist_btn.setStyleSheet("height: 30px; font-weight: bold; background-color: #311b92;")
         self.edit_playlist_btn.clicked.connect(self.open_playlist_editor)
         cue_layout.addWidget(self.edit_playlist_btn)
 
         self.play_cue_btn = QPushButton("▶ START CUE")
-        self.play_cue_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #00c853; color: black; margin-top: 10px;")
+        self.play_cue_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #00c853; color: black; margin-top: 5px;")
         self.play_cue_btn.clicked.connect(self.toggle_selected_cue)
         cue_layout.addWidget(self.play_cue_btn)
 
@@ -1480,7 +1482,7 @@ class ProjectionMappingApp(QMainWindow):
         btn_right = QPushButton("▶ RIGHT")
 
         for b in [btn_up, btn_down, btn_left, btn_right]:
-            b.setStyleSheet("height: 45px; font-weight: bold; background-color: #455a64;")
+            b.setStyleSheet("height: 32px; font-weight: bold; background-color: #455a64;")
 
         btn_up.clicked.connect(lambda: self.nudge_mask("up"))
         btn_down.clicked.connect(lambda: self.nudge_mask("down"))
@@ -1597,8 +1599,8 @@ class ProjectionMappingApp(QMainWindow):
         self.calib_scroll.setWidget(tab)
 
         layout = QVBoxLayout(tab)
-        layout.setSpacing(25)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         self.warp_group = QGroupBox("Projector Warping (3x3 Grid)")
         warp_layout = QVBoxLayout()
@@ -2292,11 +2294,11 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.blackout_active = not self.worker.blackout_active
         if self.worker.blackout_active:
             self.blackout_btn.setText("DISABLE BLACKOUT")
-            self.blackout_btn.setStyleSheet("background-color: #ff5252; color: white; font-weight: bold; height: 40px;")
+            self.blackout_btn.setStyleSheet("background-color: #ff5252; color: white; font-weight: bold; height: 35px;")
             self.statusBar().showMessage("BLACKOUT ENABLED (PANIC)", 0)
         else:
             self.blackout_btn.setText("BLACKOUT (PANIC)")
-            self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 40px;")
+            self.blackout_btn.setStyleSheet("background-color: #aa00ff; color: white; font-weight: bold; height: 35px;")
             self.statusBar().showMessage("BLACKOUT DISABLED", 3000)
 
     def toggle_splash_mode(self, checked):
