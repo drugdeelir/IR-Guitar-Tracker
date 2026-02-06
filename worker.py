@@ -1224,7 +1224,9 @@ class Worker(QObject):
                     candidate = {'pos': (cX, cY), 'intensity': intensity, 'area': area, 'circ': circularity}
 
                     # Intensity check: more inclusive for still frames/dialogs
-                    intensity_thresh = self.ir_threshold * 0.7 if force_full else self.ir_threshold * 0.9
+                    # Unified threshold to 0.8x for both modes to ensure dots seen in capture
+                    # remain visible and trackable in live mode.
+                    intensity_thresh = self.ir_threshold * 0.8
 
                     # Heuristic: Real IR markers are usually compact.
                     # If it's very large but not circular, it's probably projector glare.
@@ -1335,12 +1337,13 @@ class Worker(QObject):
             # If we were tracking, prioritize points near last known location
             if self.confidence > 0.2 and self.last_tracked_points and len(self.last_tracked_points) > 0:
                 center = np.mean(self.last_tracked_points, axis=0)
-                detected_points.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
+                detected_points_all.sort(key=lambda p: np.linalg.norm(np.array(p) - center))
 
             num_markers = len(marker_cfg)
-            # Limit search to top candidates to keep CPU usage low
+            # Use ALL detected candidates for matching, not just persistence-filtered ones.
+            # This allows initial lock acquisition even if persistence hasn't warmed up.
             limit = 15
-            points_to_check = detected_points[:limit]
+            points_to_check = detected_points_all[:limit]
 
             best_match = None
             best_matrix = None
@@ -1491,8 +1494,15 @@ class Worker(QObject):
                                         disp_variance = np.std(displacements, axis=0)
                                         motion_cost = np.sum(disp_variance) * 50.0 # Heavy penalty for non-rigid motion
 
+                                    # Marker Config Bias: if we have no lock, heavily favor dots near the original selection
+                                    # This helps snap the lock immediately after calibration pop-up closes.
+                                    config_bias = 0
+                                    if self.confidence < 0.1 and marker_cfg:
+                                        for i in range(num_markers):
+                                            config_bias += np.linalg.norm(np.array(p[i]) - np.array(marker_cfg[i]))
+
                                     # Increased stickiness weight to prioritize temporal continuity over visual exactness
-                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0) + intensity_cost + motion_cost
+                                    total_cost = err + (fp_err * 6.0) + (stickiness_err * 10.0) + (config_bias * 20.0) + intensity_cost + motion_cost
 
                                     if total_cost < best_overall_error:
                                         best_overall_error = total_cost
@@ -1711,12 +1721,12 @@ class Worker(QObject):
                 self.init_kalman(len(self.marker_config))
 
         # If we have a lock, return smoothed points.
-        # If searching (low confidence), return raw detected points so they don't "disappear"
         if self.confidence > 0.5 or (self.tracking_freeze_enabled and self.last_tracked_points is not None):
             return (self.last_tracked_points, []) if return_rejected else self.last_tracked_points
 
-        # When confidence is dropping but not zero, we show raw dots but maybe signal "searching"
-        return (detected_points, rejected_points) if return_rejected else detected_points
+        # When searching (low confidence), return ALL raw detected candidates so they don't "disappear"
+        # from the UI, even if they aren't part of a lock yet.
+        return (detected_points_all, rejected_points) if return_rejected else detected_points_all
 
     def _update_warp_maps(self, w_render, h_render, w_proj, h_proj):
         if w_render <= 0 or h_render <= 0 or w_proj <= 0 or h_proj <= 0: return
