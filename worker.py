@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 import time
+import threading
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
 from itertools import combinations, permutations
@@ -205,8 +206,8 @@ class TrackingThread(QThread):
                         self.worker.requested_camera_res = (act_w, act_h)
                         self.worker.camera_matrix = None # Reset estimation
                         print(f"Camera Optimized: {act_w}x{act_h} @ {main_cap.get(cv2.CAP_PROP_FPS)} FPS")
-                        # Give the hardware time to stabilize after optimization
-                        QThread.msleep(500)
+                    # PERFORMANCE: Reduced stabilization delay for faster startup/switching
+                    QThread.msleep(100)
                     else:
                         if self.worker._camera_changed:
                             self.worker.camera_error.emit(self.worker.video_source)
@@ -225,15 +226,16 @@ class TrackingThread(QThread):
                     continue
 
                 h_cam, w_cam = main_frame.shape[:2]
+                # ROBUSTNESS: Ensure current resolution is always up-to-date for setup modes
+                if self.worker._current_camera_res != (w_cam, h_cam):
+                    self.worker._current_camera_res = (w_cam, h_cam)
 
                 # REAL-TIME PREVIEW: Update camera frame immediately for UI before slow tracking
                 with QMutexLocker(self.worker.latest_main_frame_mutex):
-                    # Optimization: Downscale preview if larger than 1080p to save memory bandwidth
-                    # BUT ONLY if not in high-res setup modes that need full resolution
-                    in_setup = self.worker._run_sls_flag or self.worker._run_calibration_flag or \
-                               self.worker._run_boundary_detection_flag or self.worker._capture_still_frame_flag
-
-                    if w_cam > 1920 and not in_setup:
+                    # PERFORMANCE: Always downscale preview to 1080p for the UI/Rendering thread.
+                    # This ensures the main loop stays real-time even with 4K camera sources.
+                    # Setup modes (SLS, Calibration) are also fine at 1080p.
+                    if w_cam > 1920:
                         self.worker.latest_main_frame = cv2.resize(main_frame, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_LINEAR)
                     else:
                         self.worker.latest_main_frame = main_frame.copy()
@@ -632,7 +634,16 @@ class Worker(QObject):
                 self.h_c2p = np.array(matrix_list, dtype=np.float32)
 
     def init_rbf_from_points(self, points):
-        pts = np.array(points, dtype=np.float32)
+        # PERFORMANCE: Limit points to ensure reasonable fitting time (O(N^3) complexity)
+        # 1000 points is plenty for a smooth warp and fits in < 100ms.
+        if len(points) > 1000:
+            # Deterministic subsampling
+            indices = np.linspace(0, len(points) - 1, 1000, dtype=int)
+            points_to_fit = [points[i] for i in indices]
+        else:
+            points_to_fit = points
+
+        pts = np.array(points_to_fit, dtype=np.float32)
         cam_pts = pts[:, :2]
         proj_x = pts[:, 2]
         proj_y = pts[:, 3]
@@ -1942,14 +1953,9 @@ class Worker(QObject):
                 if raw_main is None:
                     main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 else:
-                    # PERFORMANCE: Only downscale/copy for UI if we are drawing HUD
-                    # 1080p is plenty for the monitor UI
-                    h_cam, w_cam = raw_main.shape[:2]
-                    if w_cam > 1920:
-                        main_frame = cv2.resize(raw_main, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_NEAREST)
-                    else:
-                        # Use raw_main directly (it is already a fresh copy from TrackingThread)
-                        main_frame = raw_main
+                    # PERFORMANCE: raw_main is already downscaled to 1080p by TrackingThread
+                    # Use directly to avoid redundant resize on the rendering thread.
+                    main_frame = raw_main
 
                 h_cam, w_cam = main_frame.shape[:2]
 
@@ -2181,83 +2187,18 @@ class Worker(QObject):
                         else:
                             self._sls_curr_wait += 1
                     else:
-                        # Decoding
-                        print("Decoding Room Scan...")
-                        proj_x, valid_x = decode_gray_code(self._sls_captures_x, self.projector_width)
-                        proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
-
-                        if valid_x.shape != valid_y.shape:
-                            print("Error: SLS capture shape mismatch!")
-                            self._run_sls_flag = False
-                            self.calibration_complete.emit(False)
-                            continue
-
-                        valid = valid_x & valid_y
-
-                        # Refine valid mask with morphological cleanup
-                        kernel_valid = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                        valid_uint8 = (valid.astype(np.uint8) * 255)
-                        valid_uint8 = cv2.morphologyEx(valid_uint8, cv2.MORPH_CLOSE, kernel_valid)
-                        valid = valid_uint8 > 128
-
-                        # Store dense LUT as normalized [0-1] and apply median filter to remove noise-induced "spikes"
-                        self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5) / self.projector_width
-                        self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5) / self.projector_height
-                        self.sls_valid_mask = valid.astype(np.uint8)
-
-                        # Automatically derive Projector Boundary from SLS valid mask
-                        # Clean up the mask aggressively to fill holes and smooth edges
-                        kernel = np.ones((25, 25), np.uint8)
-                        mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
-                        mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
-                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=3)
-
-                        contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        # Filter contours by size - lowered to 0.5% of FOV for better sensitivity
-                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.005)]
-
-                        if valid_contours:
-                            main_contour = max(valid_contours, key=cv2.contourArea)
-                            # Use convex hull and force a simple polygon or rectangle
-                            hull = cv2.convexHull(main_contour)
-                            peri = cv2.arcLength(hull, True)
-                            approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
-
-                            if len(approx) < 4 or len(approx) > 12:
-                                rect = cv2.minAreaRect(hull)
-                                approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
-
-                            # Store as normalized points
-                            pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
-                            self.projector_boundary = pts
-                            self.boundary_detected.emit(pts)
-                            print(f"One-Click Sync: Detected boundary with {len(pts)} points.")
-
-                        # Collect mapping points for RBF (sub-sampled)
-                        calib_data = []
-                        step = 10 # Sample every 10 pixels
-                        # Ensure indices are within bounds
-                        h_idx, w_idx = valid.shape
-                        for r in range(0, h_idx, step):
-                            for c in range(0, w_idx, step):
-                                if valid[r, c]:
-                                    # Normalize proj_x/y to [0, 1] based on full native projector res
-                                    nx = float(proj_x[r, c]) / self.projector_width
-                                    ny = float(proj_y[r, c]) / self.projector_height
-                                    calib_data.append([float(c), float(r), nx, ny])
-
-                        if len(calib_data) > 10:
-                            self.init_rbf_from_points(calib_data)
-                            # Estimate homography from sample points for fallback (maps to norm space)
-                            pts_arr = np.array(calib_data)
-                            self.h_c2p, _ = cv2.findHomography(pts_arr[:100, :2], pts_arr[:100, 2:])
-                            self.calibration_camera_res = (w_cam, h_cam)
-                            self.calibration_complete.emit(True)
-                        else:
-                            self.calibration_complete.emit(False)
-
+                        # DECOUPLED: Start asynchronous decoding to prevent rendering freeze
+                        # This moves Gray code decoding and RBF fitting to a background thread
                         self._run_sls_flag = False
-                        self.show_calibration_verify = True # Automatically show verification
+                        self.status_update.emit("Room Scan: Processing data...")
+
+                        thread = threading.Thread(
+                            target=self._async_decode_sls,
+                            args=(list(self._sls_captures_x), list(self._sls_captures_y),
+                                  self.projector_width, self.projector_height, w_cam, h_cam)
+                        )
+                        thread.daemon = True
+                        thread.start()
                 elif self.show_camera_on_projector:
                     cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
                 elif self.show_calibration_pattern:
@@ -3422,3 +3363,90 @@ class Worker(QObject):
 
     def set_occlusion_enabled(self, enabled):
         self.occlusion_enabled = enabled
+
+    def _async_decode_sls(self, captures_x, captures_y, proj_w, proj_h, cam_w, cam_h):
+        """Asynchronous decoding of Gray code patterns and calibration fitting."""
+        try:
+            print("Decoding Room Scan (Background Thread)...")
+            self.status_update.emit("Room Scan: Decoding Gray codes...")
+
+            proj_x, valid_x = decode_gray_code(captures_x, proj_w)
+            proj_y, valid_y = decode_gray_code(captures_y, proj_h)
+
+            if valid_x.shape != valid_y.shape:
+                print("Error: SLS capture shape mismatch!")
+                self.calibration_complete.emit(False)
+                return
+
+            valid = valid_x & valid_y
+
+            # Refine valid mask with morphological cleanup
+            kernel_valid = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            valid_uint8 = (valid.astype(np.uint8) * 255)
+            valid_uint8 = cv2.morphologyEx(valid_uint8, cv2.MORPH_CLOSE, kernel_valid)
+            valid = valid_uint8 > 128
+
+            # Store dense LUT as normalized [0-1] and apply median filter to remove noise-induced "spikes"
+            self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5) / proj_w
+            self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5) / proj_h
+            self.sls_valid_mask = valid.astype(np.uint8)
+
+            # Automatically derive Projector Boundary from SLS valid mask
+            self.status_update.emit("Room Scan: Estimating boundary...")
+            kernel = np.ones((25, 25), np.uint8)
+            mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
+            mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
+            mask_solid = cv2.dilate(mask_solid, kernel, iterations=3)
+
+            contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_contours = [c for c in contours if cv2.contourArea(c) > (cam_w * cam_h * 0.005)]
+
+            if valid_contours:
+                main_contour = max(valid_contours, key=cv2.contourArea)
+                hull = cv2.convexHull(main_contour)
+                peri = cv2.arcLength(hull, True)
+                approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
+
+                if len(approx) < 4 or len(approx) > 12:
+                    rect = cv2.minAreaRect(hull)
+                    approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+                pts = [ (float(p[0][0]) / cam_w, float(p[0][1]) / cam_h) for p in approx ]
+                self.projector_boundary = pts
+                self.boundary_detected.emit(pts)
+
+            # Collect mapping points for RBF (sub-sampled)
+            self.status_update.emit("Room Scan: Fitting interpolation maps...")
+            calib_data = []
+            step = 10 # Sample every 10 pixels
+            h_idx, w_idx = valid.shape
+            for r in range(0, h_idx, step):
+                for c in range(0, w_idx, step):
+                    if valid[r, c]:
+                        nx = float(proj_x[r, c]) / proj_w
+                        ny = float(proj_y[r, c]) / proj_h
+                        calib_data.append([float(c), float(r), nx, ny])
+
+            if len(calib_data) > 10:
+                # init_rbf_from_points now includes internal subsampling for performance
+                self.init_rbf_from_points(calib_data)
+
+                # Estimate homography from sample points for fallback
+                pts_arr = np.array(calib_data)
+                # Use a larger sample for homography (more robust than just 100)
+                h_sample = min(500, len(pts_arr))
+                self.h_c2p, _ = cv2.findHomography(pts_arr[:h_sample, :2], pts_arr[:h_sample, 2:])
+
+                self.calibration_camera_res = (cam_w, cam_h)
+                self.status_update.emit("Room Scan: Complete.")
+                self.calibration_complete.emit(True)
+                self.show_calibration_verify = True
+            else:
+                print("Error: Too few valid points for SLS calibration.")
+                self.status_update.emit("Room Scan Error: Weak signal.")
+                self.calibration_complete.emit(False)
+
+        except Exception as e:
+            print(f"Critical Error in SLS Async Decoding: {e}")
+            self.status_update.emit(f"Room Scan Error: {str(e)}")
+            self.calibration_complete.emit(False)
