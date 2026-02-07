@@ -9,7 +9,7 @@ Usage:
 from setuptools import setup
 
 APP = ['main.py']
-DATA_FILES = ['style.qss', 'logo.png']
+DATA_FILES = ['style.qss', 'logo.png', 'HELP_MAINSTAGE.md']
 OPTIONS = {
     'argv_emulation': True,
     'packages': ['cv2', 'numpy', 'PyQt5'],
