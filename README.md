@@ -8,7 +8,7 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 *   **Real-Time IR Tracking:** Tracks up to 4 IR markers simultaneously.
 *   **Dynamic Mask Warping:** Warps a video source to a mask defined by the live positions of the IR trackers.
 *   **Custom Mask Creation:** An interactive mode to draw a custom polygon mask directly on the video feed.
-*   **Cue System:** A list-based system to manage and trigger different video cues.
+*   **Cue System:** A list-based system to manage and switch active video cues or procedural generators (Plasma/Stripes).
 *   **Projector Keystone Correction:** A four-point warping system to align the final output perfectly to any projection surface.
 *   **Depth Estimation:** A system to create a 3D "zoom" effect by scaling the mask based on the distance between trackers.
 *   **Multi-threaded Performance:** A modern architecture that separates video processing from the UI to ensure a responsive and fast experience.
@@ -64,26 +64,29 @@ This project uses `py2app` to create a standalone macOS application. This is the
 ## How to Use
 
 1.  **Startup:** On launch, you'll see a brief splash screen with the logo video, and then the main control window and a black projector output window will appear.
-2.  **Select Devices:**
+2.  **Run Startup Wizard (Recommended):**
+    *   Click **Run Startup Wizard** to auto-select the first camera, assign the projector display, and trigger **Auto Scan Room**.
+    *   If room scan fails, improve scene edge contrast and rerun **Auto Scan Room**.
+3.  **Select Devices Manually (Optional):**
     *   Use the **Camera** dropdown to select your IR camera.
     *   Use the **Projector Display** dropdown to select the screen or projector you want to use for the output. The projector window will automatically move to that screen and go fullscreen.
-3.  **Add a Video Cue:**
+4.  **Add a Cue:**
     *   Click **"Add Video Cue"** and select a video file. It will appear in the "Cues" list.
-4.  **Calibrate IR Tracking:**
+5.  **Calibrate IR Tracking:**
     *   Adjust the **IR Threshold** slider until the application reliably detects your IR markers. The "Trackers detected" label will show you how many points it sees. You should also see red circles drawn over the trackers in the main video display.
-5.  **Create a Mask:**
+6.  **Create a Mask:**
     *   Select the video cue you want to associate the mask with from the list.
     *   Click **"Create Mask"**.
     *   Click on the main video feed to draw the vertices of your custom mask shape.
     *   When you are done, click **"Finish Mask"**. The mask points are now associated with the selected video cue.
-6.  **Link Trackers:**
+7.  **Link Trackers:**
     *   In the "Trackers" input field, enter the four indices of the detected trackers that correspond to the four corners of your mask (e.g., `0,1,2,3`).
     *   Click **"Link Trackers"**.
-7.  **Calibrate Projector:**
+8.  **Calibrate Projector:**
     *   Click **"Enable Warping"**. You will see four red dots on the projector output window.
     *   Drag these dots to the corners of your real-world projection surface to correct for keystone distortion.
     *   Click **"Disable Warping"** when you are done.
-8.  **Calibrate Depth:**
+9.  **Calibrate Depth:**
     *   Position your guitar at a neutral, middle-distance from the camera.
     *   Click **"Calibrate Depth"**. This sets the baseline distance for the 3D effect.
     *   Now, as you move the guitar closer or further away, the mask will scale in size. Use the **Sensitivity** slider to adjust the strength of the effect.

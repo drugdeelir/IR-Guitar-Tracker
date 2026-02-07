@@ -1,17 +1,15 @@
-
 import sys
-import time
 import cv2
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog, QLineEdit, QSlider, QListWidget, QStatusBar
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QGroupBox, QComboBox, QFileDialog, QSlider, QListWidget, QStatusBar
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import QThread, Qt, QTimer
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog
 from worker import Worker
 from mask import Mask
 from splash import SplashScreen
 
+
 def get_available_cameras():
-    """Returns a list of available camera indices."""
     index = 0
     arr = []
     while True:
@@ -22,6 +20,7 @@ def get_available_cameras():
         cap.release()
         index += 1
     return arr
+
 
 class ProjectionMappingApp(QMainWindow):
     def __init__(self):
@@ -41,7 +40,7 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window = ProjectorWindow()
 
         self.create_control_panel()
-        
+
         self.layout.addWidget(self.video_display)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
@@ -55,30 +54,34 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.warp_points_changed.connect(self.worker.set_warp_points)
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.camera_error.connect(self.show_camera_error)
-        self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
+        self.worker.room_scan_ready.connect(self.apply_room_scan)
+        self.worker.status_update.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
+
+        self.marker_selection_dialog = MarkerSelectionDialog(self)
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
 
+        QTimer.singleShot(600, self.run_startup_wizard)
+
     def open_marker_selection_dialog(self):
         self.marker_selection_dialog.clear_selection()
-        # Disconnect any previous connections to avoid multiple calls
         try:
             self.marker_selection_dialog.take_picture_button.clicked.disconnect()
         except TypeError:
-            pass # No connections to disconnect
+            pass
         self.marker_selection_dialog.take_picture_button.clicked.connect(self.start_marker_capture_countdown)
 
-        if self.marker_selection_dialog.exec_(): # This is a blocking call
+        if self.marker_selection_dialog.exec_():
             self.selected_markers = self.marker_selection_dialog.get_selected_points()
-            print(f"Selected {len(self.selected_markers)} markers.")
             self.worker.set_marker_points(self.selected_markers)
+            self.statusBar().showMessage(f"Selected {len(self.selected_markers)} markers.", 3000)
 
     def start_marker_capture_countdown(self):
         self.marker_selection_dialog.take_picture_button.setEnabled(False)
         self.countdown_timer = QTimer(self)
-        self.countdown_seconds = 7
+        self.countdown_seconds = 3
         self.countdown_timer.timeout.connect(self.update_countdown)
         self.countdown_timer.start(1000)
 
@@ -105,7 +108,17 @@ class ProjectionMappingApp(QMainWindow):
         self.control_layout = QVBoxLayout(self.control_panel)
         self.layout.addWidget(self.control_panel)
 
-        # Camera selection
+        wizard_group = QGroupBox("Startup Wizard")
+        wizard_layout = QVBoxLayout()
+        self.run_wizard_button = QPushButton("Run Startup Wizard")
+        self.run_wizard_button.clicked.connect(self.run_startup_wizard)
+        self.scan_room_button = QPushButton("Auto Scan Room")
+        self.scan_room_button.clicked.connect(self.scan_room)
+        wizard_layout.addWidget(self.run_wizard_button)
+        wizard_layout.addWidget(self.scan_room_button)
+        wizard_group.setLayout(wizard_layout)
+        self.control_layout.addWidget(wizard_group)
+
         camera_group = QGroupBox("Camera")
         camera_layout = QVBoxLayout()
         self.camera_combo = QComboBox()
@@ -116,32 +129,36 @@ class ProjectionMappingApp(QMainWindow):
         camera_group.setLayout(camera_layout)
         self.control_layout.addWidget(camera_group)
 
-        # Projector selection
         projector_group = QGroupBox("Projector Display")
         projector_layout = QVBoxLayout()
-        self.projector_combo = QComboBox()
         self.screens = QApplication.screens()
+        self.projector_combo = QComboBox()
         self.projector_combo.addItems([screen.name() or f"Screen {i+1}" for i, screen in enumerate(self.screens)])
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
         projector_layout.addWidget(self.projector_combo)
         projector_group.setLayout(projector_layout)
         self.control_layout.addWidget(projector_group)
 
-        # Cue system
-        cue_group = QGroupBox("Cues")
+        cue_group = QGroupBox("Media Cues")
         cue_layout = QVBoxLayout()
         self.cue_list_widget = QListWidget()
+        self.cue_list_widget.currentRowChanged.connect(self.select_active_cue)
         self.add_cue_button = QPushButton("Add Video Cue")
         self.add_cue_button.clicked.connect(self.add_cue)
+        self.add_plasma_button = QPushButton("Add Plasma Generator")
+        self.add_plasma_button.clicked.connect(lambda: self.add_generator_cue("plasma"))
+        self.add_stripes_button = QPushButton("Add Stripes Generator")
+        self.add_stripes_button.clicked.connect(lambda: self.add_generator_cue("stripes"))
         self.remove_cue_button = QPushButton("Remove Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
         cue_layout.addWidget(self.cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
+        cue_layout.addWidget(self.add_plasma_button)
+        cue_layout.addWidget(self.add_stripes_button)
         cue_layout.addWidget(self.remove_cue_button)
         cue_group.setLayout(cue_layout)
         self.control_layout.addWidget(cue_group)
 
-        # Warping controls
         warping_group = QGroupBox("Projector Warping")
         warping_layout = QVBoxLayout()
         self.enable_warping_button = QPushButton("Enable Warping")
@@ -153,13 +170,12 @@ class ProjectionMappingApp(QMainWindow):
         warping_layout.addWidget(self.reset_warping_button)
         warping_group.setLayout(warping_layout)
         self.control_layout.addWidget(warping_group)
-        
-        # IR Tracking controls
+
         ir_group = QGroupBox("IR Tracking")
         ir_layout = QVBoxLayout()
         self.ir_threshold_slider = QSlider(Qt.Horizontal)
         self.ir_threshold_slider.setRange(0, 255)
-        self.ir_threshold_slider.setValue(200)
+        self.ir_threshold_slider.setValue(210)
         self.ir_threshold_slider.valueChanged.connect(self.update_ir_threshold)
         self.ir_trackers_label = QLabel("Trackers detected: 0")
         ir_layout.addWidget(QLabel("IR Threshold:"))
@@ -168,17 +184,14 @@ class ProjectionMappingApp(QMainWindow):
 
         self.select_markers_button = QPushButton("Select Guitar Markers")
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
-
         self.clear_markers_button = QPushButton("Clear Marker Selection")
         self.clear_markers_button.clicked.connect(self.clear_marker_selection)
-
         ir_layout.addWidget(self.select_markers_button)
         ir_layout.addWidget(self.clear_markers_button)
 
         ir_group.setLayout(ir_layout)
         self.control_layout.addWidget(ir_group)
 
-        # Mask creation
         mask_group = QGroupBox("Mask Creation")
         mask_layout = QVBoxLayout()
         self.create_mask_button = QPushButton("Create Mask")
@@ -203,13 +216,12 @@ class ProjectionMappingApp(QMainWindow):
         mask_group.setLayout(mask_layout)
         self.control_layout.addWidget(mask_group)
 
-        # Depth Estimation
         depth_group = QGroupBox("Depth Estimation")
         depth_layout = QVBoxLayout()
         self.calibrate_depth_button = QPushButton("Calibrate Depth")
         self.calibrate_depth_button.clicked.connect(self.calibrate_depth)
         self.depth_sensitivity_slider = QSlider(Qt.Horizontal)
-        self.depth_sensitivity_slider.setRange(0, 200) # 0-200%
+        self.depth_sensitivity_slider.setRange(0, 200)
         self.depth_sensitivity_slider.setValue(100)
         self.depth_sensitivity_slider.valueChanged.connect(self.update_depth_sensitivity)
         self.depth_calibration_label = QLabel("Not calibrated")
@@ -222,6 +234,28 @@ class ProjectionMappingApp(QMainWindow):
 
         self.control_layout.addStretch()
 
+    def run_startup_wizard(self):
+        if self.available_cameras:
+            self.camera_combo.setCurrentIndex(0)
+            self.worker.set_video_source(self.available_cameras[0])
+        if len(self.screens) > 1:
+            self.projector_combo.setCurrentIndex(1)
+            self.change_projector(1)
+        else:
+            self.projector_combo.setCurrentIndex(0)
+            self.change_projector(0)
+        self.scan_room()
+        self.statusBar().showMessage("Startup wizard complete. Continue with marker selection.", 5000)
+
+    def scan_room(self):
+        self.worker.scan_room()
+        self.statusBar().showMessage("Scanning room...", 3000)
+
+    def apply_room_scan(self, points):
+        self.projector_window.set_warp_points(points)
+        self.worker.set_warp_points(points)
+        self.statusBar().showMessage("Room scan points applied.", 4000)
+
     def calibrate_depth(self):
         self.worker.calibrate_depth()
         self.depth_calibration_label.setText("Calibrated!")
@@ -230,7 +264,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.set_depth_sensitivity(value / 100.0)
 
     def show_camera_error(self, index):
-        self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000) # 5 seconds
+        self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
 
     def enter_mask_creation_mode(self):
         self.video_display.set_mask_creation_mode(True)
@@ -241,14 +275,13 @@ class ProjectionMappingApp(QMainWindow):
     def finish_mask_creation(self):
         self.video_display.set_mask_creation_mode(False)
         mask_points = self.video_display.get_mask_points()
-        
+
         current_item = self.cue_list_widget.currentItem()
         if current_item and mask_points:
             row = self.cue_list_widget.row(current_item)
             if 0 <= row < len(self.masks):
-                self.masks[row].source_points = [ (p.x(), p.y()) for p in mask_points]
+                self.masks[row].source_points = [(p.x(), p.y()) for p in mask_points]
                 self.worker.set_masks(self.masks)
-                print(f"Mask created for {self.masks[row].name} with {len(mask_points)} points.")
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
@@ -281,12 +314,13 @@ class ProjectionMappingApp(QMainWindow):
         if 0 <= row < len(self.masks):
             mask = self.masks[row]
             if len(mask.source_points) != len(self.selected_markers):
-                self.statusBar().showMessage(f"Error: Mask has {len(mask.source_points)} points, but {len(self.selected_markers)} markers are selected.", 5000)
+                self.statusBar().showMessage(
+                    f"Error: Mask has {len(mask.source_points)} points, but {len(self.selected_markers)} markers are selected.",
+                    5000,
+                )
             else:
-                # The association is now implicit. The worker will use the currently
-                # selected markers for any mask that has the correct number of vertices.
-                # We can add a property to the mask to make this explicit.
                 mask.linked_marker_count = len(self.selected_markers)
+                self.worker.set_masks(self.masks)
                 self.statusBar().showMessage(f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000)
 
     def update_ir_threshold(self, value):
@@ -297,29 +331,32 @@ class ProjectionMappingApp(QMainWindow):
 
     def toggle_warping(self, checked):
         self.projector_window.set_calibration_mode(checked)
-        if checked:
-            self.enable_warping_button.setText("Disable Warping")
-        else:
-            self.enable_warping_button.setText("Enable Warping")
+        self.enable_warping_button.setText("Disable Warping" if checked else "Enable Warping")
 
     def add_cue(self):
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
         if video_path:
             mask_name = f"Cue {len(self.masks) + 1}: {video_path.split('/')[-1]}"
-            # Placeholder for mask points
-            new_mask = Mask(mask_name, [], video_path)
+            new_mask = Mask(mask_name, [], video_path=video_path, cue_type='video')
             self.masks.append(new_mask)
             self.cue_list_widget.addItem(mask_name)
             self.worker.set_masks(self.masks)
+            self.cue_list_widget.setCurrentRow(len(self.masks) - 1)
+
+    def add_generator_cue(self, generator_type):
+        mask_name = f"Cue {len(self.masks) + 1}: {generator_type.title()} Generator"
+        new_mask = Mask(mask_name, [], cue_type='generator', generator_type=generator_type)
+        self.masks.append(new_mask)
+        self.cue_list_widget.addItem(mask_name)
+        self.worker.set_masks(self.masks)
+        self.cue_list_widget.setCurrentRow(len(self.masks) - 1)
+
+    def select_active_cue(self, row):
+        self.worker.set_active_cue(row)
 
     def change_camera(self, index):
         if self.available_cameras:
-            new_camera_index = self.available_cameras[index]
-            self.worker.set_video_source(new_camera_index)
-            # You might need to restart the worker thread for the change to take effect
-            # self.thread.quit()
-            # self.thread.wait()
-            # self.thread.start()
+            self.worker.set_video_source(self.available_cameras[index])
 
     def change_projector(self, index):
         if index < len(self.screens):
@@ -334,6 +371,7 @@ class ProjectionMappingApp(QMainWindow):
             self.cue_list_widget.takeItem(row)
             del self.masks[row]
             self.worker.set_masks(self.masks)
+            self.worker.set_active_cue(self.cue_list_widget.currentRow())
 
     def closeEvent(self, event):
         self.worker.stop()
@@ -344,14 +382,11 @@ class ProjectionMappingApp(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    
+
     splash = SplashScreen()
     splash.show()
-    
-    # Process events to show splash screen
     app.processEvents()
 
-    # Load and apply stylesheet
     try:
         with open('style.qss', 'r') as f:
             style = f.read()
@@ -360,7 +395,7 @@ if __name__ == '__main__':
         print("Stylesheet not found. Using default style.")
 
     main_win = ProjectionMappingApp()
-    
+
     main_win.show()
     splash.finish(main_win)
     sys.exit(app.exec_())
