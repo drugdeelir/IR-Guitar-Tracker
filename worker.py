@@ -115,7 +115,7 @@ class VideoPlayer(QThread):
             if self.cap:
                 self.cap.release()
 
-class TrackingThread(QThread):
+class CameraThread(QThread):
     def __init__(self, worker):
         super().__init__()
         self.setPriority(QThread.HighestPriority)
@@ -131,86 +131,60 @@ class TrackingThread(QThread):
         main_cap = None
         target_fps = 60
         frame_time = 1.0 / target_fps
-        last_attempted_res = None
 
         while self._running:
             try:
                 start_time = time.time()
 
                 req_res = self.worker.requested_camera_res
-                # Only attempt resolution change if requested resolution is different from current AND wasn't just attempted.
-                # Also always allow change if the camera device itself changed.
-                if self.worker._camera_changed or (req_res != self.worker._current_camera_res and req_res != last_attempted_res):
-                    last_attempted_res = req_res
+                # PERFORMANCE: Only attempt resolution change if requested resolution is different from current.
+                if self.worker._camera_changed or req_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
 
                         # ROBUSTNESS: Retry loop for camera initialization
                         for attempt in range(3):
-                            # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
                             main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
                             if not main_cap.isOpened():
                                 main_cap = cv2.VideoCapture(self.worker.video_source)
 
                             if main_cap.isOpened():
                                 break
-                            print(f"TrackingThread: Camera init attempt {attempt+1} failed. Retrying...")
+                            print(f"CameraThread: init attempt {attempt+1} failed. Retrying...")
                             self.msleep(1000)
 
                         if main_cap and main_cap.isOpened():
-                            # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-
                             w_req, h_req = self.worker.requested_camera_res
                             main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                             main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
-
-                            # Buffering: Minimize latency
                             main_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                             main_cap.set(cv2.CAP_PROP_FPS, 60)
 
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
-                        # Set resolution FIRST
                         w_req, h_req = self.worker.requested_camera_res
                         if w_req > 0:
                             main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                             main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
-                        # Disable auto-adjustments AFTER resolution change (drivers often reset them)
                         try:
-                            # Values are backend dependent (1/0.25 usually means manual)
                             main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
                             main_cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
                             main_cap.set(cv2.CAP_PROP_AUTO_WB, 0)
                             main_cap.set(cv2.CAP_PROP_FPS, 60)
-
-                            # Attempt to "lock" current settings
                             curr_exp = main_cap.get(cv2.CAP_PROP_EXPOSURE)
                             if curr_exp != 0: main_cap.set(cv2.CAP_PROP_EXPOSURE, curr_exp)
-                            curr_gain = main_cap.get(cv2.CAP_PROP_GAIN)
-                            if curr_gain > 0: main_cap.set(cv2.CAP_PROP_GAIN, curr_gain)
                         except: pass
 
-                        # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         self.worker._current_camera_res = (act_w, act_h)
-
-                        # Clear frame buffer to avoid resolution mismatch
-                        with QMutexLocker(self.worker.latest_main_frame_mutex):
-                             self.worker.latest_main_frame = None
-
-                        # Update requested res to match reality to prevent infinite re-initialization
                         self.worker.requested_camera_res = (act_w, act_h)
-                        self.worker.camera_matrix = None # Reset estimation
-                        print(f"Camera Optimized: {act_w}x{act_h} @ {main_cap.get(cv2.CAP_PROP_FPS)} FPS")
-                        # PERFORMANCE: Reduced stabilization delay for faster startup/switching
+                        print(f"Camera Optimized: {act_w}x{act_h}")
                         QThread.msleep(100)
                     else:
-                        if self.worker._camera_changed:
-                            self.worker.camera_error.emit(self.worker.video_source)
                         main_cap = None
 
                 if main_cap is None:
@@ -226,33 +200,76 @@ class TrackingThread(QThread):
                     continue
 
                 h_cam, w_cam = main_frame.shape[:2]
-                # ROBUSTNESS: Ensure current resolution is always up-to-date for setup modes
                 if self.worker._current_camera_res != (w_cam, h_cam):
                     self.worker._current_camera_res = (w_cam, h_cam)
 
-                # REAL-TIME PREVIEW: Update camera frame immediately for UI before slow tracking
+                # DECOUPLED PREVIEW: Update frames for tracking and UI immediately
+                with QMutexLocker(self.worker.latest_raw_frame_mutex):
+                    self.worker.latest_raw_frame = main_frame.copy()
+                    self.worker.latest_raw_frame_id += 1
+
                 with QMutexLocker(self.worker.latest_main_frame_mutex):
-                    # PERFORMANCE: Always downscale preview to 1080p for the UI/Rendering thread.
-                    # This ensures the main loop stays real-time even with 4K camera sources.
-                    # Setup modes (SLS, Calibration) are also fine at 1080p.
                     if w_cam > 1920:
                         self.worker.latest_main_frame = cv2.resize(main_frame, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_LINEAR)
                     else:
                         self.worker.latest_main_frame = main_frame.copy()
                     self.worker.latest_main_frame_id += 1
 
-                # IR Tracking
-                # Optimization: Skip tracking during setup/calibration to save CPU
+                elapsed = time.time() - start_time
+                sleep_time = max(1, int((frame_time - elapsed) * 1000))
+                QThread.msleep(sleep_time)
+            except Exception as e:
+                print(f"Error in Camera Thread: {e}")
+                QThread.msleep(500)
+
+        if main_cap:
+            main_cap.release()
+
+class TrackingThread(QThread):
+    def __init__(self, worker):
+        super().__init__()
+        self.setPriority(QThread.HighPriority)
+        self.worker = worker
+        self._running = True
+        self._last_processed_id = -1
+
+    def stop(self):
+        self._running = False
+        if not self.wait(2000):
+            self.terminate()
+
+    def run(self):
+        target_fps = 60
+        frame_time = 1.0 / target_fps
+
+        while self._running:
+            try:
+                start_time = time.time()
+
+                raw_frame = None
+                frame_id = -1
+
+                with QMutexLocker(self.worker.latest_raw_frame_mutex):
+                    if self.worker.latest_raw_frame is not None and self.worker.latest_raw_frame_id > self._last_processed_id:
+                        raw_frame = self.worker.latest_raw_frame.copy() # Copy to avoid modification issues
+                        frame_id = self.worker.latest_raw_frame_id
+                        self._last_processed_id = frame_id
+
+                if raw_frame is None:
+                    QThread.msleep(5)
+                    continue
+
+                h_cam, w_cam = raw_frame.shape[:2]
+
+                # IR Tracking logic
                 if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
-                    # Optimization: Downscale tracking frame for performance if very high res (e.g. 4K)
-                    # 1280px is plenty for dot tracking and significantly faster for Tophat morphology
                     if w_cam > 1280:
                         tracking_w = 1280
                         tracking_h = int(1280 * h_cam / w_cam)
-                        tracking_frame = cv2.resize(main_frame, (tracking_w, tracking_h), interpolation=cv2.INTER_LINEAR)
+                        tracking_frame = cv2.resize(raw_frame, (tracking_w, tracking_h), interpolation=cv2.INTER_LINEAR)
                         tracked_points = self.worker.get_tracked_points(tracking_frame)
                     else:
-                        tracked_points = self.worker.get_tracked_points(main_frame)
+                        tracked_points = self.worker.get_tracked_points(raw_frame)
                 else:
                     tracked_points = []
 
@@ -261,6 +278,7 @@ class TrackingThread(QThread):
                     self.worker.last_homography_internal = self.worker.last_homography
                     self.worker.confidence_internal = self.worker.confidence
                     self.worker.tracking_frame_count += 1
+                    self.worker.latest_tracked_points_for_ui = tracked_points
 
                 if tracked_points is None: tracked_points = []
                 self.worker.trackers_detected.emit(len(tracked_points))
@@ -271,22 +289,13 @@ class TrackingThread(QThread):
                     if self.worker._calibrate_depth_flag and current_dist > 0.001:
                         self.worker.baseline_distance = current_dist
                         self.worker._calibrate_depth_flag = False
-
                     if self.worker.baseline_distance > 0.001:
                         self.worker.proximity_val = current_dist / self.worker.baseline_distance
-                    else:
-                        self.worker.proximity_val = 1.0
 
-                # HUD Data preparation (tracking result update)
-                with QMutexLocker(self.worker.latest_main_frame_mutex):
-                    self.worker.latest_tracked_points_for_ui = tracked_points
-
-                # Handle Calibration Flags (some need to run in camera thread)
+                # Still Frame Capture
                 if self.worker._capture_still_frame_flag:
-                    # Capture immediately to avoid "Waiting for Camera" hang
-                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                    # Perform specialized high-res detection for the still frame
-                    still_dots, rejected_dots = self.worker.get_tracked_points(main_frame, force_full=True, return_rejected=True)
+                    rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+                    still_dots, rejected_dots = self.worker.get_tracked_points(raw_frame, force_full=True, return_rejected=True)
                     self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots, rejected_dots)
                     self.worker._capture_still_frame_flag = False
 
@@ -294,11 +303,8 @@ class TrackingThread(QThread):
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
                 QThread.msleep(sleep_time)
             except Exception as e:
-                print(f"Critical Error in Tracking Thread: {e}")
-                QThread.msleep(500)
-
-        if main_cap:
-            main_cap.release()
+                print(f"Error in Tracking Thread: {e}")
+                QThread.msleep(100)
 
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
@@ -488,6 +494,9 @@ class Worker(QObject):
         self.latest_main_frame = None
         self.latest_main_frame_mutex = QMutex()
         self.latest_main_frame_id = 0
+        self.latest_raw_frame = None
+        self.latest_raw_frame_mutex = QMutex()
+        self.latest_raw_frame_id = 0
         self.last_projected_frame_for_masking = None
         self.last_projected_frame_mutex = QMutex()
         self._last_captured_frame_id = -1
@@ -521,7 +530,9 @@ class Worker(QObject):
         except Exception as e:
             print(f"[DEBUG] Failed to init GPU acceleration: {e}")
 
-        # Start Tracking Thread
+        # Start Threads
+        self.camera_thread = CameraThread(self)
+        self.camera_thread.start()
         self.tracking_thread = TrackingThread(self)
         self.tracking_thread.start()
 
@@ -806,7 +817,7 @@ class Worker(QObject):
 
         # Performance: skip FX if heavily throttled and not essential
         if self.throttle_level > 0.95 and not live_only:
-             return frame
+            return frame
 
         # Performance: Use GPU for FX (Maintain UMat if already on GPU)
         is_umat = isinstance(frame, cv2.UMat)
@@ -1128,7 +1139,8 @@ class Worker(QObject):
                 new_feats = cv2.goodFeaturesToTrack(gray_frame, mask=fg, maxCorners=30, qualityLevel=0.01, minDistance=10)
                 if new_feats is not None:
                     self.visual_features = new_feats
-            except: pass
+            except:
+                pass
 
         return None, 0
 
@@ -1171,7 +1183,7 @@ class Worker(QObject):
                 self.prev_gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             if res is None:
-                 return ([], []) if return_rejected else []
+                return ([], []) if return_rejected else []
             return res
         except Exception as e:
             print(f"Error in tracking logic: {e}")
@@ -1534,7 +1546,9 @@ class Worker(QObject):
                                 else:
                                     m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
                                     if m is not None:
-                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                                        h = np.eye(3, dtype=np.float32)
+                                        h[:2, :] = m
+                                        m = h
 
                                 if m is not None:
                                     proj = cv2.perspectiveTransform(src_pts, m)
@@ -1554,7 +1568,9 @@ class Worker(QObject):
                                 else:
                                     m, _ = cv2.estimateAffinePartial2D(src_pts, p_arr)
                                     if m is not None:
-                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                                        h = np.eye(3, dtype=np.float32)
+                                        h[:2, :] = m
+                                        m = h
 
                                 if m is not None:
                                     # Calculate reprojection error
@@ -1660,7 +1676,9 @@ class Worker(QObject):
                                 else:
                                     m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
                                     if m is not None:
-                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                                        h = np.eye(3, dtype=np.float32)
+                                        h[:2, :] = m
+                                        m = h
 
                                 if m is not None:
                                     proj = cv2.perspectiveTransform(src_pts, m)
@@ -1799,7 +1817,9 @@ class Worker(QObject):
                 else:
                     m, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
                     if m is not None:
-                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                        h = np.eye(3, dtype=np.float32)
+                        h[:2, :] = m
+                        m = h
 
                 if m is not None:
                     self.last_homography = m
@@ -1945,16 +1965,15 @@ class Worker(QObject):
                     self.tracking_fps = t_fps
 
                 # 2. Get Main Frame (Optimized: No deep copy unless HUD is shown)
+                # REAL-TIME PREVIEW: Pull the latest frame immediately from CameraThread
                 with QMutexLocker(self.latest_main_frame_mutex):
-                    raw_main = self.latest_main_frame
-                    ui_tracked_points = self.latest_tracked_points_for_ui
+                    raw_main = self.latest_main_frame.copy() if self.latest_main_frame is not None else None
+                    ui_tracked_points = list(self.latest_tracked_points_for_ui)
                     curr_frame_id = self.latest_main_frame_id
 
                 if raw_main is None:
                     main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 else:
-                    # PERFORMANCE: raw_main is already downscaled to 1080p by TrackingThread
-                    # Use directly to avoid redundant resize on the rendering thread.
                     main_frame = raw_main
 
                 h_cam, w_cam = main_frame.shape[:2]
@@ -2005,6 +2024,7 @@ class Worker(QObject):
 
                 if self._run_sls_flag and self._sls_step == -1:
                     # Generate patterns if not already cached or if resolution changed
+                    print(f"Room Scan: Initiating pattern generation for {self.projector_width}x{self.projector_height}")
                     self.status_update.emit("Room Scan: Preparing patterns...")
                     needs_gen = not self._sls_patterns_x or not self._sls_patterns_y
                     if not needs_gen:
@@ -2020,9 +2040,12 @@ class Worker(QObject):
                         self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
 
                     if self._sls_patterns_x:
+                        print(f"Room Scan: Patterns ready. Total X: {len(self._sls_patterns_x)}, Total Y: {len(self._sls_patterns_y)}")
                         self.status_update.emit("Room Scan: Ready to capture.")
                         self._sls_step = 0
+                        self._sls_curr_wait = 0
                     else:
+                        print("Room Scan Error: Pattern generation failed.")
                         self.status_update.emit("Room Scan Error: Pattern generation failed.")
                         self._run_sls_flag = False
 
@@ -2140,10 +2163,11 @@ class Worker(QObject):
 
                     # Ensure resolution is stable before capturing
                     actual_w, actual_h = self._current_camera_res
-                    if self.requested_camera_res[0] > 3840 or \
-                       actual_w != self.requested_camera_res[0] or \
+                    if actual_w != self.requested_camera_res[0] or \
                        actual_h != self.requested_camera_res[1]:
-                        # Still waiting for camera thread to catch up
+                        # Still waiting for camera thread to catch up or resolution to settle
+                        if self.frame_count % 30 == 0:
+                            print(f"Room Scan: Waiting for resolution stability... Current: {actual_w}x{actual_h}, Requested: {self.requested_camera_res}")
                         self._sls_curr_wait = 0
                         QThread.msleep(10)
                         continue
@@ -2448,6 +2472,10 @@ class Worker(QObject):
 
                 for mask in iterable_masks:
                     mask_id = id(mask)
+                    lfo_val = 1.0
+                    if mask.fx_params.get('lfo_enabled'):
+                        lfo_val = self.get_lfo_value(mask)
+
                     target_fade = 1.0 if mask.visible else 0.0
                     curr_fade = self.mask_fade_levels.get(mask_id, 0.0)
 
@@ -2866,7 +2894,7 @@ class Worker(QObject):
                     self.throttle_level = max(0.0, self.throttle_level - 0.01)
                     # Slowly recover resolution if performance is good
                     if self.throttle_level < 0.1 and self.render_scale < 0.85:
-                         self.render_scale = min(0.85, self.render_scale + 0.005)
+                        self.render_scale = min(0.85, self.render_scale + 0.005)
 
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
                 QThread.msleep(sleep_time)
@@ -3178,7 +3206,8 @@ class Worker(QObject):
     def stop(self):
         """Graceful shutdown of all worker threads and resources."""
         self._running = False
-        print("Worker: Shutting down tracking thread...")
+        print("Worker: Shutting down threads...")
+        self.camera_thread.stop()
         self.tracking_thread.stop()
 
         print("Worker: Purging all video players...")
