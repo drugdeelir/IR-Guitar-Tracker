@@ -10,6 +10,7 @@ class Mask:
         self.linked_marker_count = 0
         self.tag = tag # e.g., 'amp', 'background'
         self.visible = True
+        self.opacity = 1.0 # 0.0 to 1.0
         self.is_linked = False
         self.active_fx = [] # 'strobe', 'blur', 'invert', 'edges', 'tint', 'kaleidoscope', 'mirror_h', 'mirror_v', 'rgb_shift', 'glitch', 'trails', 'hue_cycle', 'feedback'
         self.tint_color = (255, 255, 255) # BGR
@@ -17,6 +18,7 @@ class Mask:
         self.blend_mode = 'normal' # 'normal', 'add', 'screen', 'multiply'
         self.bezier_enabled = False
         self.feather = 0 # 0 to 100
+        self.z_order = 0
         self.video_bpm = 120.0
         self.fx_params = {
             'kaleidoscope_segments': 6,
@@ -36,12 +38,14 @@ class Mask:
             'is_linked': self.is_linked,
             'tag': self.tag,
             'visible': self.visible,
+            'opacity': self.opacity,
             'active_fx': self.active_fx,
             'tint_color': list(self.tint_color),
             'design_overlay': self.design_overlay,
             'blend_mode': self.blend_mode,
             'bezier_enabled': self.bezier_enabled,
             'feather': self.feather,
+            'z_order': self.z_order,
             'video_bpm': self.video_bpm,
             'fx_params': self.fx_params
         }
@@ -53,12 +57,14 @@ class Mask:
         mask.playlist_index = d.get('playlist_index', 0)
         mask.is_linked = d.get('is_linked', False)
         mask.visible = d.get('visible', True)
+        mask.opacity = d.get('opacity', 1.0)
         mask.active_fx = d.get('active_fx', [])
         mask.tint_color = tuple(d.get('tint_color', [255, 255, 255]))
         mask.design_overlay = d.get('design_overlay', 'none')
         mask.blend_mode = d.get('blend_mode', 'normal')
         mask.bezier_enabled = d.get('bezier_enabled', False)
         mask.feather = d.get('feather', 0)
+        mask.z_order = d.get('z_order', 0)
         mask.video_bpm = d.get('video_bpm', 120.0)
         mask.fx_params = d.get('fx_params', {'kaleidoscope_segments': 6})
         return mask

@@ -30,39 +30,42 @@ class VideoPlayer(QThread):
         self.playback_speed = 1.0
 
     def run(self):
-        if self.is_image:
+        try:
+            if self.is_image:
+                while self._running:
+                    time.sleep(1.0) # Just keep the thread alive
+                return
+
             while self._running:
-                time.sleep(1.0) # Just keep the thread alive
-            return
-
-        while self._running:
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(self.video_path)
-                if not self.cap.isOpened():
-                    time.sleep(1.0)
-                    continue
-
-            ret, frame = self.cap.read()
-            if not ret:
-                # Robust looping: try to seek back to start
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.cap.read()
-
-                if not ret:
-                    # If seek failed, try re-opening the capture
-                    self.cap.release()
+                if self.cap is None or not self.cap.isOpened():
                     self.cap = cv2.VideoCapture(self.video_path)
+                    if not self.cap.isOpened():
+                        time.sleep(1.0)
+                        continue
+
+                ret, frame = self.cap.read()
+                if not ret:
+                    # Robust looping: try to seek back to start
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, frame = self.cap.read()
 
-                if not ret:
-                    # Still no frame? Sleep and try again in next iteration
-                    time.sleep(1.0)
-                    continue
+                    if not ret:
+                        # If seek failed, try re-opening the capture
+                        self.cap.release()
+                        self.cap = cv2.VideoCapture(self.video_path)
+                        ret, frame = self.cap.read()
 
-            with QMutexLocker(self.mutex):
-                self.latest_frame = frame
+                    if not ret:
+                        # Still no frame? Sleep and try again in next iteration
+                        time.sleep(1.0)
+                        continue
 
-            time.sleep(max(0.001, 1.0 / (self.fps * self.playback_speed)))
+                with QMutexLocker(self.mutex):
+                    self.latest_frame = frame
+
+                time.sleep(max(0.001, 1.0 / (self.fps * self.playback_speed)))
+        except Exception as e:
+            print(f"VideoPlayer Critical Error ({self.video_path}): {e}")
 
     def get_frame(self):
         with QMutexLocker(self.mutex):
@@ -79,6 +82,7 @@ class Worker(QObject):
     projector_frame_ready = pyqtSignal(QImage)
     still_frame_ready = pyqtSignal(QImage, list)
     trackers_detected = pyqtSignal(int)
+    trackers_ready = pyqtSignal(list)
     camera_error = pyqtSignal(int)
 
     def __init__(self, parent=None):
@@ -94,8 +98,11 @@ class Worker(QObject):
         self.map_x = None
         self.map_y = None
         self._warp_map_dirty = True
+        self._warp_is_identity = True
         self.masks = []
+        self.mask_mutex = QMutex()
         self.video_players = {}
+        self.player_mutex = QMutex()
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
@@ -165,6 +172,22 @@ class Worker(QObject):
         # Master FX
         self.master_active_fx = []
         self.master_tint_color = (255, 255, 255)
+        self.master_brightness = 0 # -100 to 100
+        self.master_contrast = 0   # -100 to 100
+        self.master_saturation = 100 # 0 to 200
+        self.master_grain = 0 # 0 to 100
+        self.master_bloom = 0 # 0 to 100
+        self.master_fader = 1.0 # 0.0 to 1.0
+
+        # Reusable Buffers
+        self.projector_buffer = None
+        self.mask_buffer = None
+        self.latest_main_frame = None
+        self.cached_plasma_grid = None
+        self.cached_nebula_grid = None
+        self.generator_buffer = None
+        self.blend_temp1 = None
+        self.blend_temp2 = None
 
     def init_kalman(self, count):
         self.kalman_filters = []
@@ -222,13 +245,14 @@ class Worker(QObject):
         self.update_video_speeds()
 
     def update_video_speeds(self):
-        for mask in self.masks:
-            if mask.video_path in self.video_players:
-                if mask.video_bpm > 0:
-                    speed = self.bpm / mask.video_bpm
-                    self.video_players[mask.video_path].playback_speed = speed
-                else:
-                    self.video_players[mask.video_path].playback_speed = 1.0
+        with QMutexLocker(self.player_mutex):
+            for mask in self.masks:
+                if mask.video_path in self.video_players:
+                    if mask.video_bpm > 0:
+                        speed = self.bpm / mask.video_bpm
+                        self.video_players[mask.video_path].playback_speed = speed
+                    else:
+                        self.video_players[mask.video_path].playback_speed = 1.0
 
     def trigger_beat(self):
         self.beat_counter += 1
@@ -336,7 +360,9 @@ class Worker(QObject):
         if not mask.active_fx and mask.design_overlay == 'none':
             return frame
 
-        processed = frame.copy()
+        # Since frame_cue is already a copy from VideoPlayer or a generator,
+        # we can modify it in-place to save performance.
+        processed = frame
         h, w = processed.shape[:2]
 
         if 'mirror_h' in mask.active_fx:
@@ -455,6 +481,58 @@ class Worker(QObject):
             m = cv2.inRange(hsv, lower, upper)
             processed[m > 0] = [0, 0, 0]
 
+        if 'pixelate' in mask.active_fx:
+            # Scale down and back up
+            div = 16
+            small = cv2.resize(processed, (max(1, w // div), max(1, h // div)), interpolation=cv2.INTER_NEAREST)
+            processed = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        if 'chroma_aberration' in mask.active_fx:
+            shift = 5
+            b, g, r = cv2.split(processed)
+            b = np.roll(b, shift, axis=0)
+            r = np.roll(r, -shift, axis=1)
+            processed = cv2.merge([b, g, r])
+
+        if 'ooze' in mask.active_fx:
+            t = time.time()
+            for x in range(0, w, 20):
+                # Variable drip length based on x and time
+                length = int((np.sin(t + x * 0.1) * 0.5 + 0.5) * h)
+                cv2.line(processed, (x, 0), (x, length), (0, 255, 0), 3, cv2.LINE_AA)
+                # Head of the drip
+                cv2.circle(processed, (x, length), 5, (0, 255, 100), -1)
+
+        if 'matrix' in mask.active_fx:
+            t = time.time()
+            for x in range(0, w, 15):
+                speed = 1.0 + (np.sin(x) * 0.5 + 0.5)
+                y = int((t * 200 * speed) % (h + 100)) - 100
+                for i in range(10):
+                    alpha = (10 - i) / 10.0
+                    color = (0, int(255 * alpha), 0)
+                    cv2.putText(processed, chr(np.random.randint(33, 126)), (x, y - i*15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+        if 'vhs' in mask.active_fx:
+            # Horizontal jitter
+            jitter = np.random.randint(-5, 5)
+            processed = np.roll(processed, jitter, axis=1)
+            # Scan noise
+            y = np.random.randint(0, h)
+            processed[y:y+2, :] = cv2.add(processed[y:y+2, :], (50, 50, 50, 0))
+            # Color bleed (red shift)
+            b, g, r = cv2.split(processed)
+            r = np.roll(r, 3, axis=1)
+            processed = cv2.merge([b, g, r])
+
+        if 'scanline' in mask.active_fx:
+            t = time.time()
+            y_pos = int((t * 100) % h)
+            cv2.line(processed, (0, y_pos), (w, y_pos), (255, 255, 255), 1)
+            # Darken every other line for CRT look
+            processed[::2, :] = (processed[::2, :] * 0.7).astype(np.uint8)
+
         return processed
 
     def get_design_mask(self, design_name, h, w):
@@ -544,9 +622,17 @@ class Worker(QObject):
             points_to_check = detected_points[:limit]
 
             num_markers = len(self.marker_config)
-            for point_combo in combinations(points_to_check, num_markers):
+
+            # Optimization: Pre-calculate pairwise distances between detected points
+            # to avoid redundant norm calculations in the combinations loop.
+            dist_matrix = {}
+            for i, j in combinations(range(len(points_to_check)), 2):
+                d = np.linalg.norm(np.array(points_to_check[i]) - np.array(points_to_check[j]))
+                dist_matrix[(i, j)] = d
+
+            for indices in combinations(range(len(points_to_check)), num_markers):
                 # Quick bounding box check
-                pts_arr = np.array(point_combo)
+                pts_arr = np.array([points_to_check[i] for i in indices])
                 if self.confidence > 0.5:
                     # If tracking, current combo shouldn't be too far from last known size
                     prev_pts = np.array(self.last_tracked_points)
@@ -556,11 +642,15 @@ class Worker(QObject):
                         continue
 
                 current_distances = []
-                for p1, p2 in combinations(point_combo, 2):
-                    current_distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+                for i, j in combinations(range(num_markers), 2):
+                    # Map local combo indices back to dist_matrix keys
+                    idx1, idx2 = sorted((indices[i], indices[j]))
+                    current_distances.append(dist_matrix[(idx1, idx2)])
+
                 current_fingerprint = sorted(current_distances)
 
                 if len(current_fingerprint) == len(self.marker_fingerprint):
+                    point_combo = [points_to_check[i] for i in indices]
                     is_match = True
                     for i in range(len(current_fingerprint)):
                         if not np.isclose(current_fingerprint[i], self.marker_fingerprint[i], rtol=0.15):
@@ -673,7 +763,11 @@ class Worker(QObject):
 
     def process_video(self):
         main_cap = None
+        target_fps = 30
+        frame_time = 1.0 / target_fps
+
         while self._running:
+            start_time = time.time()
             if self._camera_changed:
                 if main_cap: main_cap.release()
                 main_cap = cv2.VideoCapture(self.video_source)
@@ -689,7 +783,7 @@ class Worker(QObject):
                 # Provide a placeholder frame when no camera is detected
                 main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(main_frame, "NO CAMERA DETECTED", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
                 rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
                 self.frame_ready.emit(QImage(rgb_main.data, 640, 480, 640 * 3, QImage.Format_RGB888).copy())
                 QThread.msleep(1000)
@@ -699,22 +793,38 @@ class Worker(QObject):
             if not ret:
                 # Provide a blank frame with an error message on camera failure
                 main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(main_frame, "CAMERA READ ERROR", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                cv2.putText(main_frame, "CAMERA READ ERROR / DISCONNECTED", (50, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
                 self.camera_error.emit(self.video_source)
 
                 rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
                 self.frame_ready.emit(QImage(rgb_main.data, 640, 480, 640 * 3, QImage.Format_RGB888).copy())
-                QThread.msleep(1000)
+
+                # Attempt Reconnection
+                main_cap.release()
+                main_cap = cv2.VideoCapture(self.video_source)
+                if main_cap.isOpened():
+                    main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                else:
+                    main_cap = None
+
+                QThread.msleep(2000)
                 continue
 
             h_cam, w_cam = main_frame.shape[:2]
             h, w = self.projector_height, self.projector_width
 
+            if self.projector_buffer is None or self.projector_buffer.shape[:2] != (h, w):
+                self.projector_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+                self.mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+
             if self.show_camera_on_projector:
-                projector_output = cv2.resize(main_frame, (w, h))
+                cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
             else:
-                projector_output = np.zeros((h, w, 3), dtype=np.uint8)
+                self.projector_buffer.fill(0)
+
+            projector_output = self.projector_buffer
 
             if self.show_splash:
                 if self.splash_player is None:
@@ -734,6 +844,7 @@ class Worker(QObject):
 
             tracked_points = self.get_tracked_points(main_frame)
             self.trackers_detected.emit(len(tracked_points))
+            self.trackers_ready.emit(tracked_points)
 
             if len(tracked_points) >= 2:
                 current_dist = np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
@@ -750,8 +861,10 @@ class Worker(QObject):
             self.update_particles(tracked_points, h, w)
             self.draw_particles(projector_output)
 
-            sorted_masks = sorted(self.masks, key=lambda m: 0 if m.tag == 'background' else 1)
-            for mask in sorted_masks:
+            with QMutexLocker(self.mask_mutex):
+                iterable_masks = [m for m in self.masks] # Snapshot for this frame
+
+            for mask in iterable_masks:
                 if not mask.visible or not mask.video_path: continue
 
                 if mask.video_path == "generative":
@@ -760,13 +873,14 @@ class Worker(QObject):
                     pattern = mask.video_path.split(":")[-1]
                     frame_cue = self.get_vj_generator(pattern, h, w)
                 else:
-                    if mask.video_path not in self.video_players:
-                        player = VideoPlayer(mask.video_path)
-                        player.start()
-                        self.video_players[mask.video_path] = player
+                    with QMutexLocker(self.player_mutex):
+                        if mask.video_path not in self.video_players:
+                            player = VideoPlayer(mask.video_path)
+                            player.start()
+                            self.video_players[mask.video_path] = player
 
-                    player = self.video_players[mask.video_path]
-                    frame_cue = player.get_frame()
+                        player = self.video_players[mask.video_path]
+                        frame_cue = player.get_frame()
 
                 if mask.tag in self.fades:
                     fade_info = self.fades[mask.tag]
@@ -782,6 +896,12 @@ class Worker(QObject):
                         del self.fades[mask.tag]
 
                 if frame_cue is not None:
+                    # Performance Optimization: Downscale video frame if it's larger than the projector resolution
+                    # This significantly speeds up all subsequent FX processing and warping.
+                    fh, fw = frame_cue.shape[:2]
+                    if fw > w or fh > h:
+                        frame_cue = cv2.resize(frame_cue, (w, h), interpolation=cv2.INTER_LINEAR)
+
                     frame_cue = self.apply_fx(frame_cue, mask)
 
                     if mask.design_overlay != 'none':
@@ -793,6 +913,13 @@ class Worker(QObject):
                     if mask.type == 'dynamic':
                         if self.confidence < 1.0:
                             effective_frame_cue = (frame_cue * self.confidence).astype(np.uint8)
+
+                    effective_opacity = mask.opacity
+                    if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
+                        effective_opacity *= lfo_val
+
+                    if effective_opacity < 1.0:
+                        effective_frame_cue = (effective_frame_cue * effective_opacity).astype(np.uint8)
 
                     # Safety Fallback
                     is_safe = True
@@ -830,7 +957,8 @@ class Worker(QObject):
                             matrix, _ = cv2.findHomography(video_corners, dst_pts)
 
                         warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
-                        mask_img = np.zeros_like(projector_output)
+                        self.mask_buffer.fill(0)
+                        mask_img = self.mask_buffer
 
                         draw_pts = np.int32(dst_pts)
                         if mask.bezier_enabled and len(dst_pts) >= 3:
@@ -847,22 +975,35 @@ class Worker(QObject):
                         cv2.fillPoly(mask_img, [draw_pts], (255, 255, 255))
                         if mask.feather > 0:
                             k = int(mask.feather) | 1
-                            mask_img = cv2.GaussianBlur(mask_img, (k, k), 0)
+                            cv2.boxFilter(mask_img, -1, (k, k), dst=mask_img)
                         projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
                     elif mask.type == 'static' or (mask.type == 'dynamic' and not mask.is_linked):
+                        effective_frame_cue = frame_cue
+
+                        effective_opacity = mask.opacity
+                        if mask.fx_params.get('lfo_enabled') and mask.fx_params.get('lfo_target') == 'opacity':
+                            lfo_val = self.get_lfo_value(mask)
+                            effective_opacity *= lfo_val
+
+                        if effective_opacity < 1.0:
+                            effective_frame_cue = (frame_cue * effective_opacity).astype(np.uint8)
+
                         if not mask.source_points:
                             full_mask = np.full((h, w, 3), 255, dtype=np.uint8)
-                            projector_output = self.blend_frames(projector_output, cv2.resize(frame_cue, (w, h)), full_mask, mask.blend_mode)
+                            projector_output = self.blend_frames(projector_output, cv2.resize(effective_frame_cue, (w, h)), full_mask, mask.blend_mode)
                         else:
                             src_pts = np.float32([[0, 0], [frame_cue.shape[1], 0], [frame_cue.shape[1], frame_cue.shape[0]], [0, frame_cue.shape[0]]])
                             dst_pts = np.float32(mask.source_points)
                             matrix, _ = cv2.findHomography(src_pts, dst_pts)
-                            warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
-                            mask_img = np.zeros_like(projector_output)
+                            warped_cue = cv2.warpPerspective(effective_frame_cue, matrix, (w, h))
+
+                            self.mask_buffer.fill(0)
+                            mask_img = self.mask_buffer
+
                             cv2.fillConvexPoly(mask_img, np.int32(dst_pts), (255, 255, 255))
                             if mask.feather > 0:
                                 k = int(mask.feather) | 1
-                                mask_img = cv2.GaussianBlur(mask_img, (k, k), 0)
+                                cv2.boxFilter(mask_img, -1, (k, k), dst=mask_img)
                             projector_output = self.blend_frames(projector_output, warped_cue, mask_img, mask.blend_mode)
 
                 # Draw outlines on projector during calibration/alignment
@@ -875,7 +1016,7 @@ class Worker(QObject):
                         draw_pts = np.array(mask.source_points).astype(np.int32)
 
                     if len(draw_pts) >= 3:
-                        cv2.polylines(projector_output, [draw_pts], True, (0, 255, 255), 2)
+                        cv2.polylines(projector_output, [draw_pts], True, (255, 0, 255), 2, cv2.LINE_AA)
                         cv2.putText(projector_output, f"{mask.tag or mask.name}", (draw_pts[0][0], draw_pts[0][1] - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
@@ -892,32 +1033,60 @@ class Worker(QObject):
                 self.last_stats_time = now
 
             if self.show_hud:
-                hud_color = (0, 255, 255)
+                hud_color = (255, 0, 255) # Purple
                 cv2.putText(main_frame, f"FPS: {self.fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
                 cv2.putText(main_frame, f"Conf: {self.confidence:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
                 cv2.putText(main_frame, f"BPM: {self.bpm:.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
                 if self.auto_pilot:
                     cv2.putText(main_frame, "AUTO-PILOT ON", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            self.latest_main_frame = main_frame.copy()
             rgb_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
             self.frame_ready.emit(QImage(rgb_main.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy())
 
             # Apply Master FX to the composition before warping
-            if self.master_active_fx:
+            if self.master_active_fx or self.master_brightness != 0 or self.master_contrast != 0 or self.master_saturation != 100:
                 from mask import Mask
                 master_proxy = Mask("Master", [], None)
                 master_proxy.active_fx = self.master_active_fx
                 master_proxy.tint_color = self.master_tint_color
                 projector_output = self.apply_fx(projector_output, master_proxy)
 
-            # 9-point grid warping (piecewise perspective optimization)
-            is_identity = True
-            for i, p in enumerate(self.warp_points):
-                if abs(p[0] - (i % 3) * 0.5) > 0.005 or abs(p[1] - (i // 3) * 0.5) > 0.005:
-                    is_identity = False
-                    break
+                # Apply Brightness/Contrast
+                if self.master_brightness != 0 or self.master_contrast != 0:
+                    alpha = (self.master_contrast + 100.0) / 100.0
+                    beta = self.master_brightness
+                    projector_output = cv2.convertScaleAbs(projector_output, alpha=alpha, beta=beta)
 
-            if is_identity:
+                # Apply Saturation
+                if self.master_saturation != 100:
+                    hsv = cv2.cvtColor(projector_output, cv2.COLOR_BGR2HSV).astype(np.float32)
+                    hsv[:,:,1] *= (self.master_saturation / 100.0)
+                    hsv[:,:,1] = np.clip(hsv[:,:,1], 0, 255)
+                    projector_output = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+                # Apply Grain
+                if self.master_grain > 0:
+                    noise = np.random.randint(0, self.master_grain, (h, w, 3), dtype=np.uint8)
+                    projector_output = cv2.add(projector_output, noise)
+
+                # Apply Bloom (Simple)
+                if self.master_bloom > 0:
+                    # Extract highlights
+                    gray = cv2.cvtColor(projector_output, cv2.COLOR_BGR2GRAY)
+                    _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+                    highlights = cv2.bitwise_and(projector_output, cv2.merge([mask, mask, mask]))
+                    # Blur highlights
+                    k = int(self.master_bloom / 2) | 1
+                    bloom = cv2.GaussianBlur(highlights, (k, k), 0)
+                    projector_output = cv2.addWeighted(projector_output, 1.0, bloom, 0.5, 0)
+
+            # Apply Master Fader
+            if self.master_fader < 1.0:
+                projector_output = (projector_output * self.master_fader).astype(np.uint8)
+
+            # 9-point grid warping (piecewise perspective optimization)
+            if self._warp_is_identity:
                 warped_output = projector_output
             else:
                 if self.map_x is None or self.map_x.shape[:2] != (h, w) or self._warp_map_dirty:
@@ -927,7 +1096,10 @@ class Worker(QObject):
 
             rgb_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
             self.projector_frame_ready.emit(QImage(rgb_proj.data, w, h, w * 3, QImage.Format_RGB888).copy())
-            QThread.msleep(30)
+
+            elapsed = time.time() - start_time
+            sleep_time = max(1, int((frame_time - elapsed) * 1000))
+            QThread.msleep(sleep_time)
 
         main_cap.release()
         for player in self.video_players.values(): player.stop()
@@ -969,10 +1141,16 @@ class Worker(QObject):
         for p in self.particles:
             color = (0, 255, 0) if self.particle_preset == 'rain' else (255, 255, 200)
             alpha = int(p['life'] * 255)
-            cv2.circle(frame, (int(p['x']), int(p['y'])), 2, color, -1)
+            # Use anti-aliasing for smoother particles
+            cv2.circle(frame, (int(p['x']), int(p['y'])), 2, color, -1, cv2.LINE_AA)
 
     def get_vj_generator(self, pattern, h, w):
-        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        if self.generator_buffer is None or self.generator_buffer.shape[:2] != (h, w):
+            self.generator_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+
+        self.generator_buffer.fill(0)
+        frame = self.generator_buffer
+
         t = time.time() * (self.bpm / 60.0)
 
         if pattern == 'grid':
@@ -989,6 +1167,143 @@ class Worker(QObject):
             center = (w // 2, h // 2)
             for r in range(int((t * 50) % 100), max(w, h), 100):
                 cv2.circle(frame, center, r, (255, 0, 0), 3)
+        elif pattern == 'tunnel':
+            center = (w // 2, h // 2)
+            for i in range(10):
+                r = int(((t + i * 0.1) % 1.0) * max(w, h))
+                cv2.rectangle(frame, (center[0]-r, center[1]-r), (center[0]+r, center[1]+r), (255, 255, 255), 2)
+        elif pattern == 'plasma':
+            # Fast plasma-like effect using sine waves
+            if self.cached_plasma_grid is None or self.cached_plasma_grid[0].shape != (h, w):
+                x = np.linspace(0, 10, w, dtype=np.float32)
+                y = np.linspace(0, 10, h, dtype=np.float32)
+                self.cached_plasma_grid = np.meshgrid(x, y)
+
+            X, Y = self.cached_plasma_grid
+            res = np.sin(X + t) + np.sin(Y + t*0.5) + np.sin((X + Y + t)*0.5)
+            res = ((res + 3) / 6 * 255).astype(np.uint8)
+            frame = cv2.applyColorMap(res, cv2.COLORMAP_JET)
+        elif pattern == 'vortex':
+            center = (w // 2, h // 2)
+            for i in range(0, 360, 20):
+                angle = np.radians(i + t * 100)
+                end_x = int(center[0] + max(w, h) * np.cos(angle))
+                end_y = int(center[1] + max(w, h) * np.sin(angle))
+                cv2.line(frame, center, (end_x, end_y), (255, 255, 0), 2)
+        elif pattern == 'polytunnel':
+            center = (w // 2, h // 2)
+            for i in range(12):
+                z = (t * 0.5 + i * 0.1) % 1.2
+                if z < 0.1: continue
+                size = int((1.0 / z) * 50)
+                rot = t * 2 + i * 0.5
+                pts = []
+                num_sides = 6
+                for s in range(num_sides):
+                    ang = rot + s * (2 * np.pi / num_sides)
+                    pts.append([center[0] + size * np.cos(ang), center[1] + size * np.sin(ang)])
+                cv2.polylines(frame, [np.array(pts, np.int32)], True, (200, 0, 255), 2, cv2.LINE_AA)
+        elif pattern == 'stardust':
+            # 3D-like forward motion of polygonal stars
+            for i in range(30):
+                seed = (i * 12345)
+                speed = 0.2 + (seed % 10) / 10.0
+                offset = (t * speed + i * 0.03) % 1.0
+                if offset < 0.01: continue
+                # Project from center
+                size = int(offset * 20)
+                dist = offset * max(w, h) * 0.8
+                ang = (seed % 360) * (np.pi / 180)
+                x = int(w // 2 + dist * np.cos(ang))
+                y = int(h // 2 + dist * np.sin(ang))
+
+                # Small triangle star
+                star_pts = []
+                for s in range(3):
+                    sang = t * 5 + s * (2 * np.pi / 3)
+                    star_pts.append([x + size * np.cos(sang), y + size * np.sin(sang)])
+                cv2.polylines(frame, [np.array(star_pts, np.int32)], True, (255, 255, 255), 1, cv2.LINE_AA)
+        elif pattern == 'hypergrid':
+            # Perspective moving grid
+            horizon = h // 2
+            num_lines = 15
+            for i in range(num_lines):
+                # Vertical perspective lines
+                x_start = int(w // 2 + (i - num_lines // 2) * (w // 20))
+                cv2.line(frame, (w // 2, horizon), (x_start * 2 - w // 2, h), (100, 0, 200), 1, cv2.LINE_AA)
+
+            # Horizontal moving lines
+            for i in range(8):
+                y_off = (t * 50 + i * (h // 8)) % (h // 2)
+                y = horizon + int(y_off)
+                # Map y to width (simulated perspective)
+                scale = (y - horizon) / (h // 2.0)
+                if scale > 0:
+                    width = int(w * scale)
+                    cv2.line(frame, (w // 2 - width // 2, y), (w // 2 + width // 2, y), (150, 0, 255), 1, cv2.LINE_AA)
+        elif pattern == 'prism_move':
+            # Floating prisms moving through space
+            for i in range(5):
+                path_t = t * 0.2 + i * 0.4
+                x = int((np.cos(path_t * 3) * 0.4 + 0.5) * w)
+                y = int((np.sin(path_t * 2) * 0.4 + 0.5) * h)
+                z_scale = 0.5 + 0.5 * np.sin(path_t * 5)
+                size = int(30 + 70 * z_scale)
+
+                # Draw a hexagonal prism wireframe
+                pts_top = []
+                pts_bot = []
+                num_sides = 6
+                rot = t + i
+                for s in range(num_sides):
+                    ang = rot + s * (2 * np.pi / num_sides)
+                    pts_top.append([x + size * np.cos(ang), y + size * np.sin(ang)])
+                    pts_bot.append([x + (size+20) * np.cos(ang), y + (size+20) * np.sin(ang)])
+
+                color = (255, 0, 255)
+                cv2.polylines(frame, [np.array(pts_top, np.int32)], True, color, 2, cv2.LINE_AA)
+                cv2.polylines(frame, [np.array(pts_bot, np.int32)], True, color, 1, cv2.LINE_AA)
+                for s in range(num_sides):
+                    cv2.line(frame, tuple(np.int32(pts_top[s])), tuple(np.int32(pts_bot[s])), color, 1, cv2.LINE_AA)
+        elif pattern == 'nebula':
+            # Multi-layered noise nebula
+            if self.cached_nebula_grid is None or self.cached_nebula_grid[0].shape != (h, w):
+                x = np.linspace(0, 4, w, dtype=np.float32)
+                y = np.linspace(0, 4, h, dtype=np.float32)
+                self.cached_nebula_grid = np.meshgrid(x, y)
+
+            X, Y = self.cached_nebula_grid
+
+            # Layer 1
+            n1 = np.sin(X + t * 0.2) * np.cos(Y - t * 0.3)
+            # Layer 2 (Faster, smaller)
+            n2 = np.sin(X * 2 - t * 0.5) * np.sin(Y * 2 + t * 0.4)
+
+            res = ((n1 + n2 + 2) / 4 * 255).astype(np.uint8)
+            frame = cv2.applyColorMap(res, cv2.COLORMAP_MAGMA)
+            # Darken for space feel
+            frame = (frame * 0.6).astype(np.uint8)
+        elif pattern == 'blackhole':
+            center = (w // 2, h // 2)
+            # Central event horizon
+            cv2.circle(frame, center, int(30 + 5 * np.sin(t*5)), (0, 0, 0), -1)
+            # Accretion disk particles
+            for i in range(40):
+                angle = (t * 2 + i * (2 * np.pi / 40))
+                dist = (1.5 - ((t * 0.5 + i * 0.05) % 1.0)) * max(w, h) * 0.3 + 40
+                if dist < 40: continue
+
+                # Whirlpool effect
+                x = int(center[0] + dist * np.cos(angle + 100/dist))
+                y = int(center[1] + dist * np.sin(angle + 100/dist))
+
+                color = (200, 100, 255)
+                cv2.circle(frame, (x, y), 2, color, -1, cv2.LINE_AA)
+                # Connecting lines for flow
+                nx = int(center[0] + (dist-10) * np.cos(angle + 100/(dist-10)))
+                ny = int(center[1] + (dist-10) * np.sin(angle + 100/(dist-10)))
+                cv2.line(frame, (x, y), (nx, ny), (100, 50, 150), 1, cv2.LINE_AA)
+
         return frame
 
     def get_generative_frame(self, h, w):
@@ -1008,26 +1323,35 @@ class Worker(QObject):
         if len(mask_img.shape) == 2:
             mask_img = cv2.merge([mask_img, mask_img, mask_img])
 
+        if self.blend_temp1 is None or self.blend_temp1.shape != base.shape:
+            self.blend_temp1 = np.zeros_like(base)
+            self.blend_temp2 = np.zeros_like(base)
+
+        # Optimized integer-based blending to avoid slow float conversions
         if mode == 'normal':
-            inv_mask = cv2.bitwise_not(mask_img)
-            return cv2.add(cv2.bitwise_and(base, inv_mask), cv2.bitwise_and(overlay, mask_img))
+            # Full alpha blending: res = overlay * (mask/255) + base * (1 - mask/255)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            cv2.bitwise_not(mask_img, dst=self.blend_temp2)
+            cv2.multiply(base, self.blend_temp2, dst=self.blend_temp2, scale=1.0/255.0)
+            return cv2.add(self.blend_temp1, self.blend_temp2, dst=base)
         elif mode == 'add':
-            overlay_masked = cv2.bitwise_and(overlay, mask_img)
-            return cv2.add(base, overlay_masked)
-
-        # Other modes still use float for now, but these are less common
-        mask_f = mask_img.astype(np.float32) / 255.0
-        base_f = base.astype(np.float32)
-        over_f = overlay.astype(np.float32)
-
-        if mode == 'screen':
-            res = 255 - ((255 - base_f) * (255 - over_f * mask_f) / 255.0)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            return cv2.add(base, self.blend_temp1, dst=base)
+        elif mode == 'screen':
+            # res = 1 - (1 - base) * (1 - overlay*mask)
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            cv2.bitwise_not(base, dst=self.blend_temp2)
+            cv2.bitwise_not(self.blend_temp1, dst=self.blend_temp1)
+            cv2.multiply(self.blend_temp2, self.blend_temp1, dst=self.blend_temp1, scale=1.0/255.0)
+            return cv2.bitwise_not(self.blend_temp1, dst=base)
         elif mode == 'multiply':
-            res = (base_f * (over_f * mask_f + (1.0 - mask_f) * 255.0)) / 255.0
-        else:
-            return base # Fallback
+            # res = base * (overlay*mask + (255-mask)) / 255
+            cv2.multiply(overlay, mask_img, dst=self.blend_temp1, scale=1.0/255.0)
+            cv2.bitwise_not(mask_img, dst=self.blend_temp2)
+            cv2.add(self.blend_temp1, self.blend_temp2, dst=self.blend_temp1)
+            return cv2.multiply(base, self.blend_temp1, dst=base, scale=1.0/255.0)
 
-        return np.clip(res, 0, 255).astype(np.uint8)
+        return base
 
     def normalize_points_to_reference(self, points):
         """Converts points from current frame space to marker-config reference space."""
@@ -1045,19 +1369,35 @@ class Worker(QObject):
     def set_warp_points(self, points):
         self.warp_points = points
         self._warp_map_dirty = True
+
+        # Check if identity
+        self._warp_is_identity = True
+        for i, p in enumerate(self.warp_points):
+            if abs(p[0] - (i % 3) * 0.5) > 0.005 or abs(p[1] - (i // 3) * 0.5) > 0.005:
+                self._warp_is_identity = False
+                break
     def cleanup_resources(self):
         # Aggressively stop unused players
         current_cues = {mask.video_path for mask in self.masks if mask.video_path}
         fade_cues = {f['prev_path'] for f in self.fades.values()}
         needed_cues = current_cues.union(fade_cues)
 
-        for path in list(self.video_players.keys()):
-            if path not in needed_cues:
-                print(f"Purging player for: {path}")
-                self.video_players[path].stop()
-                del self.video_players[path]
+        with QMutexLocker(self.player_mutex):
+            for path in list(self.video_players.keys()):
+                if path not in needed_cues:
+                    print(f"Purging player for: {path}")
+                    self.video_players[path].stop()
+                    del self.video_players[path]
+
+        # Cleanup trail buffers for removed masks
+        mask_ids = {id(mask) for mask in self.masks}
+        for mid in list(self.trail_buffers.keys()):
+            if mid not in mask_ids:
+                del self.trail_buffers[mid]
 
     def set_masks(self, masks):
-        self.masks = masks
+        with QMutexLocker(self.mask_mutex):
+            # Sort masks by Z-order once when they are updated
+            self.masks = sorted(masks, key=lambda m: m.z_order)
         self.update_video_speeds()
         self.cleanup_resources()

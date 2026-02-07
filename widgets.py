@@ -11,11 +11,13 @@ class MarkerImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.detected_points = []
         self.selected_points = []
+        self.guide_points = []
         self.pix = None
 
-    def set_data(self, pixmap, detected_points):
+    def set_data(self, pixmap, detected_points, guide_points=None):
         self.pix = pixmap
         self.detected_points = detected_points
+        self.guide_points = guide_points or []
         self.selected_points = []
         self.setPixmap(self.pix)
         self.update()
@@ -66,8 +68,13 @@ class MarkerImageLabel(QLabel):
         for dp in self.detected_points:
             painter.drawEllipse(QPoint(int(dp[0]), int(dp[1])), 12, 12)
 
-        # Draw selected points as solid green targets
-        painter.setPen(QPen(Qt.green, 3))
+        # Draw guide points (from template) as faint cyan circles
+        painter.setPen(QPen(Qt.cyan, 2, Qt.DotLine))
+        for gp in self.guide_points:
+            painter.drawEllipse(QPoint(int(gp[0]), int(gp[1])), 15, 15)
+
+        # Draw selected points as solid neon purple targets
+        painter.setPen(QPen(Qt.magenta, 3))
         for sp in self.selected_points:
             painter.drawLine(sp.x()-15, sp.y(), sp.x()+15, sp.y())
             painter.drawLine(sp.x(), sp.y()-15, sp.x(), sp.y()+15)
@@ -90,8 +97,8 @@ class MarkerSelectionDialog(QDialog):
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.confirm_button)
 
-    def set_pixmap(self, pixmap, detected_points):
-        self.image_label.set_data(pixmap, detected_points)
+    def set_pixmap(self, pixmap, detected_points, guide_points=None):
+        self.image_label.set_data(pixmap, detected_points, guide_points)
 
     def get_selected_points(self):
         return self.image_label.selected_points
@@ -107,7 +114,11 @@ class VideoDisplay(QWidget):
         super().__init__(parent)
         self.mask_creation_mode = False
         self.mask_points = []
+        self.detected_markers = []
         self.current_pixmap = None
+
+    def set_detected_markers(self, points):
+        self.detected_markers = points
 
     def set_image(self, image):
         self.current_pixmap = QPixmap.fromImage(image)
@@ -129,8 +140,8 @@ class VideoDisplay(QWidget):
             painter.drawPixmap(x, y, scaled_pixmap)
 
             if self.mask_creation_mode and self.mask_points:
-                painter.setPen(QPen(Qt.green, 2))
-                painter.setBrush(QBrush(Qt.green, Qt.Dense6Pattern))
+                painter.setPen(QPen(Qt.magenta, 2))
+                painter.setBrush(QBrush(Qt.magenta, Qt.Dense6Pattern))
 
                 # Denormalize mask points for drawing
                 pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
@@ -165,9 +176,20 @@ class VideoDisplay(QWidget):
             py = (event.pos().y() - offset_y) * pix_h / sh
 
             if 0 <= px < pix_w and 0 <= py < pix_h:
-                point = QPoint(int(px), int(py))
-                self.mask_points.append(point)
-                self.mask_point_added.emit(point)
+                click_pt = QPoint(int(px), int(py))
+
+                # Auto-Snapping to detected IR markers
+                snapped_pt = click_pt
+                min_dist = 30 # Snapping radius in pixels
+                for marker in self.detected_markers:
+                    m_pt = QPoint(int(marker[0]), int(marker[1]))
+                    dist = (click_pt - m_pt).manhattanLength()
+                    if dist < min_dist:
+                        min_dist = dist
+                        snapped_pt = m_pt
+
+                self.mask_points.append(snapped_pt)
+                self.mask_point_added.emit(snapped_pt)
                 self.update()
 
     def set_mask_creation_mode(self, enabled):
@@ -182,6 +204,40 @@ class VideoDisplay(QWidget):
     def clear_mask_points(self):
         self.mask_points = []
         self.update()
+
+class AudioMonitor(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(100)
+        self.levels = [0, 0, 0] # Bass, Mid, High
+
+    def set_levels(self, levels):
+        self.levels = levels
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+
+        w = self.width()
+        h = self.height()
+        bar_w = w // 3 - 10
+
+        colors = [Qt.red, Qt.green, Qt.blue]
+        labels = ["BASS", "MID", "HIGH"]
+
+        for i in range(3):
+            val = self.levels[i]
+            bar_h = int(val * h)
+            x = i * (w // 3) + 5
+
+            # Draw bar
+            painter.setBrush(QBrush(colors[i]))
+            painter.drawRect(x, h - bar_h, bar_w, bar_h)
+
+            # Label
+            painter.setPen(Qt.white)
+            painter.drawText(x, h - 5, labels[i])
 
 class ProjectorWindow(QWidget):
     warp_points_changed = pyqtSignal(list)

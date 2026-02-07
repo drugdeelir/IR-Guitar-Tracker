@@ -15,6 +15,7 @@ class MIDIHandler(QObject):
         super().__init__()
         self.port_name = port_name
         self.inport = None
+        self.outport = None
         self.clock_count = 0
         self.last_clock_time = 0
         self.bpm = 120.0
@@ -32,8 +33,26 @@ class MIDIHandler(QObject):
         print(f"Opening MIDI port: {self.port_name}")
         try:
             self.inport = mido.open_input(self.port_name, callback=self.midi_callback)
+            # Many controllers use same name for output
+            try:
+                self.outport = mido.open_output(self.port_name)
+            except:
+                print(f"Warning: Could not open MIDI output on {self.port_name}")
         except Exception as e:
             print(f"MIDI Error: {e}")
+
+    def send_feedback(self, msg_type, number, value):
+        if self.outport:
+            try:
+                if msg_type == 'note':
+                    msg = mido.Message('note_on', note=number, velocity=value)
+                elif msg_type == 'cc':
+                    msg = mido.Message('control_change', control=number, value=value)
+                else:
+                    return
+                self.outport.send(msg)
+            except Exception as e:
+                print(f"MIDI Feedback Error: {e}")
 
     def midi_callback(self, msg):
         if msg.type in ['note_on', 'note_off', 'control_change']:
@@ -79,6 +98,9 @@ class MIDIHandler(QObject):
         if self.inport:
             self.inport.close()
             self.inport = None
+        if self.outport:
+            self.outport.close()
+            self.outport = None
 
 def get_midi_ports():
     try:
