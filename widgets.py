@@ -1,7 +1,7 @@
-
 from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QDialog
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QPolygon
+from PyQt5.QtCore import Qt, QPoint, QPointF, pyqtSignal
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QPolygon
+
 
 class MarkerSelectionDialog(QDialog):
     marker_selected = pyqtSignal(QPoint)
@@ -34,7 +34,7 @@ class MarkerSelectionDialog(QDialog):
         point = event.pos()
         self.selected_points.append(point)
         self.marker_selected.emit(point)
-        self.update() # Trigger a repaint to draw the selected points
+        self.update()
 
     def get_selected_points(self):
         return self.selected_points
@@ -48,7 +48,6 @@ class MarkerSelectionDialog(QDialog):
     def paintEvent(self, event):
         super().paintEvent(event)
         if self.original_pixmap:
-            # Create a new pixmap to draw on
             pixmap = self.original_pixmap.copy()
             painter = QPainter(pixmap)
             pen = QPen(Qt.green, 10)
@@ -57,6 +56,7 @@ class MarkerSelectionDialog(QDialog):
                 painter.drawPoint(point)
             painter.end()
             self.image_label.setPixmap(pixmap)
+
 
 class VideoDisplay(QWidget):
     mask_point_added = pyqtSignal(QPoint)
@@ -73,7 +73,7 @@ class VideoDisplay(QWidget):
 
     def set_image(self, image):
         self.current_pixmap = QPixmap.fromImage(image)
-        self.update() # Trigger paintEvent
+        self.update()
 
     def paintEvent(self, event):
         if self.current_pixmap:
@@ -84,7 +84,7 @@ class VideoDisplay(QWidget):
                 painter.setPen(QPen(Qt.green, 2))
                 poly = QPolygon(self.mask_points)
                 painter.drawPolyline(poly)
-    
+
     def mousePressEvent(self, event):
         if self.mask_creation_mode:
             point = event.pos()
@@ -105,6 +105,7 @@ class VideoDisplay(QWidget):
         self.mask_points = []
         self.update()
 
+
 class ProjectorWindow(QWidget):
     warp_points_changed = pyqtSignal(list)
 
@@ -118,7 +119,7 @@ class ProjectorWindow(QWidget):
         self.setStyleSheet("background-color: black;")
 
         self.calibration_mode = False
-        self.warp_points = [QPoint(0, 0), QPoint(1, 0), QPoint(1, 1), QPoint(0, 1)]
+        self.warp_points = [QPointF(0, 0), QPointF(1, 0), QPointF(1, 1), QPointF(0, 1)]
         self.dragging_point_index = -1
         self.show()
 
@@ -127,10 +128,15 @@ class ProjectorWindow(QWidget):
 
     def set_calibration_mode(self, enabled):
         self.calibration_mode = enabled
-        self.update() # Trigger a repaint
+        self.update()
+
+    def set_warp_points(self, points):
+        self.warp_points = [QPointF(p[0], p[1]) for p in points]
+        self.warp_points_changed.emit(self.get_warp_points_normalized())
+        self.update()
 
     def reset_warp_points(self):
-        self.warp_points = [QPoint(0, 0), QPoint(1, 0), QPoint(1, 1), QPoint(0, 1)]
+        self.warp_points = [QPointF(0, 0), QPointF(1, 0), QPointF(1, 1), QPointF(0, 1)]
         self.warp_points_changed.emit(self.get_warp_points_normalized())
         self.update()
 
@@ -140,13 +146,11 @@ class ProjectorWindow(QWidget):
             painter = QPainter(self)
             pen = QPen(Qt.red, 10)
             painter.setPen(pen)
-            
-            # Denormalize points for drawing
+
             denormalized_points = [
                 QPoint(int(p.x() * self.width()), int(p.y() * self.height()))
                 for p in self.warp_points
             ]
-            
             for point in denormalized_points:
                 painter.drawPoint(point)
 
@@ -163,19 +167,19 @@ class ProjectorWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if self.calibration_mode:
             self.dragging_point_index = -1
-    
+
     def get_point_at(self, pos):
         denormalized_points = [
             QPoint(int(p.x() * self.width()), int(p.y() * self.height()))
             for p in self.warp_points
         ]
         for i, point in enumerate(denormalized_points):
-            if (pos - point).manhattanLength() < 20: # Click tolerance
+            if (pos - point).manhattanLength() < 20:
                 return i
         return -1
 
     def normalize_point(self, pos):
-        return QPoint(pos.x() / self.width(), pos.y() / self.height())
+        return QPointF(pos.x() / max(self.width(), 1), pos.y() / max(self.height(), 1))
 
     def get_warp_points_normalized(self):
         return [[p.x(), p.y()] for p in self.warp_points]
