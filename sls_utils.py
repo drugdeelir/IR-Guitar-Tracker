@@ -12,27 +12,31 @@ def generate_gray_code_patterns(width, height, max_bits=11):
     n_x = min(int(np.ceil(np.log2(width))), max_bits)
     n_y = min(int(np.ceil(np.log2(height))), max_bits)
 
+    # Pre-calculate x-based patterns using tiling (much faster than nested loops)
     patterns_x = []
     x_indices = np.arange(width)
     x_scaled = (x_indices * (2**n_x)) // width
     gray_x = x_scaled ^ (x_scaled >> 1)
 
     for i in range(n_x):
-        p = np.zeros((height, width), dtype=np.uint8)
         mask = (gray_x >> (n_x - 1 - i)) & 1
-        p[:, mask == 1] = 255
+        # Create 1D row and tile it to full height
+        row = (mask * 255).astype(np.uint8)
+        p = np.tile(row, (height, 1))
         patterns_x.append(p)
         patterns_x.append(255 - p) # Inverse
 
+    # Pre-calculate y-based patterns
     patterns_y = []
     y_indices = np.arange(height)
     y_scaled = (y_indices * (2**n_y)) // height
     gray_y = y_scaled ^ (y_scaled >> 1)
 
     for i in range(n_y):
-        p = np.zeros((height, width), dtype=np.uint8)
         mask = (gray_y >> (n_y - 1 - i)) & 1
-        p[mask == 1, :] = 255
+        # Create 1D column and tile it to full width
+        col = (mask * 255).astype(np.uint8).reshape(-1, 1)
+        p = np.tile(col, (1, width))
         patterns_y.append(p)
         patterns_y.append(255 - p) # Inverse
 

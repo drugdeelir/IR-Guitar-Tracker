@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                              QDialog, QFormLayout, QInputDialog, QTabWidget, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea,
                              QProgressBar, QPlainTextEdit, QGridLayout)
-from PyQt5.QtGui import QPixmap, QDesktopServices
+from PyQt5.QtGui import QPixmap, QDesktopServices, QImage
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint, QPointF, QUrl, QDateTime
 from widgets import VideoDisplay, ProjectorWindow, MarkerSelectionDialog, AudioMonitor, MaskDrawingDialog
 from worker import Worker
@@ -1993,10 +1993,10 @@ class ProjectionMappingApp(QMainWindow):
                 # Show in a simple dialog
                 dialog = QDialog(self)
                 dialog.setWindowTitle("Setup Reference Frame")
-                l = QVBoxLayout(dialog)
+                layout = QVBoxLayout(dialog)
                 lbl = QLabel()
                 lbl.setPixmap(QPixmap.fromImage(qimg))
-                l.addWidget(lbl)
+                layout.addWidget(lbl)
                 dialog.exec_()
         else:
             self.statusBar().showMessage("No setup reference frame found in this project.", 3000)

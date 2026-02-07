@@ -55,7 +55,7 @@ class Mask:
         mask = cls(d['name'], d['source_points'], d['video_path'], d['type'], d['tag'])
         mask.playlist = d.get('playlist')
         if mask.playlist is None:
-             mask.playlist = [mask.video_path] if mask.video_path else []
+            mask.playlist = [mask.video_path] if mask.video_path else []
         mask.playlist_index = d.get('playlist_index', 0)
         mask.is_linked = d.get('is_linked', False)
         mask.visible = d.get('visible', True)

@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 import time
+import threading
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage
 from itertools import combinations, permutations
@@ -114,7 +115,7 @@ class VideoPlayer(QThread):
             if self.cap:
                 self.cap.release()
 
-class TrackingThread(QThread):
+class CameraThread(QThread):
     def __init__(self, worker):
         super().__init__()
         self.setPriority(QThread.HighestPriority)
@@ -128,72 +129,62 @@ class TrackingThread(QThread):
 
     def run(self):
         main_cap = None
-        target_fps = 20
+        target_fps = 60
         frame_time = 1.0 / target_fps
-        last_attempted_res = None
 
         while self._running:
             try:
                 start_time = time.time()
 
                 req_res = self.worker.requested_camera_res
-                # Only attempt resolution change if requested resolution is different from current AND wasn't just attempted.
-                # Also always allow change if the camera device itself changed.
-                if self.worker._camera_changed or (req_res != self.worker._current_camera_res and req_res != last_attempted_res):
-                    last_attempted_res = req_res
+                # PERFORMANCE: Only attempt resolution change if requested resolution is different from current.
+                if self.worker._camera_changed or req_res != self.worker._current_camera_res:
                     if self.worker._camera_changed:
                         if main_cap: main_cap.release()
 
                         # ROBUSTNESS: Retry loop for camera initialization
                         for attempt in range(3):
-                            # Optimization: Use DSHOW and specify resolution IMMEDIATELY to avoid slow opening
                             main_cap = cv2.VideoCapture(self.worker.video_source, cv2.CAP_DSHOW)
                             if not main_cap.isOpened():
                                 main_cap = cv2.VideoCapture(self.worker.video_source)
 
                             if main_cap.isOpened():
                                 break
-                            print(f"TrackingThread: Camera init attempt {attempt+1} failed. Retrying...")
+                            print(f"CameraThread: init attempt {attempt+1} failed. Retrying...")
                             self.msleep(1000)
 
                         if main_cap and main_cap.isOpened():
-                            # Optimization: set MJPG to improve frame rates at high resolution
                             main_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-
                             w_req, h_req = self.worker.requested_camera_res
                             main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
                             main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
-
-                            # Buffering: Minimize latency
                             main_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            main_cap.set(cv2.CAP_PROP_FPS, 60)
 
                         self.worker._camera_changed = False
 
                     if main_cap and main_cap.isOpened():
+                        w_req, h_req = self.worker.requested_camera_res
+                        if w_req > 0:
+                            main_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
+                            main_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
 
-                        # Disable Auto Exposure and Auto Gain to prevent brightness swings from projector light
-                        # Note: behavior is backend dependent. 1/0.25 usually means manual.
-                        main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-                        # main_cap.set(cv2.CAP_PROP_GAIN, 0) # Disabled to allow better IR marker visibility
+                        try:
+                            main_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                            main_cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                            main_cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+                            main_cap.set(cv2.CAP_PROP_FPS, 60)
+                            curr_exp = main_cap.get(cv2.CAP_PROP_EXPOSURE)
+                            if curr_exp != 0: main_cap.set(cv2.CAP_PROP_EXPOSURE, curr_exp)
+                        except: pass
 
-                        # Read back actual resolution
                         act_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         act_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         self.worker._current_camera_res = (act_w, act_h)
-
-                        # Clear frame buffer to avoid resolution mismatch
-                        with QMutexLocker(self.worker.latest_main_frame_mutex):
-                             self.worker.latest_main_frame = None
-
-                        # Update requested res to match reality to prevent infinite re-initialization
-                        # if the camera doesn't support the requested resolution.
                         self.worker.requested_camera_res = (act_w, act_h)
-
-                        self.worker.camera_matrix = None # Reset estimation
-                        print(f"Camera Resolution Switched to: {act_w}x{act_h}")
+                        print(f"Camera Optimized: {act_w}x{act_h}")
+                        QThread.msleep(100)
                     else:
-                        if self.worker._camera_changed:
-                            self.worker.camera_error.emit(self.worker.video_source)
                         main_cap = None
 
                 if main_cap is None:
@@ -209,11 +200,76 @@ class TrackingThread(QThread):
                     continue
 
                 h_cam, w_cam = main_frame.shape[:2]
+                if self.worker._current_camera_res != (w_cam, h_cam):
+                    self.worker._current_camera_res = (w_cam, h_cam)
 
-                # IR Tracking
-                # Optimization: Skip tracking during setup/calibration to save CPU
+                # DECOUPLED PREVIEW: Update frames for tracking and UI immediately
+                with QMutexLocker(self.worker.latest_raw_frame_mutex):
+                    self.worker.latest_raw_frame = main_frame.copy()
+                    self.worker.latest_raw_frame_id += 1
+
+                with QMutexLocker(self.worker.latest_main_frame_mutex):
+                    if w_cam > 1920:
+                        self.worker.latest_main_frame = cv2.resize(main_frame, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        self.worker.latest_main_frame = main_frame.copy()
+                    self.worker.latest_main_frame_id += 1
+
+                elapsed = time.time() - start_time
+                sleep_time = max(1, int((frame_time - elapsed) * 1000))
+                QThread.msleep(sleep_time)
+            except Exception as e:
+                print(f"Error in Camera Thread: {e}")
+                QThread.msleep(500)
+
+        if main_cap:
+            main_cap.release()
+
+class TrackingThread(QThread):
+    def __init__(self, worker):
+        super().__init__()
+        self.setPriority(QThread.HighPriority)
+        self.worker = worker
+        self._running = True
+        self._last_processed_id = -1
+
+    def stop(self):
+        self._running = False
+        if not self.wait(2000):
+            self.terminate()
+
+    def run(self):
+        target_fps = 60
+        frame_time = 1.0 / target_fps
+
+        while self._running:
+            try:
+                start_time = time.time()
+
+                raw_frame = None
+                frame_id = -1
+
+                with QMutexLocker(self.worker.latest_raw_frame_mutex):
+                    if self.worker.latest_raw_frame is not None and self.worker.latest_raw_frame_id > self._last_processed_id:
+                        raw_frame = self.worker.latest_raw_frame.copy() # Copy to avoid modification issues
+                        frame_id = self.worker.latest_raw_frame_id
+                        self._last_processed_id = frame_id
+
+                if raw_frame is None:
+                    QThread.msleep(5)
+                    continue
+
+                h_cam, w_cam = raw_frame.shape[:2]
+
+                # IR Tracking logic
                 if not (self.worker._run_sls_flag or self.worker._run_calibration_flag or self.worker._run_boundary_detection_flag):
-                    tracked_points = self.worker.get_tracked_points(main_frame)
+                    if w_cam > 1280:
+                        tracking_w = 1280
+                        tracking_h = int(1280 * h_cam / w_cam)
+                        tracking_frame = cv2.resize(raw_frame, (tracking_w, tracking_h), interpolation=cv2.INTER_LINEAR)
+                        tracked_points = self.worker.get_tracked_points(tracking_frame)
+                    else:
+                        tracked_points = self.worker.get_tracked_points(raw_frame)
                 else:
                     tracked_points = []
 
@@ -222,6 +278,7 @@ class TrackingThread(QThread):
                     self.worker.last_homography_internal = self.worker.last_homography
                     self.worker.confidence_internal = self.worker.confidence
                     self.worker.tracking_frame_count += 1
+                    self.worker.latest_tracked_points_for_ui = tracked_points
 
                 if tracked_points is None: tracked_points = []
                 self.worker.trackers_detected.emit(len(tracked_points))
@@ -232,24 +289,13 @@ class TrackingThread(QThread):
                     if self.worker._calibrate_depth_flag and current_dist > 0.001:
                         self.worker.baseline_distance = current_dist
                         self.worker._calibrate_depth_flag = False
-
                     if self.worker.baseline_distance > 0.001:
                         self.worker.proximity_val = current_dist / self.worker.baseline_distance
-                    else:
-                        self.worker.proximity_val = 1.0
 
-                # HUD Data preparation (camera side)
-                with QMutexLocker(self.worker.latest_main_frame_mutex):
-                    self.worker.latest_main_frame = main_frame.copy()
-                    self.worker.latest_main_frame_id += 1
-                    self.worker.latest_tracked_points_for_ui = tracked_points
-
-                # Handle Calibration Flags (some need to run in camera thread)
+                # Still Frame Capture
                 if self.worker._capture_still_frame_flag:
-                    # Capture immediately to avoid "Waiting for Camera" hang
-                    rgb = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-                    # Perform specialized high-res detection for the still frame
-                    still_dots, rejected_dots = self.worker.get_tracked_points(main_frame, force_full=True, return_rejected=True)
+                    rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+                    still_dots, rejected_dots = self.worker.get_tracked_points(raw_frame, force_full=True, return_rejected=True)
                     self.worker.still_frame_ready.emit(QImage(rgb.data, w_cam, h_cam, w_cam * 3, QImage.Format_RGB888).copy(), still_dots, rejected_dots)
                     self.worker._capture_still_frame_flag = False
 
@@ -257,11 +303,8 @@ class TrackingThread(QThread):
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
                 QThread.msleep(sleep_time)
             except Exception as e:
-                print(f"Critical Error in Tracking Thread: {e}")
-                QThread.msleep(500)
-
-        if main_cap:
-            main_cap.release()
+                print(f"Error in Tracking Thread: {e}")
+                QThread.msleep(100)
 
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
@@ -299,7 +342,7 @@ class Worker(QObject):
         self.ir_threshold = 200
         self.auto_threshold = False
         self._camera_changed = True
-        self.requested_camera_res = (9999, 9999) # Default to max FOV for stability
+        self.requested_camera_res = (3840, 2160) # Default to max FOV for stability
         self._current_camera_res = (0, 0)
         self.calibration_camera_res = None
         self.baseline_distance = 0
@@ -397,7 +440,7 @@ class Worker(QObject):
         self._sls_patterns_y = []
         self._sls_captures_x = []
         self._sls_captures_y = []
-        self._sls_wait_frames = 12
+        self._sls_wait_frames = 45
         self._sls_curr_wait = 0
 
         # Projector Boundary Detection
@@ -451,6 +494,9 @@ class Worker(QObject):
         self.latest_main_frame = None
         self.latest_main_frame_mutex = QMutex()
         self.latest_main_frame_id = 0
+        self.latest_raw_frame = None
+        self.latest_raw_frame_mutex = QMutex()
+        self.latest_raw_frame_id = 0
         self.last_projected_frame_for_masking = None
         self.last_projected_frame_mutex = QMutex()
         self._last_captured_frame_id = -1
@@ -484,7 +530,9 @@ class Worker(QObject):
         except Exception as e:
             print(f"[DEBUG] Failed to init GPU acceleration: {e}")
 
-        # Start Tracking Thread
+        # Start Threads
+        self.camera_thread = CameraThread(self)
+        self.camera_thread.start()
         self.tracking_thread = TrackingThread(self)
         self.tracking_thread.start()
 
@@ -572,7 +620,7 @@ class Worker(QObject):
 
     def capture_still_frame(self):
         # Set to max FOV for capture
-        self.requested_camera_res = (9999, 9999)
+        self.requested_camera_res = (3840, 2160)
         self._capture_still_frame_flag = True
 
     def calibrate_depth(self):
@@ -597,7 +645,16 @@ class Worker(QObject):
                 self.h_c2p = np.array(matrix_list, dtype=np.float32)
 
     def init_rbf_from_points(self, points):
-        pts = np.array(points, dtype=np.float32)
+        # PERFORMANCE: Limit points to ensure reasonable fitting time (O(N^3) complexity)
+        # 1000 points is plenty for a smooth warp and fits in < 100ms.
+        if len(points) > 1000:
+            # Deterministic subsampling
+            indices = np.linspace(0, len(points) - 1, 1000, dtype=int)
+            points_to_fit = [points[i] for i in indices]
+        else:
+            points_to_fit = points
+
+        pts = np.array(points_to_fit, dtype=np.float32)
         cam_pts = pts[:, :2]
         proj_x = pts[:, 2]
         proj_y = pts[:, 3]
@@ -760,7 +817,7 @@ class Worker(QObject):
 
         # Performance: skip FX if heavily throttled and not essential
         if self.throttle_level > 0.95 and not live_only:
-             return frame
+            return frame
 
         # Performance: Use GPU for FX (Maintain UMat if already on GPU)
         is_umat = isinstance(frame, cv2.UMat)
@@ -1082,7 +1139,8 @@ class Worker(QObject):
                 new_feats = cv2.goodFeaturesToTrack(gray_frame, mask=fg, maxCorners=30, qualityLevel=0.01, minDistance=10)
                 if new_feats is not None:
                     self.visual_features = new_feats
-            except: pass
+            except:
+                pass
 
         return None, 0
 
@@ -1125,7 +1183,7 @@ class Worker(QObject):
                 self.prev_gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             if res is None:
-                 return ([], []) if return_rejected else []
+                return ([], []) if return_rejected else []
             return res
         except Exception as e:
             print(f"Error in tracking logic: {e}")
@@ -1202,7 +1260,12 @@ class Worker(QObject):
                     except: pass
 
         # 2. Advanced Pre-processing (GPU Accelerated)
-        th_size = max(150, int(w / 30))
+        # Performance: Use smaller Tophat kernel when locked with high confidence
+        if not force_full and self.confidence > 0.8:
+            th_size = 51
+        else:
+            th_size = max(150, int(w / 30))
+
         th_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (th_size, th_size))
         u_tophat = cv2.morphologyEx(u_gray, cv2.MORPH_TOPHAT, th_kernel)
 
@@ -1483,7 +1546,9 @@ class Worker(QObject):
                                 else:
                                     m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
                                     if m is not None:
-                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                                        h = np.eye(3, dtype=np.float32)
+                                        h[:2, :] = m
+                                        m = h
 
                                 if m is not None:
                                     proj = cv2.perspectiveTransform(src_pts, m)
@@ -1503,7 +1568,9 @@ class Worker(QObject):
                                 else:
                                     m, _ = cv2.estimateAffinePartial2D(src_pts, p_arr)
                                     if m is not None:
-                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                                        h = np.eye(3, dtype=np.float32)
+                                        h[:2, :] = m
+                                        m = h
 
                                 if m is not None:
                                     # Calculate reprojection error
@@ -1609,7 +1676,9 @@ class Worker(QObject):
                                 else:
                                     m, _ = cv2.estimateAffinePartial2D(src_pts, ordered_dst_arr)
                                     if m is not None:
-                                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                                        h = np.eye(3, dtype=np.float32)
+                                        h[:2, :] = m
+                                        m = h
 
                                 if m is not None:
                                     proj = cv2.perspectiveTransform(src_pts, m)
@@ -1748,7 +1817,9 @@ class Worker(QObject):
                 else:
                     m, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
                     if m is not None:
-                        h = np.eye(3, dtype=np.float32); h[:2, :] = m; m = h
+                        h = np.eye(3, dtype=np.float32)
+                        h[:2, :] = m
+                        m = h
 
                 if m is not None:
                     self.last_homography = m
@@ -1869,8 +1940,8 @@ class Worker(QObject):
         self._warp_map_dirty = False
 
     def process_video(self):
-        """Main Rendering Loop (Target 30 FPS)"""
-        target_fps = 30
+        """Main Rendering Loop (Target 60 FPS)"""
+        target_fps = 60
         frame_time = 1.0 / target_fps
 
         while self._running:
@@ -1894,21 +1965,16 @@ class Worker(QObject):
                     self.tracking_fps = t_fps
 
                 # 2. Get Main Frame (Optimized: No deep copy unless HUD is shown)
+                # REAL-TIME PREVIEW: Pull the latest frame immediately from CameraThread
                 with QMutexLocker(self.latest_main_frame_mutex):
-                    raw_main = self.latest_main_frame
-                    ui_tracked_points = self.latest_tracked_points_for_ui
+                    raw_main = self.latest_main_frame.copy() if self.latest_main_frame is not None else None
+                    ui_tracked_points = list(self.latest_tracked_points_for_ui)
                     curr_frame_id = self.latest_main_frame_id
 
                 if raw_main is None:
                     main_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 else:
-                    # PERFORMANCE: Only downscale/copy for UI if we are drawing HUD
-                    # 1080p is plenty for the monitor UI
-                    h_cam, w_cam = raw_main.shape[:2]
-                    if w_cam > 1920:
-                        main_frame = cv2.resize(raw_main, (1920, int(1920 * h_cam / w_cam)), interpolation=cv2.INTER_NEAREST)
-                    else:
-                        main_frame = raw_main.copy()
+                    main_frame = raw_main
 
                 h_cam, w_cam = main_frame.shape[:2]
 
@@ -1957,19 +2023,42 @@ class Worker(QObject):
                     self._warp_map_dirty = True
 
                 if self._run_sls_flag and self._sls_step == -1:
-                    # Generate patterns in background
-                    self.status_update.emit("Room Scan: Generating patterns...")
-                    self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
-                    self._sls_step = 0
-                    continue
+                    # Generate patterns if not already cached or if resolution changed
+                    print(f"Room Scan: Initiating pattern generation for {self.projector_width}x{self.projector_height}")
+                    self.status_update.emit("Room Scan: Preparing patterns...")
+                    needs_gen = not self._sls_patterns_x or not self._sls_patterns_y
+                    if not needs_gen:
+                        # Check if cached patterns match current projector resolution
+                        try:
+                            ph, pw = self._sls_patterns_x[0].shape[:2]
+                            if pw != self.projector_width or ph != self.projector_height:
+                                needs_gen = True
+                        except:
+                            needs_gen = True
+
+                    if needs_gen:
+                        self._sls_patterns_x, self._sls_patterns_y = generate_gray_code_patterns(self.projector_width, self.projector_height)
+
+                    if self._sls_patterns_x:
+                        print(f"Room Scan: Patterns ready. Total X: {len(self._sls_patterns_x)}, Total Y: {len(self._sls_patterns_y)}")
+                        self.status_update.emit("Room Scan: Ready to capture.")
+                        self._sls_step = 0
+                        self._sls_curr_wait = 0
+                    else:
+                        print("Room Scan Error: Pattern generation failed.")
+                        self.status_update.emit("Room Scan Error: Pattern generation failed.")
+                        self._run_sls_flag = False
 
                 if self._run_boundary_detection_flag:
                     # Ensure resolution is stable before capturing
-                    if self.requested_camera_res[0] > 5000 or \
-                       main_frame.shape[1] != self.requested_camera_res[0] or \
-                       main_frame.shape[0] != self.requested_camera_res[1]:
+                    # Optimization: Compare hardware resolution against requested resolution
+                    actual_w, actual_h = self._current_camera_res
+                    if self.requested_camera_res[0] > 3840 or \
+                       actual_w != self.requested_camera_res[0] or \
+                       actual_h != self.requested_camera_res[1]:
                         # Still waiting for camera thread to catch up
                         self._sls_curr_wait = 0
+                        QThread.msleep(10)
                         continue
 
                     if self._boundary_step == 0:
@@ -2066,15 +2155,23 @@ class Worker(QObject):
                         self._boundary_step = 0
                         self._boundary_captures = []
                 elif self._run_sls_flag:
-                    # Ensure resolution is stable before capturing
-                    if self.requested_camera_res[0] > 5000 or \
-                       main_frame.shape[1] != self.requested_camera_res[0] or \
-                       main_frame.shape[0] != self.requested_camera_res[1]:
-                        # Still waiting for camera thread to catch up
-                        self._sls_curr_wait = 0
+                    # Structured Light Scanning takes priority
+                    if not self._sls_patterns_x:
+                        self._sls_step = -1
+                        QThread.msleep(10)
                         continue
 
-                    # Structured Light Scanning takes priority
+                    # Ensure resolution is stable before capturing
+                    actual_w, actual_h = self._current_camera_res
+                    if actual_w != self.requested_camera_res[0] or \
+                       actual_h != self.requested_camera_res[1]:
+                        # Still waiting for camera thread to catch up or resolution to settle
+                        if self.frame_count % 30 == 0:
+                            print(f"Room Scan: Waiting for resolution stability... Current: {actual_w}x{actual_h}, Requested: {self.requested_camera_res}")
+                        self._sls_curr_wait = 0
+                        QThread.msleep(10)
+                        continue
+
                     total_x = len(self._sls_patterns_x)
                     total_y = len(self._sls_patterns_y)
 
@@ -2114,83 +2211,18 @@ class Worker(QObject):
                         else:
                             self._sls_curr_wait += 1
                     else:
-                        # Decoding
-                        print("Decoding Room Scan...")
-                        proj_x, valid_x = decode_gray_code(self._sls_captures_x, self.projector_width)
-                        proj_y, valid_y = decode_gray_code(self._sls_captures_y, self.projector_height)
-
-                        if valid_x.shape != valid_y.shape:
-                            print("Error: SLS capture shape mismatch!")
-                            self._run_sls_flag = False
-                            self.calibration_complete.emit(False)
-                            continue
-
-                        valid = valid_x & valid_y
-
-                        # Refine valid mask with morphological cleanup
-                        kernel_valid = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                        valid_uint8 = (valid.astype(np.uint8) * 255)
-                        valid_uint8 = cv2.morphologyEx(valid_uint8, cv2.MORPH_CLOSE, kernel_valid)
-                        valid = valid_uint8 > 128
-
-                        # Store dense LUT as normalized [0-1] and apply median filter to remove noise-induced "spikes"
-                        self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5) / self.projector_width
-                        self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5) / self.projector_height
-                        self.sls_valid_mask = valid.astype(np.uint8)
-
-                        # Automatically derive Projector Boundary from SLS valid mask
-                        # Clean up the mask aggressively to fill holes and smooth edges
-                        kernel = np.ones((25, 25), np.uint8)
-                        mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
-                        mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
-                        mask_solid = cv2.dilate(mask_solid, kernel, iterations=3)
-
-                        contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        # Filter contours by size - lowered to 0.5% of FOV for better sensitivity
-                        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_cam * h_cam * 0.005)]
-
-                        if valid_contours:
-                            main_contour = max(valid_contours, key=cv2.contourArea)
-                            # Use convex hull and force a simple polygon or rectangle
-                            hull = cv2.convexHull(main_contour)
-                            peri = cv2.arcLength(hull, True)
-                            approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
-
-                            if len(approx) < 4 or len(approx) > 12:
-                                rect = cv2.minAreaRect(hull)
-                                approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
-
-                            # Store as normalized points
-                            pts = [ (float(p[0][0]) / w_cam, float(p[0][1]) / h_cam) for p in approx ]
-                            self.projector_boundary = pts
-                            self.boundary_detected.emit(pts)
-                            print(f"One-Click Sync: Detected boundary with {len(pts)} points.")
-
-                        # Collect mapping points for RBF (sub-sampled)
-                        calib_data = []
-                        step = 10 # Sample every 10 pixels
-                        # Ensure indices are within bounds
-                        h_idx, w_idx = valid.shape
-                        for r in range(0, h_idx, step):
-                            for c in range(0, w_idx, step):
-                                if valid[r, c]:
-                                    # Normalize proj_x/y to [0, 1] based on full native projector res
-                                    nx = float(proj_x[r, c]) / self.projector_width
-                                    ny = float(proj_y[r, c]) / self.projector_height
-                                    calib_data.append([float(c), float(r), nx, ny])
-
-                        if len(calib_data) > 10:
-                            self.init_rbf_from_points(calib_data)
-                            # Estimate homography from sample points for fallback (maps to norm space)
-                            pts_arr = np.array(calib_data)
-                            self.h_c2p, _ = cv2.findHomography(pts_arr[:100, :2], pts_arr[:100, 2:])
-                            self.calibration_camera_res = (w_cam, h_cam)
-                            self.calibration_complete.emit(True)
-                        else:
-                            self.calibration_complete.emit(False)
-
+                        # DECOUPLED: Start asynchronous decoding to prevent rendering freeze
+                        # This moves Gray code decoding and RBF fitting to a background thread
                         self._run_sls_flag = False
-                        self.show_calibration_verify = True # Automatically show verification
+                        self.status_update.emit("Room Scan: Processing data...")
+
+                        thread = threading.Thread(
+                            target=self._async_decode_sls,
+                            args=(list(self._sls_captures_x), list(self._sls_captures_y),
+                                  self.projector_width, self.projector_height, w_cam, h_cam)
+                        )
+                        thread.daemon = True
+                        thread.start()
                 elif self.show_camera_on_projector:
                     cv2.resize(main_frame, (w, h), dst=self.projector_buffer)
                 elif self.show_calibration_pattern:
@@ -2287,9 +2319,11 @@ class Worker(QObject):
                 # Handle Auto-Calibration logic (Multi-frame averaging)
                 if self._run_calibration_flag:
                     # Ensure resolution is stable before capturing
-                    if self.requested_camera_res[0] > 5000 or \
-                       main_frame.shape[1] != self.requested_camera_res[0] or \
-                       main_frame.shape[0] != self.requested_camera_res[1]:
+                    actual_w, actual_h = self._current_camera_res
+                    if self.requested_camera_res[0] > 3840 or \
+                       actual_w != self.requested_camera_res[0] or \
+                       actual_h != self.requested_camera_res[1]:
+                        QThread.msleep(10)
                         continue
 
                     if curr_frame_id > self._last_captured_frame_id:
@@ -2438,6 +2472,10 @@ class Worker(QObject):
 
                 for mask in iterable_masks:
                     mask_id = id(mask)
+                    lfo_val = 1.0
+                    if mask.fx_params.get('lfo_enabled'):
+                        lfo_val = self.get_lfo_value(mask)
+
                     target_fade = 1.0 if mask.visible else 0.0
                     curr_fade = self.mask_fade_levels.get(mask_id, 0.0)
 
@@ -2856,7 +2894,7 @@ class Worker(QObject):
                     self.throttle_level = max(0.0, self.throttle_level - 0.01)
                     # Slowly recover resolution if performance is good
                     if self.throttle_level < 0.1 and self.render_scale < 0.85:
-                         self.render_scale = min(0.85, self.render_scale + 0.005)
+                        self.render_scale = min(0.85, self.render_scale + 0.005)
 
                 sleep_time = max(1, int((frame_time - elapsed) * 1000))
                 QThread.msleep(sleep_time)
@@ -3168,7 +3206,8 @@ class Worker(QObject):
     def stop(self):
         """Graceful shutdown of all worker threads and resources."""
         self._running = False
-        print("Worker: Shutting down tracking thread...")
+        print("Worker: Shutting down threads...")
+        self.camera_thread.stop()
         self.tracking_thread.stop()
 
         print("Worker: Purging all video players...")
@@ -3182,8 +3221,8 @@ class Worker(QObject):
 
     def run_boundary_detection(self):
         # We MUST keep resolution consistent across all setup steps
-        # Use (9999,9999) as a trigger for max available res in TrackingThread
-        self.requested_camera_res = (9999, 9999)
+        # Use (3840,3840) as a trigger for max available res in TrackingThread
+        self.requested_camera_res = (3840, 2160)
         self._boundary_step = 0
         self._boundary_captures = []
         self._sls_curr_wait = 0
@@ -3199,7 +3238,7 @@ class Worker(QObject):
         # FOV stability is paramount for projection mapping
 
     def run_auto_calibration(self):
-        self.requested_camera_res = (9999, 9999)
+        self.requested_camera_res = (3840, 2160)
         self._run_calibration_flag = True
 
     def run_one_click_sync(self):
@@ -3207,7 +3246,7 @@ class Worker(QObject):
         self.run_room_scan()
 
     def run_room_scan(self):
-        self.requested_camera_res = (9999, 9999) # Request max FOV
+        self.requested_camera_res = (3840, 2160) # Request max FOV
         self._run_sls_flag = True
         self._sls_step = -1 # Trigger pattern generation in worker thread
         self._sls_captures_x = []
@@ -3246,7 +3285,7 @@ class Worker(QObject):
             cal_w, cal_h = self.calibration_camera_res
         else:
             # Fallback if not calibrated: use current res
-            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (9999, 9999)
+            cal_w, cal_h = self._current_camera_res if self._current_camera_res[0] > 0 else (3840, 2160)
 
         # Ensure we are using absolute pixels relative to the calibration FOV
         pts_cal = pts_arr * [cal_w, cal_h]
@@ -3353,3 +3392,90 @@ class Worker(QObject):
 
     def set_occlusion_enabled(self, enabled):
         self.occlusion_enabled = enabled
+
+    def _async_decode_sls(self, captures_x, captures_y, proj_w, proj_h, cam_w, cam_h):
+        """Asynchronous decoding of Gray code patterns and calibration fitting."""
+        try:
+            print("Decoding Room Scan (Background Thread)...")
+            self.status_update.emit("Room Scan: Decoding Gray codes...")
+
+            proj_x, valid_x = decode_gray_code(captures_x, proj_w)
+            proj_y, valid_y = decode_gray_code(captures_y, proj_h)
+
+            if valid_x.shape != valid_y.shape:
+                print("Error: SLS capture shape mismatch!")
+                self.calibration_complete.emit(False)
+                return
+
+            valid = valid_x & valid_y
+
+            # Refine valid mask with morphological cleanup
+            kernel_valid = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            valid_uint8 = (valid.astype(np.uint8) * 255)
+            valid_uint8 = cv2.morphologyEx(valid_uint8, cv2.MORPH_CLOSE, kernel_valid)
+            valid = valid_uint8 > 128
+
+            # Store dense LUT as normalized [0-1] and apply median filter to remove noise-induced "spikes"
+            self.sls_lut_x = cv2.medianBlur(proj_x.astype(np.float32), 5) / proj_w
+            self.sls_lut_y = cv2.medianBlur(proj_y.astype(np.float32), 5) / proj_h
+            self.sls_valid_mask = valid.astype(np.uint8)
+
+            # Automatically derive Projector Boundary from SLS valid mask
+            self.status_update.emit("Room Scan: Estimating boundary...")
+            kernel = np.ones((25, 25), np.uint8)
+            mask_solid = cv2.morphologyEx(self.sls_valid_mask, cv2.MORPH_CLOSE, kernel)
+            mask_solid = cv2.morphologyEx(mask_solid, cv2.MORPH_OPEN, kernel)
+            mask_solid = cv2.dilate(mask_solid, kernel, iterations=3)
+
+            contours, _ = cv2.findContours(mask_solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_contours = [c for c in contours if cv2.contourArea(c) > (cam_w * cam_h * 0.005)]
+
+            if valid_contours:
+                main_contour = max(valid_contours, key=cv2.contourArea)
+                hull = cv2.convexHull(main_contour)
+                peri = cv2.arcLength(hull, True)
+                approx = cv2.approxPolyDP(hull, 0.01 * peri, True)
+
+                if len(approx) < 4 or len(approx) > 12:
+                    rect = cv2.minAreaRect(hull)
+                    approx = cv2.boxPoints(rect).reshape(-1, 1, 2)
+
+                pts = [ (float(p[0][0]) / cam_w, float(p[0][1]) / cam_h) for p in approx ]
+                self.projector_boundary = pts
+                self.boundary_detected.emit(pts)
+
+            # Collect mapping points for RBF (sub-sampled)
+            self.status_update.emit("Room Scan: Fitting interpolation maps...")
+            calib_data = []
+            step = 10 # Sample every 10 pixels
+            h_idx, w_idx = valid.shape
+            for r in range(0, h_idx, step):
+                for c in range(0, w_idx, step):
+                    if valid[r, c]:
+                        nx = float(proj_x[r, c]) / proj_w
+                        ny = float(proj_y[r, c]) / proj_h
+                        calib_data.append([float(c), float(r), nx, ny])
+
+            if len(calib_data) > 10:
+                # init_rbf_from_points now includes internal subsampling for performance
+                self.init_rbf_from_points(calib_data)
+
+                # Estimate homography from sample points for fallback
+                pts_arr = np.array(calib_data)
+                # Use a larger sample for homography (more robust than just 100)
+                h_sample = min(500, len(pts_arr))
+                self.h_c2p, _ = cv2.findHomography(pts_arr[:h_sample, :2], pts_arr[:h_sample, 2:])
+
+                self.calibration_camera_res = (cam_w, cam_h)
+                self.status_update.emit("Room Scan: Complete.")
+                self.calibration_complete.emit(True)
+                self.show_calibration_verify = True
+            else:
+                print("Error: Too few valid points for SLS calibration.")
+                self.status_update.emit("Room Scan Error: Weak signal.")
+                self.calibration_complete.emit(False)
+
+        except Exception as e:
+            print(f"Critical Error in SLS Async Decoding: {e}")
+            self.status_update.emit(f"Room Scan Error: {str(e)}")
+            self.calibration_complete.emit(False)
