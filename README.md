@@ -5,12 +5,14 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 
 ## Features
 
-*   **Real-Time IR Tracking:** Tracks up to 4 IR markers simultaneously.
+*   **Real-Time IR Tracking:** Tracks configurable IR marker constellations with smoothing and dropout recovery.
 *   **Dynamic Mask Warping:** Warps a video source to a mask defined by the live positions of the IR trackers.
 *   **Custom Mask Creation:** An interactive mode to draw a custom polygon mask directly on the video feed.
 *   **Cue System:** A list-based system to manage and trigger different video cues.
 *   **Projector Keystone Correction:** A four-point warping system to align the final output perfectly to any projection surface.
 *   **Depth Estimation:** A system to create a 3D "zoom" effect by scaling the mask based on the distance between trackers.
+*   **Adaptive Thresholding:** Switch between manual threshold and auto (Otsu) threshold for varying stage lighting.
+*   **Live Diagnostics:** Real-time FPS and frame-time stats in the control panel.
 *   **Multi-threaded Performance:** A modern architecture that separates video processing from the UI to ensure a responsive and fast experience.
 *   **Standalone Application:** Includes a setup script to package the tool into a native macOS (`.app`) application.
 
@@ -77,8 +79,8 @@ This project uses `py2app` to create a standalone macOS application. This is the
     *   Click on the main video feed to draw the vertices of your custom mask shape.
     *   When you are done, click **"Finish Mask"**. The mask points are now associated with the selected video cue.
 6.  **Link Trackers:**
-    *   In the "Trackers" input field, enter the four indices of the detected trackers that correspond to the four corners of your mask (e.g., `0,1,2,3`).
-    *   Click **"Link Trackers"**.
+    *   Click **"Select Guitar Markers"**, capture a still frame, and click the marker positions directly on the image in order.
+    *   Click **"Confirm Markers"**, then click **"Link Mask to Markers"** for the selected cue.
 7.  **Calibrate Projector:**
     *   Click **"Enable Warping"**. You will see four red dots on the projector output window.
     *   Drag these dots to the corners of your real-world projection surface to correct for keystone distortion.
