@@ -323,12 +323,6 @@ class ProjectionMappingApp(QMainWindow):
             [screen.name() or f"Screen {i + 1}" for i, screen in enumerate(self.screens)]
         )
 
-        primary = QApplication.primaryScreen()
-        if primary is not None:
-            screen_geo = primary.availableGeometry()
-            min_w = max(320, screen_geo.width() // 4)
-            min_h = max(180, screen_geo.height() // 4)
-            self.video_display.setMinimumSize(min_w, min_h)
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
         projector_layout.addWidget(self.projector_combo)
         projector_group.setLayout(projector_layout)
@@ -359,12 +353,6 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_preview_label = QLabel("Waiting for projector frames...")
         self.projector_preview_label.setAlignment(Qt.AlignCenter)
         self.projector_preview_label.setMinimumHeight(140)
-        primary = QApplication.primaryScreen()
-        if primary is not None:
-            screen_geo = primary.availableGeometry()
-            min_w = max(320, screen_geo.width() // 4)
-            min_h = max(180, screen_geo.height() // 4)
-            self.projector_preview_label.setMinimumSize(min_w, min_h)
         preview_layout.addWidget(self.preview_checkbox)
         preview_layout.addWidget(self.projector_preview_label)
         preview_group.setLayout(preview_layout)
@@ -461,7 +449,19 @@ class ProjectionMappingApp(QMainWindow):
         diagnostics_group.setLayout(diagnostics_layout)
         self.control_layout.addWidget(diagnostics_group)
 
+        self.apply_preview_minimum_sizes()
         self.control_layout.addStretch()
+
+    def apply_preview_minimum_sizes(self):
+        primary = QApplication.primaryScreen()
+        if primary is None:
+            return
+
+        screen_geo = primary.availableGeometry()
+        min_w = max(320, screen_geo.width() // 4)
+        min_h = max(180, screen_geo.height() // 4)
+        self.video_display.setMinimumSize(min_w, min_h)
+        self.projector_preview_label.setMinimumSize(min_w, min_h)
 
     def toggle_preview(self, checked):
         self.projector_preview_label.setVisible(checked)
