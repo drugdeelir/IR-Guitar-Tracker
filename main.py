@@ -1,4 +1,5 @@
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -28,14 +29,42 @@ from worker import Worker
 
 SETTINGS_PATH = Path("settings.json")
 
+def _get_camera_backends():
+    is_windows = platform.system().lower() == "windows"
+    if not is_windows:
+        return [cv2.CAP_ANY]
+
+    preferred = ["CAP_DSHOW", "CAP_MSMF", "CAP_ANY"]
+    backends = []
+    for name in preferred:
+        backend = getattr(cv2, name, None)
+        if backend is not None and backend not in backends:
+            backends.append(backend)
+    return backends or [cv2.CAP_ANY]
+
+
+def _open_capture(index, backend):
+    try:
+        return cv2.VideoCapture(index, backend)
+    except TypeError:
+        return cv2.VideoCapture(index)
+
 
 def get_available_cameras(max_probe=10):
     arr = []
+    backends = _get_camera_backends()
+
     for index in range(max_probe):
-        cap = cv2.VideoCapture(index)
-        if cap.isOpened():
+        opened = False
+        for backend in backends:
+            cap = _open_capture(index, backend)
+            if cap.isOpened():
+                opened = True
+                cap.release()
+                break
+            cap.release()
+        if opened:
             arr.append(index)
-        cap.release()
     return arr
 
 
