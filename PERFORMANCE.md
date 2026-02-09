@@ -1,9 +1,20 @@
 
-# Performance Recommendations for Your Mac Mini
+# Performance Recommendations for Your Windows 10 Laptop
 
 This application has been architected with a multi-threaded design to maximize performance by separating the user interface from the heavy video processing. This is the most significant optimization for ensuring a smooth, real-time experience.
 
-However, here are several additional factors you can control to get the best possible performance on your Mac Mini.
+However, here are several additional factors you can control to get the best possible performance on your Windows 10 laptop.
+
+
+### 0. Windows 10 Defaults Included in App
+
+This project now applies Windows-aware runtime defaults automatically when it detects Windows:
+
+* Uses the **DirectShow camera backend** (`cv2.CAP_DSHOW`) for faster and more stable webcam open/close behavior on Windows 10.
+* Starts with a **lighter camera workload** (960x540 at 30 FPS) to reduce dropped frames on laptop CPUs while preserving reliable IR tracking.
+* Uses a slightly more aggressive detection downscale to reduce per-frame CPU cost.
+
+If your machine is more powerful, you can raise resolution/FPS in code later, but these defaults are tuned for stability-first live performance.
 
 ### 1. Video Resolution is Key
 
@@ -19,8 +30,8 @@ The most performance-intensive tasks in the application are directly related to 
 ### 3. System Environment
 
 *   **Close Unnecessary Applications:** Before a live performance, close all other applications (web browsers, email clients, etc.) to free up CPU, RAM, and GPU resources for the projection mapping tool.
-*   **Use Activity Monitor:** Use the macOS Activity Monitor to check if any other processes are unexpectedly consuming a large amount of CPU or memory.
-*   **Power Connection:** Ensure your Mac Mini is plugged into a power source. Running on a UPS (if applicable) in a power-saving mode can throttle performance.
+*   **Use Task Manager:** Use the Windows Task Manager to check if any other processes are unexpectedly consuming a large amount of CPU or memory.
+*   **Power Connection:** Ensure your Windows 10 laptop is plugged into a power source. Running on a UPS (if applicable) in a power-saving mode can throttle performance.
 
 ### 4. Lighting and IR Tracking
 
