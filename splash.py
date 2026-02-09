@@ -16,26 +16,41 @@ class SplashScreen(QSplashScreen):
         
         self.cap = cv2.VideoCapture('logo.mkv')
         if not self.cap.isOpened():
-            print("Warning: Could not open logo.mkv. Attempting to use logo.png fallback.")
-            pixmap = QPixmap('logo.png')
-            if not pixmap.isNull():
-                self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self._set_fallback_logo()
             return
-            
+
+        # Validate decode path before starting the timer to avoid startup crashes
+        # caused by unstable codec backends on some Windows builds.
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.cap.release()
+            self._set_fallback_logo()
+            return
+
+        self._display_frame(frame)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(33) # ~30 FPS
 
+    def _set_fallback_logo(self):
+        pixmap = QPixmap('logo.png')
+        if not pixmap.isNull():
+            self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _display_frame(self, frame):
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+
+        pixmap = QPixmap.fromImage(qt_image)
+        self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
     def update_frame(self):
         ret, frame = self.cap.read()
-        if ret:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame_rgb.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            
-            pixmap = QPixmap.fromImage(qt_image)
-            self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)) # Small logo
+        if ret and frame is not None:
+            self._display_frame(frame)
         else:
             self.timer.stop()
             self.cap.release()

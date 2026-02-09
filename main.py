@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
 import cv2
 import numpy as np
@@ -99,7 +100,9 @@ def _get_camera_backends():
     if not is_windows:
         return [cv2.CAP_ANY]
 
-    preferred = ["CAP_DSHOW", "CAP_MSMF", "CAP_ANY"]
+    # MSMF has repeatedly produced hard crashes on some Windows camera drivers.
+    # Prioritize DirectShow and fall back to CAP_ANY for better stability.
+    preferred = ["CAP_DSHOW", "CAP_ANY"]
     backends = []
     for name in preferred:
         backend = getattr(cv2, name, None)

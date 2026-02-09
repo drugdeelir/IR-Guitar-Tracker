@@ -8,15 +8,7 @@ if exist "venv\Scripts\python.exe" (
     set "PYTHON_EXE=python"
 )
 
-echo Ensuring Python requirements are installed...
-%PYTHON_EXE% -m pip install -r requirements.txt
-if errorlevel 1 (
-    echo.
-    echo Warning: dependency install failed. Attempting to start anyway...
-    echo.
-)
-
-%PYTHON_EXE% main.py
+%PYTHON_EXE% start.py
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
