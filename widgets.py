@@ -1,6 +1,6 @@
 from PyQt5.QtCore import QPoint, QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QPixmap, QPolygonF
-from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout, QPushButton, QWidget
+from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout, QPushButton, QWidget
 
 
 class MarkerSelectionDialog(QDialog):
@@ -267,3 +267,95 @@ class ProjectorWindow(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+
+
+class PolygonMaskDialog(QDialog):
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(900, 650)
+        self.original_pixmap = None
+        self.points = []
+
+        self.layout = QVBoxLayout(self)
+        self.image_label = QLabel("Capture a still frame first.")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.mousePressEvent = self.image_clicked
+        self.layout.addWidget(self.image_label)
+
+        buttons_layout = QHBoxLayout()
+        self.clear_button = QPushButton("Clear Points")
+        self.clear_button.clicked.connect(self.clear_points)
+        self.confirm_button = QPushButton("Confirm 4-Point Mask")
+        self.confirm_button.clicked.connect(self.accept)
+        buttons_layout.addWidget(self.clear_button)
+        buttons_layout.addWidget(self.confirm_button)
+        self.layout.addLayout(buttons_layout)
+
+    def set_pixmap(self, pixmap):
+        self.original_pixmap = pixmap
+        self._render_preview()
+
+    def _get_draw_rect(self):
+        if not self.original_pixmap:
+            return None
+        label_size = self.image_label.size()
+        pixmap_size = self.original_pixmap.size()
+        if pixmap_size.width() == 0 or pixmap_size.height() == 0:
+            return None
+        scaled = pixmap_size.scaled(label_size, Qt.KeepAspectRatio)
+        x = (label_size.width() - scaled.width()) // 2
+        y = (label_size.height() - scaled.height()) // 2
+        return x, y, scaled.width(), scaled.height()
+
+    def _label_to_image(self, point):
+        rect = self._get_draw_rect()
+        if not rect or not self.original_pixmap:
+            return None
+        x, y, draw_w, draw_h = rect
+        rel_x = point.x() - x
+        rel_y = point.y() - y
+        if rel_x < 0 or rel_y < 0 or rel_x > draw_w or rel_y > draw_h:
+            return None
+        img_w = self.original_pixmap.width()
+        img_h = self.original_pixmap.height()
+        img_x = int(rel_x * img_w / max(draw_w, 1))
+        img_y = int(rel_y * img_h / max(draw_h, 1))
+        return QPoint(img_x, img_y)
+
+    def image_clicked(self, event):
+        if len(self.points) >= 4:
+            return
+        point = self._label_to_image(event.pos())
+        if point is None:
+            return
+        self.points.append(point)
+        self._render_preview()
+
+    def clear_points(self):
+        self.points = []
+        self._render_preview()
+
+    def get_points(self):
+        return self.points
+
+    def _render_preview(self):
+        if not self.original_pixmap:
+            return
+        preview = self.original_pixmap.copy()
+        painter = QPainter(preview)
+        painter.setPen(QPen(Qt.yellow, 8))
+        for p in self.points:
+            painter.drawPoint(p)
+        if len(self.points) >= 2:
+            painter.setPen(QPen(Qt.green, 3))
+            painter.drawPolyline(QPolygonF([QPointF(p) for p in self.points]))
+        if len(self.points) == 4:
+            painter.setPen(QPen(Qt.green, 3))
+            painter.drawLine(self.points[-1], self.points[0])
+        painter.end()
+        self.image_label.setPixmap(preview.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._render_preview()

@@ -1,6 +1,9 @@
 import time
 from itertools import combinations
+import os
 import platform
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
 import numpy as np
@@ -377,8 +380,24 @@ class Worker(QObject):
             for i, mask in enumerate(self.masks):
                 if self.active_cue_index >= 0 and i != self.active_cue_index:
                     continue
-                if mask.type != "dynamic" or mask.linked_marker_count != len(tracked_points):
+                if not mask.video_path or not mask.source_points:
                     continue
+
+                if mask.type == "dynamic":
+                    if mask.linked_marker_count != len(tracked_points):
+                        continue
+                    if len(tracked_points) != len(mask.source_points):
+                        continue
+                    src_pts = self._get_cached_source_points(mask)
+                    dst_pts = self._calculate_destination_points(tracked_points)
+                else:
+                    if len(mask.source_points) < 4:
+                        continue
+                    dst_pts = np.float32(mask.source_points)
+                    fh, fw = 720, 1280
+                    src_pts = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
+                    if len(dst_pts) != 4:
+                        continue
 
                 if mask.video_path not in self.video_captures:
                     self.video_captures[mask.video_path] = cv2.VideoCapture(mask.video_path)
@@ -390,14 +409,13 @@ class Worker(QObject):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret_cue, frame_cue = cap.read()
 
-                if not (ret_cue and mask.source_points):
+                if not ret_cue:
                     continue
 
-                if len(tracked_points) != len(mask.source_points):
-                    continue
+                if mask.type != "dynamic":
+                    fh, fw = frame_cue.shape[:2]
+                    src_pts = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
 
-                src_pts = self._get_cached_source_points(mask)
-                dst_pts = self._calculate_destination_points(tracked_points)
                 matrix = self._compute_transform(src_pts, dst_pts)
                 if matrix is None:
                     continue

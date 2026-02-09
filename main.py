@@ -1,22 +1,32 @@
 import json
+import os
 import platform
 import sys
 from pathlib import Path
 
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+
 import cv2
-from PyQt5.QtCore import QThread, Qt, QTimer
-from PyQt5.QtGui import QPixmap
+import numpy as np
+from PyQt5.QtCore import QEventLoop, QThread, Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSlider,
+    QScrollArea,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -24,10 +34,65 @@ from PyQt5.QtWidgets import (
 
 from mask import Mask
 from splash import SplashScreen
-from widgets import MarkerSelectionDialog, ProjectorWindow, VideoDisplay
+from widgets import MarkerSelectionDialog, PolygonMaskDialog, ProjectorWindow, VideoDisplay
 from worker import Worker
 
 SETTINGS_PATH = Path("settings.json")
+
+
+def configure_opencv_logging():
+    try:
+        cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+    except AttributeError:
+        try:
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+        except Exception:
+            pass
+
+
+class StartupWizardDialog(QDialog):
+    def __init__(self, cameras, screens, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Startup Wizard")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Let's quickly configure your tracking session."))
+
+        form = QFormLayout()
+        self.camera_combo = QComboBox()
+        if cameras:
+            self.camera_combo.addItems([f"Camera {i}" for i in cameras])
+            camera_idx = settings.get("camera_index", 0)
+            self.camera_combo.setCurrentIndex(min(camera_idx, len(cameras) - 1))
+        else:
+            self.camera_combo.addItem("No camera detected")
+            self.camera_combo.setEnabled(False)
+        form.addRow("Camera", self.camera_combo)
+
+        self.projector_combo = QComboBox()
+        self.projector_combo.addItems(
+            [screen.name() or f"Screen {i + 1}" for i, screen in enumerate(screens)]
+        )
+        if screens:
+            proj_idx = settings.get("projector_index", 0)
+            self.projector_combo.setCurrentIndex(min(proj_idx, len(screens) - 1))
+        form.addRow("Projector", self.projector_combo)
+
+        self.threshold_combo = QComboBox()
+        self.threshold_combo.addItems(["Manual", "Auto (Otsu)"])
+        self.threshold_combo.setCurrentIndex(settings.get("threshold_mode", 0))
+        form.addRow("Threshold Mode", self.threshold_combo)
+
+        self.auto_sync_checkbox = QCheckBox("Enable auto-sync of marker links")
+        self.auto_sync_checkbox.setChecked(settings.get("auto_sync_enabled", True))
+        form.addRow("", self.auto_sync_checkbox)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 def _get_camera_backends():
     is_windows = platform.system().lower() == "windows"
@@ -53,18 +118,28 @@ def _open_capture(index, backend):
 def get_available_cameras(max_probe=10):
     arr = []
     backends = _get_camera_backends()
+    misses_after_first = 0
 
     for index in range(max_probe):
         opened = False
         for backend in backends:
             cap = _open_capture(index, backend)
             if cap.isOpened():
+                ret, _ = cap.read()
+                if not ret:
+                    cap.release()
+                    continue
                 opened = True
                 cap.release()
                 break
             cap.release()
         if opened:
             arr.append(index)
+            misses_after_first = 0
+        elif arr:
+            misses_after_first += 1
+            if misses_after_first >= 3:
+                break
     return arr
 
 
@@ -75,6 +150,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
         self.selected_markers = []
+        self.latest_camera_qimage = None
         self.settings = self.load_settings()
 
         self.setStatusBar(QStatusBar(self))
@@ -97,7 +173,9 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.show()
 
         self.worker.frame_ready.connect(self.video_display.set_image)
+        self.worker.frame_ready.connect(self.cache_latest_frame)
         self.worker.projector_frame_ready.connect(self.projector_window.set_image)
+        self.worker.projector_frame_ready.connect(self.update_projector_preview)
         self.projector_window.warp_points_changed.connect(self.worker.set_warp_points)
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.camera_error.connect(self.show_camera_error)
@@ -110,6 +188,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
         self.apply_loaded_settings()
+        self.maybe_show_startup_wizard()
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
@@ -130,6 +209,9 @@ class ProjectionMappingApp(QMainWindow):
             "camera_index": self.camera_combo.currentIndex(),
             "projector_index": self.projector_combo.currentIndex(),
             "warp_points": self.projector_window.get_warp_points_normalized(),
+            "auto_sync_enabled": self.auto_sync_checkbox.isChecked(),
+            "show_preview_enabled": self.preview_checkbox.isChecked(),
+            "wizard_completed": True,
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
@@ -142,6 +224,9 @@ class ProjectionMappingApp(QMainWindow):
         threshold_mode = self.settings.get("threshold_mode", 0)
         self.threshold_mode_combo.setCurrentIndex(threshold_mode)
         self.depth_sensitivity_slider.setValue(self.settings.get("depth_sensitivity", 100))
+        self.auto_sync_checkbox.setChecked(self.settings.get("auto_sync_enabled", True))
+        self.preview_checkbox.setChecked(self.settings.get("show_preview_enabled", True))
+        self.projector_preview_label.setVisible(self.preview_checkbox.isChecked())
 
         cam_idx = self.settings.get("camera_index", 0)
         if self.camera_combo.count() and self.camera_combo.isEnabled():
@@ -195,10 +280,32 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.clear_marker_config()
         self.statusBar().showMessage("Marker selection cleared.", 3000)
 
+    def maybe_show_startup_wizard(self):
+        if self.settings.get("wizard_completed"):
+            return
+
+        dialog = StartupWizardDialog(self.available_cameras, self.screens, self.settings, self)
+        if dialog.exec_():
+            if dialog.camera_combo.isEnabled():
+                self.camera_combo.setCurrentIndex(dialog.camera_combo.currentIndex())
+                self.change_camera(dialog.camera_combo.currentIndex())
+            if self.projector_combo.count() > 0:
+                self.projector_combo.setCurrentIndex(dialog.projector_combo.currentIndex())
+                self.change_projector(dialog.projector_combo.currentIndex())
+            self.threshold_mode_combo.setCurrentIndex(dialog.threshold_combo.currentIndex())
+            self.auto_sync_checkbox.setChecked(dialog.auto_sync_checkbox.isChecked())
+            self.settings["wizard_completed"] = True
+            self.save_settings()
+
     def create_control_panel(self):
         self.control_panel = QWidget()
         self.control_layout = QVBoxLayout(self.control_panel)
-        self.layout.addWidget(self.control_panel)
+
+        self.control_scroll = QScrollArea()
+        self.control_scroll.setWidgetResizable(True)
+        self.control_scroll.setWidget(self.control_panel)
+        self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.layout.addWidget(self.control_scroll)
 
         camera_group = QGroupBox("Camera")
         camera_layout = QVBoxLayout()
@@ -225,23 +332,31 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_combo.addItems(
             [screen.name() or f"Screen {i + 1}" for i, screen in enumerate(self.screens)]
         )
+
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
         projector_layout.addWidget(self.projector_combo)
         projector_group.setLayout(projector_layout)
         self.control_layout.addWidget(projector_group)
 
+        self.setup_wizard_button = QPushButton("Run Full Calibration Wizard")
+        self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard)
+        self.control_layout.addWidget(self.setup_wizard_button)
+
         cue_group = QGroupBox("Cues")
         cue_layout = QVBoxLayout()
         self.cue_list_widget = QListWidget()
         self.cue_list_widget.currentRowChanged.connect(self.worker.set_active_cue_index)
-        self.add_cue_button = QPushButton("Add Video Cue")
+        self.add_cue_button = QPushButton("Add New Cue/Mask")
         self.add_cue_button.clicked.connect(self.add_cue)
+        self.assign_cue_button = QPushButton("Assign Cue to Selected Mask")
+        self.assign_cue_button.clicked.connect(self.assign_cue_to_selected_mask)
         self.remove_cue_button = QPushButton("Remove Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
         self.render_all_cues_button = QPushButton("Render All Cues")
         self.render_all_cues_button.clicked.connect(lambda: self.worker.set_active_cue_index(-1))
         cue_layout.addWidget(self.cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
+        cue_layout.addWidget(self.assign_cue_button)
         cue_layout.addWidget(self.remove_cue_button)
         cue_layout.addWidget(self.render_all_cues_button)
         cue_group.setLayout(cue_layout)
@@ -307,7 +422,10 @@ class ProjectionMappingApp(QMainWindow):
 
         self.link_mask_button = QPushButton("Link Mask to Markers")
         self.link_mask_button.clicked.connect(self.link_mask_to_markers)
+        self.auto_sync_checkbox = QCheckBox("Auto-sync marker links")
+        self.auto_sync_checkbox.setChecked(True)
         mask_layout.addWidget(self.link_mask_button)
+        mask_layout.addWidget(self.auto_sync_checkbox)
 
         mask_group.setLayout(mask_layout)
         self.control_layout.addWidget(mask_group)
@@ -335,7 +453,176 @@ class ProjectionMappingApp(QMainWindow):
         diagnostics_group.setLayout(diagnostics_layout)
         self.control_layout.addWidget(diagnostics_group)
 
+        preview_group = QGroupBox("Preview")
+        preview_layout = QVBoxLayout()
+        self.preview_checkbox = QCheckBox("Show projector preview")
+        self.preview_checkbox.setChecked(True)
+        self.preview_checkbox.toggled.connect(self.toggle_preview)
+        self.projector_preview_label = QLabel("Waiting for projector frames...")
+        self.projector_preview_label.setAlignment(Qt.AlignCenter)
+        self.projector_preview_label.setMinimumHeight(140)
+        preview_layout.addWidget(self.preview_checkbox)
+        preview_layout.addWidget(self.projector_preview_label)
+        preview_group.setLayout(preview_layout)
+        self.control_layout.addWidget(preview_group)
+
+        self.apply_preview_minimum_sizes()
+        self.apply_control_sizing()
         self.control_layout.addStretch()
+
+    def apply_preview_minimum_sizes(self):
+        primary = QApplication.primaryScreen()
+        if primary is None:
+            return
+
+        screen_geo = primary.availableGeometry()
+        min_w = max(320, screen_geo.width() // 4)
+        min_h = max(180, screen_geo.height() // 4)
+        self.video_display.setMinimumSize(min_w, min_h)
+        self.projector_preview_label.setMinimumSize(min_w, min_h)
+
+    def toggle_preview(self, checked):
+        self.projector_preview_label.setVisible(checked)
+
+    def update_projector_preview(self, image):
+        if not self.preview_checkbox.isChecked() or not self.projector_preview_label.isVisible():
+            return
+
+        target_size = self.projector_preview_label.size()
+        safe_w = max(1, target_size.width())
+        safe_h = max(1, target_size.height())
+
+        pixmap = QPixmap.fromImage(image)
+        self.projector_preview_label.setPixmap(
+            pixmap.scaled(
+                safe_w,
+                safe_h,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+
+    def apply_control_sizing(self):
+        for button in self.control_panel.findChildren(QPushButton):
+            button.setMinimumHeight(42)
+        for combo in self.control_panel.findChildren(QComboBox):
+            combo.setMinimumHeight(34)
+
+    def cache_latest_frame(self, image):
+        self.latest_camera_qimage = image.copy()
+
+    def capture_still_frame_sync(self, timeout_ms=5000):
+        loop = QEventLoop(self)
+        result = {"image": None}
+
+        def on_frame(image):
+            result["image"] = image.copy()
+            loop.quit()
+
+        self.worker.still_frame_ready.connect(on_frame)
+        self.worker.capture_still_frame()
+        QTimer.singleShot(timeout_ms, loop.quit)
+        loop.exec_()
+        try:
+            self.worker.still_frame_ready.disconnect(on_frame)
+        except Exception:
+            pass
+        return result["image"]
+
+    def detect_projector_bounds(self, image):
+        if image is None:
+            return None
+        qimg = image.convertToFormat(QImage.Format_RGB32)
+        w = qimg.width()
+        h = qimg.height()
+        ptr = qimg.bits()
+        ptr.setsize(qimg.byteCount())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 4))
+        frame = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(contour) < 1000:
+            return None
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect)
+        points = []
+        for x, y in box:
+            points.append([float(max(0.0, min(1.0, x / max(w, 1)))), float(max(0.0, min(1.0, y / max(h, 1))))])
+        return points
+
+    def ensure_mask(self, name, points, mask_type="static", linked_marker_count=0):
+        for mask in self.masks:
+            if mask.name == name:
+                mask.source_points = points
+                mask.type = mask_type
+                mask.linked_marker_count = linked_marker_count
+                return mask
+        mask = Mask(name, points, None)
+        mask.type = mask_type
+        mask.linked_marker_count = linked_marker_count
+        self.masks.append(mask)
+        self.cue_list_widget.addItem(name)
+        return mask
+
+    def run_full_calibration_wizard(self):
+        # Stage 1: room scan + projector bounds
+        still = self.capture_still_frame_sync()
+        if still is None:
+            QMessageBox.warning(self, "Calibration", "Could not capture a camera frame for room scan.")
+            return
+
+        bounds = self.detect_projector_bounds(still)
+        if bounds:
+            self.projector_window.warp_points = self.projector_window.deserialize_warp_points(bounds)
+            self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
+            bg_points = [(int(p[0] * still.width()), int(p[1] * still.height())) for p in bounds]
+            self.ensure_mask("Background", bg_points, mask_type="static", linked_marker_count=0)
+
+        QMessageBox.information(
+            self,
+            "Stage 1 Complete",
+            "Projector bounds were auto-scanned. You can now manually adjust points with 'Enable Warping' if needed.",
+        )
+
+        # Stage 2: guitar markers + guitar mask + depth baseline
+        self.open_marker_selection_dialog()
+        if len(self.selected_markers) < 4:
+            QMessageBox.warning(self, "Stage 2", "Select at least 4 IR markers on the guitar to continue.")
+            return
+
+        still2 = self.capture_still_frame_sync()
+        if still2 is None:
+            QMessageBox.warning(self, "Stage 2", "Could not capture still frame for guitar mask.")
+            return
+        guitar_dialog = PolygonMaskDialog("Draw 4-point guitar mask", self)
+        guitar_dialog.set_pixmap(QPixmap.fromImage(still2))
+        if guitar_dialog.exec_():
+            pts = guitar_dialog.get_points()
+            if len(pts) == 4:
+                source = [(p.x(), p.y()) for p in pts]
+            else:
+                source = [(p.x(), p.y()) for p in self.selected_markers[:4]]
+            self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
+            self.worker.set_marker_points(self.selected_markers[:4])
+            self.worker.calibrate_depth()
+
+        # Stage 3: amp mask
+        still3 = self.capture_still_frame_sync()
+        if still3 is None:
+            QMessageBox.warning(self, "Stage 3", "Could not capture still frame for amp mask.")
+            return
+        amp_dialog = PolygonMaskDialog("Draw 4-point amp mask", self)
+        amp_dialog.set_pixmap(QPixmap.fromImage(still3))
+        if amp_dialog.exec_() and len(amp_dialog.get_points()) == 4:
+            amp_source = [(p.x(), p.y()) for p in amp_dialog.get_points()]
+            self.ensure_mask("Amp", amp_source, mask_type="static", linked_marker_count=0)
+
+        self.worker.set_masks(self.masks)
+        self.statusBar().showMessage("Calibration wizard complete. Assign cues to masks in the Cues list.", 6000)
 
     def refresh_cameras(self, initial=False):
         selected_camera = None
@@ -406,6 +693,7 @@ class ProjectionMappingApp(QMainWindow):
         self.cancel_mask_button.setEnabled(False)
         self.video_display.clear_mask_points()
         self.mask_points_list.clear()
+        self.auto_sync_marker_links()
 
     def cancel_mask_creation(self):
         self.video_display.set_mask_creation_mode(False)
@@ -442,6 +730,23 @@ class ProjectionMappingApp(QMainWindow):
                     f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000
                 )
 
+    def auto_sync_marker_links(self):
+        if not self.auto_sync_checkbox.isChecked() or not self.selected_markers:
+            return
+
+        marker_count = len(self.selected_markers)
+        linked = 0
+        for mask in self.masks:
+            if len(mask.source_points) == marker_count:
+                mask.linked_marker_count = marker_count
+                linked += 1
+
+        if linked:
+            self.statusBar().showMessage(
+                f"Auto-sync updated {linked} cue(s) to {marker_count} markers.",
+                3500,
+            )
+
     def update_ir_threshold(self, value):
         self.worker.set_ir_threshold(value)
 
@@ -457,13 +762,28 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.set_calibration_mode(checked)
         self.enable_warping_button.setText("Disable Warping" if checked else "Enable Warping")
 
+    def assign_cue_to_selected_mask(self):
+        current_item = self.cue_list_widget.currentItem()
+        if not current_item:
+            self.statusBar().showMessage("Select a mask first.", 3000)
+            return
+        row = self.cue_list_widget.row(current_item)
+        if row < 0 or row >= len(self.masks):
+            return
+        video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
+        if not video_path:
+            return
+        self.masks[row].video_path = video_path
+        self.cue_list_widget.item(row).setText(f"{self.masks[row].name}: {Path(video_path).name}")
+        self.worker.set_masks(self.masks)
+
     def add_cue(self):
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
         if video_path:
-            mask_name = f"Cue {len(self.masks) + 1}: {video_path.split('/')[-1]}"
+            mask_name = f"Cue {len(self.masks) + 1}"
             new_mask = Mask(mask_name, [], video_path)
             self.masks.append(new_mask)
-            self.cue_list_widget.addItem(mask_name)
+            self.cue_list_widget.addItem(f"{mask_name}: {Path(video_path).name}")
             self.worker.set_masks(self.masks)
 
     def change_camera(self, index):
@@ -471,10 +791,17 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.set_video_source(self.available_cameras[index])
 
     def change_projector(self, index):
-        if index < len(self.screens):
-            screen = self.screens[index]
-            self.projector_window.setScreen(screen)
-            self.projector_window.showFullScreen()
+        if index >= len(self.screens):
+            return
+
+        screen = self.screens[index]
+        window_handle = self.projector_window.windowHandle()
+        if window_handle is not None:
+            window_handle.setScreen(screen)
+        else:
+            self.projector_window.setGeometry(screen.geometry())
+
+        self.projector_window.showFullScreen()
 
     def remove_cue(self):
         current_item = self.cue_list_widget.currentItem()
@@ -493,6 +820,7 @@ class ProjectionMappingApp(QMainWindow):
 
 
 if __name__ == '__main__':
+    configure_opencv_logging()
     app = QApplication(sys.argv)
 
     splash = SplashScreen()
