@@ -1,4 +1,5 @@
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -31,11 +32,22 @@ SETTINGS_PATH = Path("settings.json")
 
 def get_available_cameras(max_probe=10):
     arr = []
+    is_windows = platform.system().lower() == "windows"
+    backends = [cv2.CAP_ANY]
+    if is_windows:
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+
     for index in range(max_probe):
-        cap = cv2.VideoCapture(index)
-        if cap.isOpened():
+        opened = False
+        for backend in backends:
+            cap = cv2.VideoCapture(index, backend)
+            if cap.isOpened():
+                opened = True
+                cap.release()
+                break
+            cap.release()
+        if opened:
             arr.append(index)
-        cap.release()
     return arr
 
 

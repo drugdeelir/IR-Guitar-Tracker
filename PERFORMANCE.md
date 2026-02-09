@@ -30,7 +30,7 @@ The most performance-intensive tasks in the application are directly related to 
 ### 3. System Environment
 
 *   **Close Unnecessary Applications:** Before a live performance, close all other applications (web browsers, email clients, etc.) to free up CPU, RAM, and GPU resources for the projection mapping tool.
-*   **Use Activity Monitor:** Use the Windows Task Manager to check if any other processes are unexpectedly consuming a large amount of CPU or memory.
+*   **Use Task Manager:** Use the Windows Task Manager to check if any other processes are unexpectedly consuming a large amount of CPU or memory.
 *   **Power Connection:** Ensure your Windows 10 laptop is plugged into a power source. Running on a UPS (if applicable) in a power-saving mode can throttle performance.
 
 ### 4. Lighting and IR Tracking

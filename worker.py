@@ -284,15 +284,23 @@ class Worker(QObject):
         return True
 
     def _open_camera(self):
-        backend = cv2.CAP_DSHOW if self._is_windows else cv2.CAP_ANY
-        cap = cv2.VideoCapture(self.video_source, backend)
-        if not cap.isOpened():
-            return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._camera_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._camera_height)
-        cap.set(cv2.CAP_PROP_FPS, self._camera_fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap
+        backends = [cv2.CAP_ANY]
+        if self._is_windows:
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+
+        for backend in backends:
+            cap = cv2.VideoCapture(self.video_source, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._camera_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._camera_height)
+            cap.set(cv2.CAP_PROP_FPS, self._camera_fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap
+
+        return None
 
     def process_video(self):
         main_cap = None
