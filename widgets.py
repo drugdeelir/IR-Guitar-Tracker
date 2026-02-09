@@ -1,5 +1,7 @@
 from PyQt5.QtCore import QPoint, QPointF, Qt, pyqtSignal
-from PyQt5.QtGui import QPainter, QPen, QPixmap, QPolygonF
+import cv2
+import numpy as np
+from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout, QPushButton, QWidget
 
 
@@ -12,6 +14,7 @@ class MarkerSelectionDialog(QDialog):
         self.setMinimumSize(800, 600)
         self.selected_points = []
         self.original_pixmap = None
+        self.detected_ir_points = []
 
         self.layout = QVBoxLayout(self)
         self.image_label = QLabel("Press 'Take Picture' to begin.")
@@ -28,7 +31,45 @@ class MarkerSelectionDialog(QDialog):
 
     def set_pixmap(self, pixmap):
         self.original_pixmap = pixmap
+        self.detected_ir_points = self._detect_ir_points(pixmap)
         self._render_preview()
+
+    def _detect_ir_points(self, pixmap):
+        image = pixmap.toImage().convertToFormat(QImage.Format_RGB888)
+        w, h = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(image.byteCount())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 3))
+
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        candidates = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 8:
+                continue
+            moments = cv2.moments(contour)
+            if moments["m00"] == 0:
+                continue
+            cx = int(moments["m10"] / moments["m00"])
+            cy = int(moments["m01"] / moments["m00"])
+            candidates.append(QPoint(cx, cy))
+        return candidates
+
+    def _snap_to_ir_point(self, point, max_distance=40):
+        if not self.detected_ir_points:
+            return point
+
+        nearest = min(
+            self.detected_ir_points,
+            key=lambda candidate: (candidate - point).manhattanLength(),
+        )
+        if (nearest - point).manhattanLength() <= max_distance:
+            return nearest
+        return point
 
     def _get_draw_rect(self):
         if not self.original_pixmap:
@@ -81,6 +122,7 @@ class MarkerSelectionDialog(QDialog):
         point = self._label_to_image(event.pos())
         if point is None:
             return
+        point = self._snap_to_ir_point(point)
         self.selected_points.append(point)
         self.marker_selected.emit(point)
         self._render_preview()
@@ -102,10 +144,6 @@ class VideoDisplay(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.label = QLabel()
-        layout = QVBoxLayout()
-        layout.addWidget(self.label)
-        self.setLayout(layout)
         self.mask_creation_mode = False
         self.mask_points = []
         self.current_pixmap = None
@@ -187,6 +225,8 @@ class ProjectorWindow(QWidget):
         self.setWindowTitle("Projector Output")
         self.layout = QVBoxLayout()
         self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setScaledContents(True)
         self.layout.addWidget(self.label)
         self.setLayout(self.layout)
         self.setStyleSheet("background-color: black;")
@@ -197,7 +237,11 @@ class ProjectorWindow(QWidget):
         self.show()
 
     def set_image(self, image):
-        self.label.setPixmap(QPixmap.fromImage(image))
+        pixmap = QPixmap.fromImage(image)
+        size = self.label.size()
+        if size.width() > 1 and size.height() > 1:
+            pixmap = pixmap.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self.label.setPixmap(pixmap)
 
     def set_calibration_mode(self, enabled):
         self.calibration_mode = enabled
@@ -334,6 +378,10 @@ class PolygonMaskDialog(QDialog):
 
     def clear_points(self):
         self.points = []
+        self._render_preview()
+
+    def set_points(self, points):
+        self.points = [QPoint(int(p.x()), int(p.y())) for p in points[:4]]
         self._render_preview()
 
     def get_points(self):

@@ -9,8 +9,8 @@ os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QEventLoop, QThread, Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QEventLoop, QPoint, QThread, Qt, QTimer
+from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -172,6 +172,8 @@ class ProjectionMappingApp(QMainWindow):
         self.create_control_panel()
 
         self.layout.addWidget(self.video_display)
+        self.layout.setStretch(0, 1)
+        self.layout.setStretch(1, 3)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
 
@@ -191,6 +193,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
         self.apply_loaded_settings()
+        self.change_projector(self.projector_combo.currentIndex())
         self.maybe_show_startup_wizard()
 
         self.thread.started.connect(self.worker.process_video)
@@ -308,6 +311,7 @@ class ProjectionMappingApp(QMainWindow):
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setWidget(self.control_panel)
         self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.control_scroll.setMaximumWidth(480)
         self.layout.addWidget(self.control_scroll)
 
         camera_group = QGroupBox("Camera")
@@ -365,18 +369,6 @@ class ProjectionMappingApp(QMainWindow):
         cue_group.setLayout(cue_layout)
         self.control_layout.addWidget(cue_group)
 
-        preview_group = QGroupBox("Preview")
-        preview_layout = QVBoxLayout()
-        self.preview_checkbox = QCheckBox("Show projector preview")
-        self.preview_checkbox.setChecked(True)
-        self.preview_checkbox.toggled.connect(self.toggle_preview)
-        self.projector_preview_label = QLabel("Waiting for projector frames...")
-        self.projector_preview_label.setAlignment(Qt.AlignCenter)
-        self.projector_preview_label.setMinimumHeight(140)
-        preview_layout.addWidget(self.preview_checkbox)
-        preview_layout.addWidget(self.projector_preview_label)
-        preview_group.setLayout(preview_layout)
-        self.control_layout.addWidget(preview_group)
 
         warping_group = QGroupBox("Projector Warping")
         warping_layout = QVBoxLayout()
@@ -476,7 +468,8 @@ class ProjectionMappingApp(QMainWindow):
         self.preview_checkbox.toggled.connect(self.toggle_preview)
         self.projector_preview_label = QLabel("Waiting for projector frames...")
         self.projector_preview_label.setAlignment(Qt.AlignCenter)
-        self.projector_preview_label.setMinimumHeight(140)
+        self.projector_preview_label.setMinimumHeight(220)
+        self.projector_preview_label.setScaledContents(True)
         preview_layout.addWidget(self.preview_checkbox)
         preview_layout.addWidget(self.projector_preview_label)
         preview_group.setLayout(preview_layout)
@@ -513,7 +506,7 @@ class ProjectionMappingApp(QMainWindow):
             pixmap.scaled(
                 safe_w,
                 safe_h,
-                Qt.KeepAspectRatio,
+                Qt.IgnoreAspectRatio,
                 Qt.SmoothTransformation,
             )
         )
@@ -570,6 +563,25 @@ class ProjectionMappingApp(QMainWindow):
             points.append([float(max(0.0, min(1.0, x / max(w, 1)))), float(max(0.0, min(1.0, y / max(h, 1))))])
         return points
 
+
+    def _draw_polygon_overlay(self, image, points, color=Qt.green):
+        if image is None:
+            return None
+        overlay = QImage(image)
+        if not points:
+            return overlay
+        painter = QPainter(overlay)
+        painter.setPen(QPen(color, 4))
+        for idx, point in enumerate(points):
+            painter.drawPoint(point)
+            painter.drawText(point.x() + 8, point.y() - 8, str(idx + 1))
+            if idx > 0:
+                painter.drawLine(points[idx - 1], point)
+        if len(points) > 2:
+            painter.drawLine(points[-1], points[0])
+        painter.end()
+        return overlay
+
     def ensure_mask(self, name, points, mask_type="static", linked_marker_count=0):
         for mask in self.masks:
             if mask.name == name:
@@ -592,16 +604,45 @@ class ProjectionMappingApp(QMainWindow):
             return
 
         bounds = self.detect_projector_bounds(still)
+        initial_points = []
         if bounds:
-            self.projector_window.warp_points = self.projector_window.deserialize_warp_points(bounds)
-            self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
-            bg_points = [(int(p[0] * still.width()), int(p[1] * still.height())) for p in bounds]
-            self.ensure_mask("Background", bg_points, mask_type="static", linked_marker_count=0)
+            initial_points = [
+                QPoint(int(p[0] * still.width()), int(p[1] * still.height()))
+                for p in bounds
+            ]
+
+        bounds_dialog = PolygonMaskDialog("Confirm projector bounds", self)
+        bounds_dialog.set_pixmap(QPixmap.fromImage(still))
+        if initial_points:
+            bounds_dialog.set_points(initial_points)
+
+        QMessageBox.information(
+            self,
+            "Stage 1",
+            "Review the auto-scanned projector mask. Drag/click 4 points if needed, then confirm.",
+        )
+        if not bounds_dialog.exec_() or len(bounds_dialog.get_points()) != 4:
+            QMessageBox.warning(self, "Stage 1", "Projector bounds were not confirmed.")
+            return
+
+        confirmed_points = bounds_dialog.get_points()
+        normalized = [
+            [p.x() / max(still.width(), 1), p.y() / max(still.height(), 1)]
+            for p in confirmed_points
+        ]
+        self.projector_window.warp_points = self.projector_window.deserialize_warp_points(normalized)
+        self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
+
+        bg_points = [(p.x(), p.y()) for p in confirmed_points]
+        self.ensure_mask("Background", bg_points, mask_type="static", linked_marker_count=0)
+        overlay = self._draw_polygon_overlay(still, confirmed_points, Qt.yellow)
+        if overlay is not None:
+            self.update_projector_preview(overlay)
 
         QMessageBox.information(
             self,
             "Stage 1 Complete",
-            "Projector bounds were auto-scanned. You can now manually adjust points with 'Enable Warping' if needed.",
+            "Projector bounds applied. Continue to marker selection.",
         )
 
         # Stage 2: guitar markers + guitar mask + depth baseline
@@ -850,6 +891,6 @@ if __name__ == '__main__':
         print("Stylesheet not found. Using default style.")
 
     main_win = ProjectionMappingApp()
-    main_win.show()
+    main_win.showFullScreen()
     splash.finish(main_win)
     sys.exit(app.exec_())
