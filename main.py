@@ -469,7 +469,6 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_preview_label = QLabel("Waiting for projector frames...")
         self.projector_preview_label.setAlignment(Qt.AlignCenter)
         self.projector_preview_label.setMinimumHeight(220)
-        self.projector_preview_label.setScaledContents(True)
         preview_layout.addWidget(self.preview_checkbox)
         preview_layout.addWidget(self.projector_preview_label)
         preview_group.setLayout(preview_layout)
