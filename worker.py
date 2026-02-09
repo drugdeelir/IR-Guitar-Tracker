@@ -1,5 +1,6 @@
 import time
 from itertools import combinations
+import platform
 
 import cv2
 import numpy as np
@@ -57,6 +58,16 @@ class Worker(QObject):
         self._camera_width = 1280
         self._camera_height = 720
         self._camera_fps = 30
+        self._is_windows = platform.system().lower() == "windows"
+
+        if self._is_windows:
+            # Windows 10 laptop defaults: lower camera load while keeping enough detail
+            # for IR marker tracking, and limit target FPS to a realistic sustained value.
+            self._camera_width = 960
+            self._camera_height = 540
+            self._camera_fps = 30
+            self._target_fps = 30.0
+            self._detection_scale = 0.45
 
     def set_marker_points(self, points):
         self.marker_config = [(p.x(), p.y()) for p in points]
@@ -273,7 +284,8 @@ class Worker(QObject):
         return True
 
     def _open_camera(self):
-        cap = cv2.VideoCapture(self.video_source)
+        backend = cv2.CAP_DSHOW if self._is_windows else cv2.CAP_ANY
+        cap = cv2.VideoCapture(self.video_source, backend)
         if not cap.isOpened():
             return None
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._camera_width)

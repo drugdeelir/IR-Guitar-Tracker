@@ -22,7 +22,7 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 
 These instructions are for running the application directly from the source code.
 
-1.  **Install Python:** Ensure you have Python 3 installed on your Mac. You can download it from [python.org](https://www.python.org/).
+1.  **Install Python:** Ensure you have Python 3 installed on your Windows 10 laptop. You can download it from [python.org](https://www.python.org/).
 
 2.  **Clone the Repository:**
     ```bash
@@ -32,15 +32,15 @@ These instructions are for running the application directly from the source code
 
 3.  **Install Dependencies:** It's recommended to use a virtual environment.
     ```bash
-    python3 -m venv venv
-    source venv/bin/activate
+    python -m venv venv
+    venv\Scripts\activate
     pip install -r requirements.txt
     ```
     *(Note: A `requirements.txt` will need to be generated, but for now, the dependencies are `opencv-python`, `numpy`, and `PyQt5`)*
 
 4.  **Run the Application:**
     ```bash
-    python3 main.py
+    python main.py
     ```
 
 ## How to Package for macOS (`.app` Bundle)
@@ -95,3 +95,14 @@ This project uses `py2app` to create a standalone macOS application. This is the
 ## Performance Note for SSD Users
 
 Running this application from an SSD is highly recommended. It will significantly improve the loading speed of your video cue files, resulting in smoother transitions and a more reliable performance during a live show.
+
+
+## Windows 10 Optimization Notes
+
+This app now auto-applies Windows-focused performance defaults:
+
+* DirectShow camera backend for more stable webcam startup/latency on Windows.
+* Camera defaults tuned for laptop performance (960x540 @ 30 FPS).
+* Slightly lower detection scale to reduce CPU usage while tracking IR markers.
+
+These defaults are stability-first for live use.
