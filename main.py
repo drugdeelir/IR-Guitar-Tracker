@@ -614,10 +614,17 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.set_video_source(self.available_cameras[index])
 
     def change_projector(self, index):
-        if index < len(self.screens):
-            screen = self.screens[index]
-            self.projector_window.setScreen(screen)
-            self.projector_window.showFullScreen()
+        if index >= len(self.screens):
+            return
+
+        screen = self.screens[index]
+        window_handle = self.projector_window.windowHandle()
+        if window_handle is not None:
+            window_handle.setScreen(screen)
+        else:
+            self.projector_window.setGeometry(screen.geometry())
+
+        self.projector_window.showFullScreen()
 
     def remove_cue(self):
         current_item = self.cue_list_widget.currentItem()
