@@ -13,6 +13,8 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 *   **Depth Estimation:** A system to create a 3D "zoom" effect by scaling the mask based on the distance between trackers.
 *   **Adaptive Thresholding:** Switch between manual threshold and auto (Otsu) threshold for varying stage lighting.
 *   **Live Diagnostics:** Real-time FPS and frame-time stats in the control panel.
+*   **Stage Timing Breakdown:** Live detect/match/warp/render timings to quickly spot bottlenecks.
+*   **Session Persistence:** Remembers thresholds, display selections, and warp calibration between launches.
 *   **Multi-threaded Performance:** A modern architecture that separates video processing from the UI to ensure a responsive and fast experience.
 *   **Standalone Application:** Includes a setup script to package the tool into a native macOS (`.app`) application.
 

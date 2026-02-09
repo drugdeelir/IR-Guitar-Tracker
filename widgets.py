@@ -253,6 +253,15 @@ class ProjectorWindow(QWidget):
         y = min(max(pos.y() / self.height(), 0.0), 1.0)
         return QPointF(float(x), float(y))
 
+    def deserialize_warp_points(self, points):
+        result = []
+        for p in points:
+            if isinstance(p, (list, tuple)) and len(p) == 2:
+                result.append(QPointF(float(p[0]), float(p[1])))
+        if len(result) != 4:
+            return [QPointF(0.0, 0.0), QPointF(1.0, 0.0), QPointF(1.0, 1.0), QPointF(0.0, 1.0)]
+        return result
+
     def get_warp_points_normalized(self):
         return [[float(p.x()), float(p.y())] for p in self.warp_points]
 

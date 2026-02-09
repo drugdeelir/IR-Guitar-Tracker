@@ -1,4 +1,7 @@
+import json
 import sys
+from pathlib import Path
+
 import cv2
 from PyQt5.QtCore import QThread, Qt, QTimer
 from PyQt5.QtGui import QPixmap
@@ -23,9 +26,10 @@ from splash import SplashScreen
 from widgets import MarkerSelectionDialog, ProjectorWindow, VideoDisplay
 from worker import Worker
 
+SETTINGS_PATH = Path("settings.json")
+
 
 def get_available_cameras(max_probe=10):
-    """Returns a list of available camera indices."""
     arr = []
     for index in range(max_probe):
         cap = cv2.VideoCapture(index)
@@ -42,6 +46,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
         self.selected_markers = []
+        self.settings = self.load_settings()
 
         self.setStatusBar(QStatusBar(self))
 
@@ -52,15 +57,15 @@ class ProjectionMappingApp(QMainWindow):
         self.video_display = VideoDisplay()
         self.projector_window = ProjectorWindow()
 
+        self.worker = Worker()
+        self.thread = QThread()
+        self.worker.moveToThread(self.thread)
+
         self.create_control_panel()
 
         self.layout.addWidget(self.video_display)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
-
-        self.worker = Worker()
-        self.thread = QThread()
-        self.worker.moveToThread(self.thread)
 
         self.worker.frame_ready.connect(self.video_display.set_image)
         self.worker.projector_frame_ready.connect(self.projector_window.set_image)
@@ -75,8 +80,52 @@ class ProjectionMappingApp(QMainWindow):
         )
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
+        self.apply_loaded_settings()
+
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
+
+    def load_settings(self):
+        if SETTINGS_PATH.exists():
+            try:
+                return json.loads(SETTINGS_PATH.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def save_settings(self):
+        settings = {
+            "ir_threshold": self.ir_threshold_slider.value(),
+            "threshold_mode": self.threshold_mode_combo.currentIndex(),
+            "depth_sensitivity": self.depth_sensitivity_slider.value(),
+            "camera_index": self.camera_combo.currentIndex(),
+            "projector_index": self.projector_combo.currentIndex(),
+            "warp_points": self.projector_window.get_warp_points_normalized(),
+        }
+        try:
+            SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+        except Exception:
+            pass
+
+    def apply_loaded_settings(self):
+        ir_threshold = self.settings.get("ir_threshold", 200)
+        self.ir_threshold_slider.setValue(ir_threshold)
+        threshold_mode = self.settings.get("threshold_mode", 0)
+        self.threshold_mode_combo.setCurrentIndex(threshold_mode)
+        self.depth_sensitivity_slider.setValue(self.settings.get("depth_sensitivity", 100))
+
+        cam_idx = self.settings.get("camera_index", 0)
+        if self.camera_combo.count() and self.camera_combo.isEnabled():
+            self.camera_combo.setCurrentIndex(min(cam_idx, self.camera_combo.count() - 1))
+
+        proj_idx = self.settings.get("projector_index", 0)
+        if self.projector_combo.count():
+            self.projector_combo.setCurrentIndex(min(proj_idx, self.projector_combo.count() - 1))
+
+        warp_points = self.settings.get("warp_points")
+        if isinstance(warp_points, list) and len(warp_points) == 4:
+            self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
+            self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
 
     def open_marker_selection_dialog(self):
         self.marker_selection_dialog.clear_selection()
@@ -155,13 +204,17 @@ class ProjectionMappingApp(QMainWindow):
         cue_group = QGroupBox("Cues")
         cue_layout = QVBoxLayout()
         self.cue_list_widget = QListWidget()
+        self.cue_list_widget.currentRowChanged.connect(self.worker.set_active_cue_index)
         self.add_cue_button = QPushButton("Add Video Cue")
         self.add_cue_button.clicked.connect(self.add_cue)
         self.remove_cue_button = QPushButton("Remove Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
+        self.render_all_cues_button = QPushButton("Render All Cues")
+        self.render_all_cues_button.clicked.connect(lambda: self.worker.set_active_cue_index(-1))
         cue_layout.addWidget(self.cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
         cue_layout.addWidget(self.remove_cue_button)
+        cue_layout.addWidget(self.render_all_cues_button)
         cue_group.setLayout(cue_layout)
         self.control_layout.addWidget(cue_group)
 
@@ -197,7 +250,6 @@ class ProjectionMappingApp(QMainWindow):
 
         self.select_markers_button = QPushButton("Select Guitar Markers")
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
-
         self.clear_markers_button = QPushButton("Clear Marker Selection")
         self.clear_markers_button.clicked.connect(self.clear_marker_selection)
 
@@ -249,7 +301,7 @@ class ProjectionMappingApp(QMainWindow):
 
         diagnostics_group = QGroupBox("Diagnostics")
         diagnostics_layout = QVBoxLayout()
-        self.performance_label = QLabel("FPS: -- | Frame time: -- ms")
+        self.performance_label = QLabel("FPS: -- | Frame: -- | D: -- M: -- W: -- R: --")
         diagnostics_layout.addWidget(self.performance_label)
         diagnostics_group.setLayout(diagnostics_layout)
         self.control_layout.addWidget(diagnostics_group)
@@ -290,7 +342,7 @@ class ProjectionMappingApp(QMainWindow):
 
     def calibrate_depth(self):
         self.worker.calibrate_depth()
-        self.depth_calibration_label.setText("Calibrated!")
+        self.depth_calibration_label.setText("Calibrating...")
 
     def update_depth_sensitivity(self, value):
         self.worker.set_depth_sensitivity(value / 100.0)
@@ -298,8 +350,10 @@ class ProjectionMappingApp(QMainWindow):
     def show_camera_error(self, index):
         self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
 
-    def update_performance_label(self, fps, frame_time_ms):
-        self.performance_label.setText(f"FPS: {fps:.1f} | Frame time: {frame_time_ms:.1f} ms")
+    def update_performance_label(self, fps, frame_time_ms, detect_ms, match_ms, warp_ms, render_ms):
+        self.performance_label.setText(
+            f"FPS: {fps:.1f} | Frame: {frame_time_ms:.1f}ms | D:{detect_ms:.1f} M:{match_ms:.1f} W:{warp_ms:.1f} R:{render_ms:.1f}"
+        )
 
     def enter_mask_creation_mode(self):
         self.video_display.set_mask_creation_mode(True)
@@ -402,6 +456,7 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.set_masks(self.masks)
 
     def closeEvent(self, event):
+        self.save_settings()
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()
@@ -422,7 +477,6 @@ if __name__ == '__main__':
         print("Stylesheet not found. Using default style.")
 
     main_win = ProjectionMappingApp()
-
     main_win.show()
     splash.finish(main_win)
     sys.exit(app.exec_())

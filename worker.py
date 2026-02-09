@@ -13,7 +13,7 @@ class Worker(QObject):
     still_frame_ready = pyqtSignal(QImage)
     trackers_detected = pyqtSignal(int)
     camera_error = pyqtSignal(int)
-    performance_updated = pyqtSignal(float, float)
+    performance_updated = pyqtSignal(float, float, float, float, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,11 +29,13 @@ class Worker(QObject):
         self.depth_sensitivity = 1.0
         self._calibrate_depth_flag = False
         self._capture_still_frame_flag = False
+        self.active_cue_index = -1
 
         self.marker_config = None
         self.marker_fingerprint = []
         self.max_points_to_check = 12
         self.max_combinations_to_check = 1200
+        self._dynamic_combination_budget = self.max_combinations_to_check
 
         self._noise_kernel = np.ones((3, 3), np.uint8)
         self._transform_cache = {}
@@ -43,6 +45,19 @@ class Worker(QObject):
         self.tracking_lost_frames = 0
         self.max_lost_tracking_frames = 5
 
+        self._projector_output_buffer = None
+        self._mask_buffer = None
+        self._buffer_shape = None
+
+        self._target_fps = 30.0
+        self._detection_scale = 0.5
+        self._recent_frame_times = []
+        self._calibration_distances = []
+
+        self._camera_width = 1280
+        self._camera_height = 720
+        self._camera_fps = 30
+
     def set_marker_points(self, points):
         self.marker_config = [(p.x(), p.y()) for p in points]
 
@@ -51,7 +66,6 @@ class Worker(QObject):
             for p1, p2 in combinations(self.marker_config, 2):
                 distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
             self.marker_fingerprint = sorted(distances)
-            print(f"Marker fingerprint calculated: {self.marker_fingerprint}")
         else:
             self.marker_fingerprint = []
 
@@ -64,6 +78,7 @@ class Worker(QObject):
 
     def calibrate_depth(self):
         self._calibrate_depth_flag = True
+        self._calibration_distances = []
 
     def set_depth_sensitivity(self, value):
         self.depth_sensitivity = value
@@ -81,8 +96,28 @@ class Worker(QObject):
     def retry_camera(self):
         self._camera_changed = True
 
+    def set_active_cue_index(self, index):
+        self.active_cue_index = index
+
+    def _ensure_buffers(self, h, w):
+        if self._buffer_shape == (h, w):
+            return
+        self._projector_output_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+        self._mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+        self._buffer_shape = (h, w)
+
     def _extract_detected_points(self, main_frame):
-        gray_frame = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+        gray_full = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+        if self._detection_scale < 1.0:
+            gray_frame = cv2.resize(
+                gray_full,
+                None,
+                fx=self._detection_scale,
+                fy=self._detection_scale,
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            gray_frame = gray_full
 
         if self.threshold_mode == "auto":
             _, thresh = cv2.threshold(
@@ -97,14 +132,26 @@ class Worker(QObject):
         contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         contour_candidates = []
+        scale_back = 1.0 / self._detection_scale if self._detection_scale < 1.0 else 1.0
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 20:
-                moments = cv2.moments(contour)
-                if moments["m00"] != 0:
-                    cx = int(moments["m10"] / moments["m00"])
-                    cy = int(moments["m01"] / moments["m00"])
-                    contour_candidates.append((area, (cx, cy)))
+            if area <= 12:
+                continue
+
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.3:
+                continue
+
+            moments = cv2.moments(contour)
+            if moments["m00"] == 0:
+                continue
+
+            cx = int((moments["m10"] / moments["m00"]) * scale_back)
+            cy = int((moments["m01"] / moments["m00"]) * scale_back)
+            contour_candidates.append((area, (cx, cy)))
 
         contour_candidates.sort(key=lambda item: item[0], reverse=True)
         return [point for _, point in contour_candidates]
@@ -124,7 +171,7 @@ class Worker(QObject):
         combinations_checked = 0
         for point_combo in combinations(points_to_check, num_markers):
             combinations_checked += 1
-            if combinations_checked > self.max_combinations_to_check:
+            if combinations_checked > self._dynamic_combination_budget:
                 break
 
             current_distances = []
@@ -218,6 +265,23 @@ class Worker(QObject):
         self._transform_cache[key] = {"signature": signature, "src_pts": src_pts}
         return src_pts
 
+    def _is_default_warp(self):
+        default = [[0, 0], [1, 0], [1, 1], [0, 1]]
+        for p, d in zip(self.warp_points, default):
+            if abs(p[0] - d[0]) > 1e-6 or abs(p[1] - d[1]) > 1e-6:
+                return False
+        return True
+
+    def _open_camera(self):
+        cap = cv2.VideoCapture(self.video_source)
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._camera_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._camera_height)
+        cap.set(cv2.CAP_PROP_FPS, self._camera_fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
     def process_video(self):
         main_cap = None
         fps_counter = 0
@@ -229,42 +293,55 @@ class Worker(QObject):
             if self._camera_changed:
                 if main_cap:
                     main_cap.release()
-                main_cap = cv2.VideoCapture(self.video_source)
-                if not main_cap.isOpened():
+                main_cap = self._open_camera()
+                if main_cap is None:
                     self.camera_error.emit(self.video_source)
-                    main_cap = None
                 self._camera_changed = False
 
             if main_cap is None:
                 QThread.msleep(100)
                 continue
 
+            t0 = time.perf_counter()
             ret, main_frame = main_cap.read()
+            capture_ms = (time.perf_counter() - t0) * 1000.0
             if not ret:
                 self.camera_error.emit(self.video_source)
-                QThread.msleep(500)
+                QThread.msleep(200)
                 continue
 
             h, w, _ = main_frame.shape
-            projector_output = np.zeros((h, w, 3), dtype=np.uint8)
+            self._ensure_buffers(h, w)
+            projector_output = self._projector_output_buffer
+            projector_output.fill(0)
 
+            t0 = time.perf_counter()
             all_detected_points = self._extract_detected_points(main_frame)
+            detect_ms = (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
             tracked_points = self._match_marker_configuration(all_detected_points)
             tracked_points = self._stabilize_tracked_points(tracked_points)
+            match_ms = (time.perf_counter() - t0) * 1000.0
 
             self.trackers_detected.emit(len(tracked_points))
 
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
-                self.baseline_distance = np.linalg.norm(
-                    np.array(tracked_points[0]) - np.array(tracked_points[1])
+                self._calibration_distances.append(
+                    np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
                 )
-                self._calibrate_depth_flag = False
-                print(f"Depth calibrated with baseline distance: {self.baseline_distance}")
+                if len(self._calibration_distances) >= 20:
+                    self.baseline_distance = float(np.median(self._calibration_distances))
+                    self._calibrate_depth_flag = False
+                    self._calibration_distances = []
 
             for point in tracked_points:
                 cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
 
-            for mask in self.masks:
+            t0 = time.perf_counter()
+            for i, mask in enumerate(self.masks):
+                if self.active_cue_index >= 0 and i != self.active_cue_index:
+                    continue
                 if mask.type != "dynamic" or mask.linked_marker_count != len(tracked_points):
                     continue
 
@@ -292,15 +369,17 @@ class Worker(QObject):
 
                 warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
 
-                mask_image = np.zeros_like(projector_output)
+                mask_image = self._mask_buffer
+                mask_image.fill(0)
                 cv2.fillPoly(mask_image, [np.int32(dst_pts)], (255, 255, 255))
 
-                projector_output = cv2.bitwise_and(
+                projector_output[:] = cv2.bitwise_and(
                     projector_output, cv2.bitwise_not(mask_image)
                 )
-                projector_output = cv2.add(
+                projector_output[:] = cv2.add(
                     projector_output, cv2.bitwise_and(warped_cue, mask_image)
                 )
+            warp_compose_ms = (time.perf_counter() - t0) * 1000.0
 
             if self._capture_still_frame_flag:
                 rgb_image_still = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
@@ -314,25 +393,53 @@ class Worker(QObject):
             qt_image_main = QImage(rgb_image_main.data, w, h, w * 3, QImage.Format_RGB888)
             self.frame_ready.emit(qt_image_main)
 
-            src_points = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-            dst_points = np.float32([[p[0] * w, p[1] * h] for p in self.warp_points])
-            matrix = cv2.getPerspectiveTransform(src_points, dst_points)
-            warped_output = cv2.warpPerspective(projector_output, matrix, (w, h))
+            t0 = time.perf_counter()
+            if self._is_default_warp():
+                warped_output = projector_output
+            else:
+                src_points = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+                dst_points = np.float32([[p[0] * w, p[1] * h] for p in self.warp_points])
+                matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+                warped_output = cv2.warpPerspective(projector_output, matrix, (w, h))
 
             rgb_image_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
             qt_image_proj = QImage(rgb_image_proj.data, w, h, w * 3, QImage.Format_RGB888)
             self.projector_frame_ready.emit(qt_image_proj)
+            projector_ms = (time.perf_counter() - t0) * 1000.0
 
             frame_time_ms = (time.perf_counter() - frame_start) * 1000.0
+            self._recent_frame_times.append(frame_time_ms)
+            if len(self._recent_frame_times) > 20:
+                self._recent_frame_times.pop(0)
+
+            avg_frame = sum(self._recent_frame_times) / len(self._recent_frame_times)
+            if avg_frame > 40:
+                self._dynamic_combination_budget = max(250, self._dynamic_combination_budget - 100)
+            elif avg_frame < 25:
+                self._dynamic_combination_budget = min(
+                    self.max_combinations_to_check,
+                    self._dynamic_combination_budget + 50,
+                )
+
             fps_counter += 1
             elapsed = time.perf_counter() - fps_window_start
             if elapsed >= 1.0:
                 fps = fps_counter / elapsed
-                self.performance_updated.emit(fps, frame_time_ms)
+                self.performance_updated.emit(
+                    fps,
+                    frame_time_ms,
+                    detect_ms,
+                    match_ms,
+                    warp_compose_ms,
+                    projector_ms + capture_ms,
+                )
                 fps_counter = 0
                 fps_window_start = time.perf_counter()
 
-            QThread.msleep(30)
+            target_ms = 1000.0 / self._target_fps
+            sleep_ms = max(0.0, target_ms - frame_time_ms)
+            if sleep_ms > 0:
+                QThread.msleep(int(sleep_ms))
 
         if main_cap:
             main_cap.release()
