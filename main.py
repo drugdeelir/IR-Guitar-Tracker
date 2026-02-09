@@ -30,12 +30,22 @@ from worker import Worker
 SETTINGS_PATH = Path("settings.json")
 
 
+def _camera_backends_for_platform():
+    if platform.system().lower() != "windows":
+        return [cv2.CAP_ANY]
+
+    backends = []
+    for backend_name in ("CAP_DSHOW", "CAP_MSMF", "CAP_ANY"):
+        backend = getattr(cv2, backend_name, None)
+        if backend is not None and backend not in backends:
+            backends.append(backend)
+
+    return backends or [cv2.CAP_ANY]
+
+
 def get_available_cameras(max_probe=10):
     arr = []
-    is_windows = platform.system().lower() == "windows"
-    backends = [cv2.CAP_ANY]
-    if is_windows:
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    backends = _camera_backends_for_platform()
 
     for index in range(max_probe):
         opened = False

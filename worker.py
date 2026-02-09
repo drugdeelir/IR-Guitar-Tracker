@@ -283,12 +283,20 @@ class Worker(QObject):
                 return False
         return True
 
-    def _open_camera(self):
-        backends = [cv2.CAP_ANY]
-        if self._is_windows:
-            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    def _camera_backends_for_open(self):
+        if not self._is_windows:
+            return [cv2.CAP_ANY]
 
-        for backend in backends:
+        backends = []
+        for backend_name in ("CAP_DSHOW", "CAP_MSMF", "CAP_ANY"):
+            backend = getattr(cv2, backend_name, None)
+            if backend is not None and backend not in backends:
+                backends.append(backend)
+
+        return backends or [cv2.CAP_ANY]
+
+    def _open_camera(self):
+        for backend in self._camera_backends_for_open():
             cap = cv2.VideoCapture(self.video_source, backend)
             if not cap.isOpened():
                 cap.release()
