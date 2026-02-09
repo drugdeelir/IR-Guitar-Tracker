@@ -201,7 +201,7 @@ class ProjectionMappingApp(QMainWindow):
             "camera_index": self.camera_combo.currentIndex(),
             "projector_index": self.projector_combo.currentIndex(),
             "warp_points": self.projector_window.get_warp_points_normalized(),
-            "auto_sync_enabled": self.auto_sync_checkbox.isChecked() if hasattr(self, "auto_sync_checkbox") else True,
+            "auto_sync_enabled": self.auto_sync_checkbox.isChecked(),
             "show_preview_enabled": self.preview_checkbox.isChecked(),
             "wizard_completed": True,
         }
@@ -216,8 +216,7 @@ class ProjectionMappingApp(QMainWindow):
         threshold_mode = self.settings.get("threshold_mode", 0)
         self.threshold_mode_combo.setCurrentIndex(threshold_mode)
         self.depth_sensitivity_slider.setValue(self.settings.get("depth_sensitivity", 100))
-        if hasattr(self, "auto_sync_checkbox"):
-            self.auto_sync_checkbox.setChecked(self.settings.get("auto_sync_enabled", True))
+        self.auto_sync_checkbox.setChecked(self.settings.get("auto_sync_enabled", True))
         self.preview_checkbox.setChecked(self.settings.get("show_preview_enabled", True))
         self.projector_preview_label.setVisible(self.preview_checkbox.isChecked())
 
