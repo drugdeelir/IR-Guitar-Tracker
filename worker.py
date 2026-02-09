@@ -223,6 +223,8 @@ class Worker(QObject):
         src_pts = np.float32(self.marker_config).reshape(-1, 1, 2)
 
         combinations_checked = 0
+        best_ordered_points = []
+        best_error = float("inf")
         for point_combo in combinations(points_to_check, num_markers):
             combinations_checked += 1
             if combinations_checked > self._dynamic_combination_budget:
@@ -260,9 +262,20 @@ class Worker(QObject):
                 ordered_points[i] = closest_actual_pt
                 remaining_dst.remove(closest_actual_pt)
 
-            return ordered_points
+            reprojection_error = float(
+                np.mean(
+                    [
+                        np.linalg.norm(np.array(ordered_points[i]) - transformed_src[i][0])
+                        for i in range(num_markers)
+                    ]
+                )
+            )
 
-        return []
+            if reprojection_error < best_error:
+                best_error = reprojection_error
+                best_ordered_points = ordered_points
+
+        return best_ordered_points
 
     def _stabilize_tracked_points(self, tracked_points):
         if not tracked_points:
@@ -346,6 +359,8 @@ class Worker(QObject):
             if req_fps:
                 cap.set(cv2.CAP_PROP_FPS, req_fps)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cv2, "CAP_PROP_ZOOM"):
+                cap.set(cv2.CAP_PROP_ZOOM, 0)
 
             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)

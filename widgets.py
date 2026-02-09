@@ -413,7 +413,7 @@ class PolygonMaskDialog(QDialog):
         buttons_layout = QHBoxLayout()
         self.clear_button = QPushButton("Clear Points")
         self.clear_button.clicked.connect(self.clear_points)
-        self.confirm_button = QPushButton("Confirm 4-Point Mask")
+        self.confirm_button = QPushButton("Confirm Mask")
         self.confirm_button.clicked.connect(self.accept)
         buttons_layout.addWidget(self.clear_button)
         buttons_layout.addWidget(self.confirm_button)
@@ -451,8 +451,6 @@ class PolygonMaskDialog(QDialog):
         return QPoint(img_x, img_y)
 
     def image_clicked(self, event):
-        if len(self.points) >= 4:
-            return
         point = self._label_to_image(event.pos())
         if point is None:
             return
@@ -464,7 +462,7 @@ class PolygonMaskDialog(QDialog):
         self._render_preview()
 
     def set_points(self, points):
-        self.points = [QPoint(int(p.x()), int(p.y())) for p in points[:4]]
+        self.points = [QPoint(int(p.x()), int(p.y())) for p in points]
         self._render_preview()
 
     def get_points(self):
@@ -481,7 +479,7 @@ class PolygonMaskDialog(QDialog):
         if len(self.points) >= 2:
             painter.setPen(QPen(Qt.green, 3))
             painter.drawPolyline(QPolygonF([QPointF(p) for p in self.points]))
-        if len(self.points) == 4:
+        if len(self.points) >= 3:
             painter.setPen(QPen(Qt.green, 3))
             painter.drawLine(self.points[-1], self.points[0])
         painter.end()

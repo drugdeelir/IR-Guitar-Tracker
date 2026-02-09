@@ -177,9 +177,11 @@ class ProjectionMappingApp(QMainWindow):
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.addWidget(self.control_scroll)
         self.main_splitter.addWidget(self.video_display)
-        self.main_splitter.setStretchFactor(0, 2)
-        self.main_splitter.setStretchFactor(1, 3)
-        self.main_splitter.setSizes([500, 900])
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 4)
+        self.main_splitter.setSizes([620, 900])
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setCollapsible(1, False)
         self.layout.addWidget(self.main_splitter)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
@@ -333,7 +335,7 @@ class ProjectionMappingApp(QMainWindow):
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setWidget(self.control_panel)
         self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.control_scroll.setMinimumWidth(460)
+        self.control_scroll.setMinimumWidth(560)
         self.control_scroll.setMaximumWidth(560)
 
         camera_group = QGroupBox("Camera")
@@ -739,7 +741,7 @@ class ProjectionMappingApp(QMainWindow):
         QMessageBox.information(
             self,
             "Stage 1",
-            "Review the auto-scanned projector mask. Drag/click 4 points if needed, then confirm.",
+            "Review the auto-scanned projector bounds. Drag/click 4 points if needed, then confirm.",
         )
         if not bounds_dialog.exec_() or len(bounds_dialog.get_points()) != 4:
             QMessageBox.warning(self, "Stage 1", "Projector bounds were not confirmed.")
@@ -753,16 +755,29 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.warp_points = self.projector_window.deserialize_warp_points(normalized)
         self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
 
-        bg_points = [(p.x(), p.y()) for p in confirmed_points]
+        background_dialog = PolygonMaskDialog("Draw background mask (unlimited points)", self)
+        background_dialog.set_pixmap(QPixmap.fromImage(still))
+        background_dialog.set_points(confirmed_points)
+        QMessageBox.information(
+            self,
+            "Stage 1",
+            "Now draw the background mask. Add as many points as needed, then confirm.",
+        )
+        if not background_dialog.exec_() or len(background_dialog.get_points()) < 3:
+            QMessageBox.warning(self, "Stage 1", "Background mask was not confirmed.")
+            return
+
+        bg_points_q = background_dialog.get_points()
+        bg_points = [(p.x(), p.y()) for p in bg_points_q]
         self.ensure_mask("Background", bg_points, mask_type="static", linked_marker_count=0)
-        overlay = self._draw_polygon_overlay(still, confirmed_points, Qt.yellow)
+        overlay = self._draw_polygon_overlay(still, bg_points_q, Qt.yellow)
         if overlay is not None:
             self.update_projector_preview(overlay)
 
         QMessageBox.information(
             self,
             "Stage 1 Complete",
-            "Projector bounds applied. Continue to marker selection.",
+            "Projector bounds and background mask applied. Continue to marker selection.",
         )
 
         # Stage 2: guitar markers + guitar mask + depth baseline
