@@ -414,7 +414,10 @@ class ProjectionMappingApp(QMainWindow):
 
         self.link_mask_button = QPushButton("Link Mask to Markers")
         self.link_mask_button.clicked.connect(self.link_mask_to_markers)
+        self.auto_sync_checkbox = QCheckBox("Auto-sync marker links")
+        self.auto_sync_checkbox.setChecked(True)
         mask_layout.addWidget(self.link_mask_button)
+        mask_layout.addWidget(self.auto_sync_checkbox)
 
         mask_group.setLayout(mask_layout)
         self.control_layout.addWidget(mask_group)
