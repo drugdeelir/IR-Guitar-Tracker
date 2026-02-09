@@ -16,13 +16,13 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 *   **Stage Timing Breakdown:** Live detect/match/warp/render timings to quickly spot bottlenecks.
 *   **Session Persistence:** Remembers thresholds, display selections, and warp calibration between launches.
 *   **Multi-threaded Performance:** A modern architecture that separates video processing from the UI to ensure a responsive and fast experience.
-*   **Standalone Application:** Includes a setup script to package the tool into a native macOS (`.app`) application.
+*   **Windows-first Workflow:** Optimized for Windows 10 laptop use with practical defaults for live performance.
 
 ## Installation (for Development)
 
 These instructions are for running the application directly from the source code.
 
-1.  **Install Python:** Ensure you have Python 3 installed on your Mac. You can download it from [python.org](https://www.python.org/).
+1.  **Install Python:** Ensure you have Python 3 installed on your Windows 10 laptop. You can download it from [python.org](https://www.python.org/).
 
 2.  **Clone the Repository:**
     ```bash
@@ -32,38 +32,36 @@ These instructions are for running the application directly from the source code
 
 3.  **Install Dependencies:** It's recommended to use a virtual environment.
     ```bash
-    python3 -m venv venv
-    source venv/bin/activate
+    python -m venv venv
+    venv\Scripts\activate
     pip install -r requirements.txt
     ```
-    *(Note: A `requirements.txt` will need to be generated, but for now, the dependencies are `opencv-python`, `numpy`, and `PyQt5`)*
+    *(Dependencies are listed in `requirements.txt`.)*
 
 4.  **Run the Application:**
     ```bash
-    python3 main.py
+    python main.py
     ```
 
-## How to Package for macOS (`.app` Bundle)
+## Package as a Windows Executable (Optional)
 
-This project uses `py2app` to create a standalone macOS application. This is the recommended way to use the tool for live performances.
+If you want to run this without opening a terminal each time, you can build a `.exe` with PyInstaller:
 
-1.  **Install Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-2.  **Clean Previous Builds (Important):**
-    Before each build, make sure to remove any old build artifacts to prevent errors.
-    ```bash
-    rm -rf build dist
-    ```
+2. Build a one-folder executable:
+   ```bash
+   pyinstaller --noconfirm --name ProjectionMapper --windowed --add-data "style.qss;." --add-data "logo.png;." main.py
+   ```
+   or:
+   ```bash
+   python setup.py
+   ```
 
-3.  **Build the Application:**
-    ```bash
-    python3 setup.py py2app
-    ```
-
-3.  **Run the App:** A `Projection Mapper.app` file will be created in the `dist/` directory. You can drag this to your Applications folder and run it like any other Mac app. No more terminal commands are needed!
+3. Run from `dist/ProjectionMapper/ProjectionMapper.exe`.
 
 ## How to Use
 
@@ -95,3 +93,16 @@ This project uses `py2app` to create a standalone macOS application. This is the
 ## Performance Note for SSD Users
 
 Running this application from an SSD is highly recommended. It will significantly improve the loading speed of your video cue files, resulting in smoother transitions and a more reliable performance during a live show.
+
+
+## Windows 10 Optimization Notes
+
+This app now auto-applies Windows-focused performance defaults:
+
+* DirectShow camera backend for more stable webcam startup/latency on Windows.
+* Camera defaults tuned for laptop performance (960x540 @ 30 FPS).
+* Slightly lower detection scale to reduce CPU usage while tracking IR markers.
+
+These defaults are stability-first for live use.
+
+The app also attempts multiple camera backends on Windows (DirectShow -> Media Foundation -> Any) so it works with a wider range of webcams and capture devices.
