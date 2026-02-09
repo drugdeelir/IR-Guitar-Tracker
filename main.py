@@ -2,6 +2,7 @@ import json
 import os
 import platform
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
@@ -253,7 +254,11 @@ class ProjectionMappingApp(QMainWindow):
         self.marker_selection_dialog.take_picture_button.setEnabled(True)
 
         if self.marker_selection_dialog.exec_():
-            self.selected_markers = self.marker_selection_dialog.get_selected_points()
+            markers = self.marker_selection_dialog.get_selected_points()
+            if len(markers) < 4:
+                QMessageBox.warning(self, "Marker Selection", "Please select exactly 4 guitar markers.")
+                return
+            self.selected_markers = markers[:4]
             self.worker.set_marker_points(self.selected_markers)
             self.statusBar().showMessage(
                 f"Selected {len(self.selected_markers)} markers.", 3000
@@ -537,7 +542,7 @@ class ProjectionMappingApp(QMainWindow):
             pass
         return result["image"]
 
-    def detect_projector_bounds(self, image):
+    def _qimage_to_bgr(self, image):
         if image is None:
             return None
         qimg = image.convertToFormat(QImage.Format_RGB32)
@@ -546,21 +551,85 @@ class ProjectionMappingApp(QMainWindow):
         ptr = qimg.bits()
         ptr.setsize(qimg.byteCount())
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 4))
-        frame = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+
+    @staticmethod
+    def _order_quad_points(points):
+        pts = np.array(points, dtype=np.float32)
+        s = pts.sum(axis=1)
+        d = np.diff(pts, axis=1)
+        ordered = np.zeros((4, 2), dtype=np.float32)
+        ordered[0] = pts[np.argmin(s)]
+        ordered[2] = pts[np.argmax(s)]
+        ordered[1] = pts[np.argmin(d)]
+        ordered[3] = pts[np.argmax(d)]
+        return ordered
+
+    def detect_projector_bounds(self, off_image, on_image):
+        off_frame = self._qimage_to_bgr(off_image)
+        on_frame = self._qimage_to_bgr(on_image)
+        if off_frame is None or on_frame is None:
+            return None
+
+        h, w = on_frame.shape[:2]
+        diff = cv2.absdiff(on_frame, off_frame)
+        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        diff_gray = cv2.GaussianBlur(diff_gray, (5, 5), 0)
+
+        adaptive_threshold = int(np.percentile(diff_gray, 95))
+        _, otsu = cv2.threshold(diff_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, pct = cv2.threshold(diff_gray, adaptive_threshold, 255, cv2.THRESH_BINARY)
+        thresh = cv2.bitwise_or(otsu, pct)
+
+        kernel = np.ones((5, 5), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < 1000:
+
+        best_quad = None
+        best_score = -1.0
+        image_area = float(w * h)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < image_area * 0.05:
+                continue
+
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+
+            approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
+            if len(approx) == 4:
+                quad = approx.reshape(-1, 2)
+            else:
+                rect = cv2.minAreaRect(contour)
+                quad = cv2.boxPoints(rect)
+
+            quad_area = abs(cv2.contourArea(np.array(quad, dtype=np.float32)))
+            x, y, bw, bh = cv2.boundingRect(np.array(quad, dtype=np.int32))
+            rect_area = max(float(bw * bh), 1.0)
+            rectangularity = quad_area / rect_area
+            score = (quad_area / image_area) * 0.8 + rectangularity * 0.2
+
+            if score > best_score:
+                best_score = score
+                best_quad = quad
+
+        if best_quad is None:
             return None
-        rect = cv2.minAreaRect(contour)
-        box = cv2.boxPoints(rect)
-        points = []
-        for x, y in box:
-            points.append([float(max(0.0, min(1.0, x / max(w, 1)))), float(max(0.0, min(1.0, y / max(h, 1))))])
-        return points
+
+        ordered = self._order_quad_points(best_quad)
+        normalized = []
+        for x, y in ordered:
+            normalized.append([
+                float(max(0.0, min(1.0, x / max(w, 1)))),
+                float(max(0.0, min(1.0, y / max(h, 1)))),
+            ])
+        return normalized
 
 
     def _draw_polygon_overlay(self, image, points, color=Qt.green):
@@ -597,12 +666,26 @@ class ProjectionMappingApp(QMainWindow):
 
     def run_full_calibration_wizard(self):
         # Stage 1: room scan + projector bounds
-        still = self.capture_still_frame_sync()
-        if still is None:
-            QMessageBox.warning(self, "Calibration", "Could not capture a camera frame for room scan.")
+        self.projector_window.set_pattern_mode(False)
+        QApplication.processEvents()
+        time.sleep(0.25)
+        still_off = self.capture_still_frame_sync()
+        if still_off is None:
+            QMessageBox.warning(self, "Calibration", "Could not capture a camera frame for room scan (projector off frame).")
             return
 
-        bounds = self.detect_projector_bounds(still)
+        self.projector_window.set_pattern_mode(True, brightness=255)
+        QApplication.processEvents()
+        time.sleep(0.35)
+        still_on = self.capture_still_frame_sync()
+        self.projector_window.set_pattern_mode(False)
+
+        if still_on is None:
+            QMessageBox.warning(self, "Calibration", "Could not capture a camera frame for room scan (projector on frame).")
+            return
+
+        still = still_on
+        bounds = self.detect_projector_bounds(still_off, still_on)
         initial_points = []
         if bounds:
             initial_points = [
@@ -654,17 +737,29 @@ class ProjectionMappingApp(QMainWindow):
         if still2 is None:
             QMessageBox.warning(self, "Stage 2", "Could not capture still frame for guitar mask.")
             return
-        guitar_dialog = PolygonMaskDialog("Draw 4-point guitar mask", self)
-        guitar_dialog.set_pixmap(QPixmap.fromImage(still2))
-        if guitar_dialog.exec_():
-            pts = guitar_dialog.get_points()
-            if len(pts) == 4:
-                source = [(p.x(), p.y()) for p in pts]
-            else:
-                source = [(p.x(), p.y()) for p in self.selected_markers[:4]]
-            self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
-            self.worker.set_marker_points(self.selected_markers[:4])
-            self.worker.calibrate_depth()
+
+        auto_source = [(p.x(), p.y()) for p in self.selected_markers[:4]]
+        auto_source = self._order_quad_points(auto_source)
+        source = [(int(p[0]), int(p[1])) for p in auto_source]
+
+        self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
+        self.worker.set_marker_points(self.selected_markers[:4])
+        self.worker.calibrate_depth()
+
+        refine = QMessageBox.question(
+            self,
+            "Stage 2",
+            "Auto-created guitar mask from IR markers. Refine manually?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if refine == QMessageBox.Yes:
+            guitar_dialog = PolygonMaskDialog("Refine 4-point guitar mask", self)
+            guitar_dialog.set_pixmap(QPixmap.fromImage(still2))
+            guitar_dialog.set_points([QPoint(x, y) for x, y in source])
+            if guitar_dialog.exec_() and len(guitar_dialog.get_points()) == 4:
+                source = [(p.x(), p.y()) for p in guitar_dialog.get_points()]
+                self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
 
         # Stage 3: amp mask
         still3 = self.capture_still_frame_sync()

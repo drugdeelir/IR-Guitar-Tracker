@@ -1,7 +1,7 @@
 from PyQt5.QtCore import QPoint, QPointF, Qt, pyqtSignal
 import cv2
 import numpy as np
-from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap, QPolygonF
+from PyQt5.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout, QPushButton, QWidget
 
 
@@ -15,18 +15,22 @@ class MarkerSelectionDialog(QDialog):
         self.selected_points = []
         self.original_pixmap = None
         self.detected_ir_points = []
+        self.max_markers = 4
 
         self.layout = QVBoxLayout(self)
         self.image_label = QLabel("Press 'Take Picture' to begin.")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.mousePressEvent = self.image_clicked
         self.take_picture_button = QPushButton("Take Picture")
+        self.auto_select_button = QPushButton("Auto-Select Best 4")
+        self.auto_select_button.clicked.connect(self.auto_select_markers)
 
         self.confirm_button = QPushButton("Confirm Markers")
         self.confirm_button.clicked.connect(self.accept)
 
         self.layout.addWidget(self.image_label)
         self.layout.addWidget(self.take_picture_button)
+        self.layout.addWidget(self.auto_select_button)
         self.layout.addWidget(self.confirm_button)
 
     def set_pixmap(self, pixmap):
@@ -42,22 +46,43 @@ class MarkerSelectionDialog(QDialog):
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 3))
 
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        percentile_threshold = int(np.percentile(enhanced, 99.2))
+        _, otsu_thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, pct_thresh = cv2.threshold(enhanced, percentile_threshold, 255, cv2.THRESH_BINARY)
+        thresh = cv2.bitwise_or(otsu_thresh, pct_thresh)
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 8:
+            if area < 6 or area > 300:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.45:
                 continue
             moments = cv2.moments(contour)
             if moments["m00"] == 0:
                 continue
             cx = int(moments["m10"] / moments["m00"])
             cy = int(moments["m01"] / moments["m00"])
-            candidates.append(QPoint(cx, cy))
-        return candidates
+            x, y, ww, hh = cv2.boundingRect(contour)
+            roi = enhanced[y : y + hh, x : x + ww]
+            peak = int(np.max(roi)) if roi.size else 0
+            score = circularity * 1000.0 + area * 0.2 + peak
+            candidates.append((score, QPoint(cx, cy)))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [pt for _, pt in candidates[:40]]
 
     def _snap_to_ir_point(self, point, max_distance=40):
         if not self.detected_ir_points:
@@ -65,11 +90,16 @@ class MarkerSelectionDialog(QDialog):
 
         nearest = min(
             self.detected_ir_points,
-            key=lambda candidate: (candidate - point).manhattanLength(),
+            key=lambda candidate: (candidate.x() - point.x()) ** 2 + (candidate.y() - point.y()) ** 2,
         )
-        if (nearest - point).manhattanLength() <= max_distance:
+        distance = ((nearest.x() - point.x()) ** 2 + (nearest.y() - point.y()) ** 2) ** 0.5
+        if distance <= max_distance:
             return nearest
         return point
+
+    def auto_select_markers(self):
+        self.selected_points = [QPoint(p.x(), p.y()) for p in self.detected_ir_points[: self.max_markers]]
+        self._render_preview()
 
     def _get_draw_rect(self):
         if not self.original_pixmap:
@@ -108,9 +138,13 @@ class MarkerSelectionDialog(QDialog):
 
         preview = self.original_pixmap.copy()
         painter = QPainter(preview)
+        painter.setPen(QPen(Qt.red, 5))
+        for point in self.detected_ir_points:
+            painter.drawEllipse(point, 4, 4)
         painter.setPen(QPen(Qt.green, 10))
-        for point in self.selected_points:
+        for i, point in enumerate(self.selected_points, start=1):
             painter.drawPoint(point)
+            painter.drawText(point.x() + 6, point.y() - 6, str(i))
         painter.end()
 
         scaled_preview = preview.scaled(
@@ -119,10 +153,18 @@ class MarkerSelectionDialog(QDialog):
         self.image_label.setPixmap(scaled_preview)
 
     def image_clicked(self, event):
+        if len(self.selected_points) >= self.max_markers:
+            return
         point = self._label_to_image(event.pos())
         if point is None:
             return
         point = self._snap_to_ir_point(point)
+
+        for existing in self.selected_points:
+            distance = ((existing.x() - point.x()) ** 2 + (existing.y() - point.y()) ** 2) ** 0.5
+            if distance < 12:
+                return
+
         self.selected_points.append(point)
         self.marker_selected.emit(point)
         self._render_preview()
@@ -136,6 +178,7 @@ class MarkerSelectionDialog(QDialog):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._render_preview()
         self._render_preview()
 
 
@@ -232,16 +275,49 @@ class ProjectorWindow(QWidget):
         self.setStyleSheet("background-color: black;")
 
         self.calibration_mode = False
+        self.pattern_mode = False
+        self.pattern_brightness = 255
+        self.pattern_margin_ratio = 0.08
         self.warp_points = [QPointF(0.0, 0.0), QPointF(1.0, 0.0), QPointF(1.0, 1.0), QPointF(0.0, 1.0)]
         self.dragging_point_index = -1
         self.show()
 
     def set_image(self, image):
+        if self.pattern_mode:
+            return
         pixmap = QPixmap.fromImage(image)
         size = self.label.size()
         if size.width() > 1 and size.height() > 1:
             pixmap = pixmap.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         self.label.setPixmap(pixmap)
+
+    def set_pattern_mode(self, enabled, brightness=255):
+        self.pattern_mode = bool(enabled)
+        self.pattern_brightness = int(max(1, min(255, brightness)))
+        if self.pattern_mode:
+            self.render_calibration_pattern()
+
+    def render_calibration_pattern(self):
+        size = self.label.size()
+        w = max(2, size.width())
+        h = max(2, size.height())
+
+        image = QImage(w, h, QImage.Format_RGB888)
+        image.fill(Qt.black)
+
+        painter = QPainter(image)
+        margin_x = int(w * self.pattern_margin_ratio)
+        margin_y = int(h * self.pattern_margin_ratio)
+        rect_w = max(2, w - 2 * margin_x)
+        rect_h = max(2, h - 2 * margin_y)
+
+        fill = QColor(self.pattern_brightness, self.pattern_brightness, self.pattern_brightness)
+        painter.setPen(QPen(Qt.white, 5))
+        painter.setBrush(QBrush(fill))
+        painter.drawRect(margin_x, margin_y, rect_w, rect_h)
+        painter.end()
+
+        self.label.setPixmap(QPixmap.fromImage(image))
 
     def set_calibration_mode(self, enabled):
         self.calibration_mode = enabled
@@ -311,6 +387,8 @@ class ProjectorWindow(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self.pattern_mode:
+            self.render_calibration_pattern()
 
 
 class PolygonMaskDialog(QDialog):
