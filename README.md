@@ -9,6 +9,9 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 *   **Dynamic Mask Warping:** Warps a video source to a mask defined by the live positions of the IR trackers.
 *   **Custom Mask Creation:** An interactive mode to draw a custom polygon mask directly on the video feed.
 *   **Cue System:** A list-based system to manage and trigger different video cues.
+*   **Built-in Projector Preview:** See the projector output directly inside the main control panel.
+*   **Auto-Sync Marker Linking:** Automatically links compatible masks when marker selection and mask point counts match.
+*   **Startup Wizard:** First-run guided setup for camera, projector, threshold mode, and auto-sync defaults.
 *   **Projector Keystone Correction:** A four-point warping system to align the final output perfectly to any projection surface.
 *   **Depth Estimation:** A system to create a 3D "zoom" effect by scaling the mask based on the distance between trackers.
 *   **Adaptive Thresholding:** Switch between manual threshold and auto (Otsu) threshold for varying stage lighting.
@@ -108,3 +111,19 @@ This app now auto-applies Windows-focused performance defaults:
 These defaults are stability-first for live use.
 
 The app also attempts multiple camera backends on Windows (DirectShow -> Media Foundation -> Any) so it works with a wider range of webcams and capture devices.
+
+## Troubleshooting Camera/Startup Warnings
+
+If you see warnings such as `VIDEOIO(DSHOW)` / `Camera index out of range`, these are usually backend probe warnings during camera detection. The app now reduces probing noise and validates camera reads before exposing cameras in the picker.
+
+If startup still exits unexpectedly:
+
+1. Confirm dependencies are installed:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Launch once from terminal to capture logs:
+   ```bash
+   python main.py
+   ```
+3. In the Startup Wizard, pick the camera and projector explicitly, then save.
