@@ -59,6 +59,13 @@ If you want to run this without opening a terminal each time, you can build a `.
 
 3. Run from `dist/ProjectionMapper/ProjectionMapper.exe`.
 
+
+## Recommended IR Camera
+
+For your Windows 10 setup, use this camera link you shared:
+
+* https://a.co/d/0eH7NOVO
+
 ## How to Use
 
 1.  **Startup:** On launch, you'll see a brief splash screen with the logo video, and then the main control window and a black projector output window will appear.
