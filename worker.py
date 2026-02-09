@@ -1,6 +1,9 @@
 import time
 from itertools import combinations
+import os
 import platform
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
 import numpy as np
