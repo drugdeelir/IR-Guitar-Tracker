@@ -172,6 +172,8 @@ class ProjectionMappingApp(QMainWindow):
         self.create_control_panel()
 
         self.layout.addWidget(self.video_display)
+        self.layout.setStretch(0, 1)
+        self.layout.setStretch(1, 3)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
 
@@ -309,6 +311,7 @@ class ProjectionMappingApp(QMainWindow):
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setWidget(self.control_panel)
         self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.control_scroll.setMaximumWidth(480)
         self.layout.addWidget(self.control_scroll)
 
         camera_group = QGroupBox("Camera")

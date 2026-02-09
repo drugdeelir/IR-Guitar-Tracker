@@ -144,10 +144,6 @@ class VideoDisplay(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.label = QLabel()
-        layout = QVBoxLayout()
-        layout.addWidget(self.label)
-        self.setLayout(layout)
         self.mask_creation_mode = False
         self.mask_points = []
         self.current_pixmap = None
@@ -229,6 +225,8 @@ class ProjectorWindow(QWidget):
         self.setWindowTitle("Projector Output")
         self.layout = QVBoxLayout()
         self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setScaledContents(True)
         self.layout.addWidget(self.label)
         self.setLayout(self.layout)
         self.setStyleSheet("background-color: black;")
@@ -239,7 +237,11 @@ class ProjectorWindow(QWidget):
         self.show()
 
     def set_image(self, image):
-        self.label.setPixmap(QPixmap.fromImage(image))
+        pixmap = QPixmap.fromImage(image)
+        size = self.label.size()
+        if size.width() > 1 and size.height() > 1:
+            pixmap = pixmap.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self.label.setPixmap(pixmap)
 
     def set_calibration_mode(self, enabled):
         self.calibration_mode = enabled
