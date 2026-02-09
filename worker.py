@@ -4,6 +4,7 @@ import os
 import platform
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
 import cv2
 import numpy as np
@@ -76,7 +77,7 @@ class Worker(QObject):
         if not self._is_windows:
             return [cv2.CAP_ANY]
 
-        preferred = ["CAP_DSHOW", "CAP_MSMF", "CAP_ANY"]
+        preferred = ["CAP_DSHOW", "CAP_ANY"]
         backends = []
         for name in preferred:
             backend = getattr(cv2, name, None)
@@ -438,12 +439,14 @@ class Worker(QObject):
                 rgb_image_still = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
                 qt_image_still = QImage(
                     rgb_image_still.data, w, h, w * 3, QImage.Format_RGB888
-                )
+                ).copy()
                 self.still_frame_ready.emit(qt_image_still)
                 self._capture_still_frame_flag = False
 
             rgb_image_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
-            qt_image_main = QImage(rgb_image_main.data, w, h, w * 3, QImage.Format_RGB888)
+            qt_image_main = QImage(
+                rgb_image_main.data, w, h, w * 3, QImage.Format_RGB888
+            ).copy()
             self.frame_ready.emit(qt_image_main)
 
             t0 = time.perf_counter()
@@ -456,7 +459,9 @@ class Worker(QObject):
                 warped_output = cv2.warpPerspective(projector_output, matrix, (w, h))
 
             rgb_image_proj = cv2.cvtColor(warped_output, cv2.COLOR_BGR2RGB)
-            qt_image_proj = QImage(rgb_image_proj.data, w, h, w * 3, QImage.Format_RGB888)
+            qt_image_proj = QImage(
+                rgb_image_proj.data, w, h, w * 3, QImage.Format_RGB888
+            ).copy()
             self.projector_frame_ready.emit(qt_image_proj)
             projector_ms = (time.perf_counter() - t0) * 1000.0
 
