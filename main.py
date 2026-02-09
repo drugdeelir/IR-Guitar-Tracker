@@ -28,7 +28,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QSplitter,
     QScrollArea,
+    QSizePolicy,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -172,9 +174,13 @@ class ProjectionMappingApp(QMainWindow):
 
         self.create_control_panel()
 
-        self.layout.addWidget(self.video_display)
-        self.layout.setStretch(0, 1)
-        self.layout.setStretch(1, 3)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(self.control_scroll)
+        self.main_splitter.addWidget(self.video_display)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setSizes([500, 900])
+        self.layout.addWidget(self.main_splitter)
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
 
@@ -186,6 +192,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.trackers_detected.connect(self.update_tracker_label)
         self.worker.camera_error.connect(self.show_camera_error)
         self.worker.performance_updated.connect(self.update_performance_label)
+        self.worker.camera_info_updated.connect(self.update_camera_info)
 
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.marker_selection_dialog.take_picture_button.clicked.connect(
@@ -218,6 +225,8 @@ class ProjectionMappingApp(QMainWindow):
             "warp_points": self.projector_window.get_warp_points_normalized(),
             "auto_sync_enabled": self.auto_sync_checkbox.isChecked(),
             "show_preview_enabled": self.preview_checkbox.isChecked(),
+            "camera_mode": self.camera_mode_combo.currentData(),
+            "show_mask_overlays": self.show_mask_overlays_checkbox.isChecked(),
             "wizard_completed": True,
         }
         try:
@@ -233,7 +242,15 @@ class ProjectionMappingApp(QMainWindow):
         self.depth_sensitivity_slider.setValue(self.settings.get("depth_sensitivity", 100))
         self.auto_sync_checkbox.setChecked(self.settings.get("auto_sync_enabled", True))
         self.preview_checkbox.setChecked(self.settings.get("show_preview_enabled", True))
+        self.show_mask_overlays_checkbox.setChecked(self.settings.get("show_mask_overlays", True))
         self.projector_preview_label.setVisible(self.preview_checkbox.isChecked())
+
+        camera_mode = self.settings.get("camera_mode", "native")
+        mode_index = self.camera_mode_combo.findData(camera_mode)
+        if mode_index >= 0:
+            self.camera_mode_combo.setCurrentIndex(mode_index)
+
+        self.worker.set_show_mask_overlays(self.show_mask_overlays_checkbox.isChecked())
 
         cam_idx = self.settings.get("camera_index", 0)
         if self.camera_combo.count() and self.camera_combo.isEnabled():
@@ -316,12 +333,17 @@ class ProjectionMappingApp(QMainWindow):
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setWidget(self.control_panel)
         self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.control_scroll.setMaximumWidth(480)
-        self.layout.addWidget(self.control_scroll)
+        self.control_scroll.setMinimumWidth(460)
+        self.control_scroll.setMaximumWidth(560)
 
         camera_group = QGroupBox("Camera")
         camera_layout = QVBoxLayout()
         self.camera_combo = QComboBox()
+        self.camera_mode_combo = QComboBox()
+        self.camera_mode_combo.addItem("Native / Driver Default", "native")
+        self.camera_mode_combo.addItem("Performance (960x540 @ 30)", "performance")
+        self.camera_mode_combo.addItem("High Detail (1280x720 @ 30)", "hd")
+        self.camera_mode_combo.currentIndexChanged.connect(self.update_camera_mode)
         self.refresh_camera_button = QPushButton("Refresh Cameras")
         self.refresh_camera_button.clicked.connect(self.refresh_cameras)
         self.retry_camera_button = QPushButton("Retry Camera")
@@ -332,6 +354,7 @@ class ProjectionMappingApp(QMainWindow):
         self.refresh_cameras(initial=True)
 
         camera_layout.addWidget(self.camera_combo)
+        camera_layout.addWidget(self.camera_mode_combo)
         camera_layout.addWidget(self.refresh_camera_button)
         camera_layout.addWidget(self.retry_camera_button)
         camera_group.setLayout(camera_layout)
@@ -462,7 +485,9 @@ class ProjectionMappingApp(QMainWindow):
         diagnostics_group = QGroupBox("Diagnostics")
         diagnostics_layout = QVBoxLayout()
         self.performance_label = QLabel("FPS: -- | Frame: -- | D: -- M: -- W: -- R: --")
+        self.camera_info_label = QLabel("Camera: waiting for stream...")
         diagnostics_layout.addWidget(self.performance_label)
+        diagnostics_layout.addWidget(self.camera_info_label)
         diagnostics_group.setLayout(diagnostics_layout)
         self.control_layout.addWidget(diagnostics_group)
 
@@ -478,6 +503,15 @@ class ProjectionMappingApp(QMainWindow):
         preview_layout.addWidget(self.projector_preview_label)
         preview_group.setLayout(preview_layout)
         self.control_layout.addWidget(preview_group)
+
+        overlays_group = QGroupBox("Mask Overlays")
+        overlays_layout = QVBoxLayout()
+        self.show_mask_overlays_checkbox = QCheckBox("Show calibration/static masks")
+        self.show_mask_overlays_checkbox.setChecked(True)
+        self.show_mask_overlays_checkbox.toggled.connect(self.worker.set_show_mask_overlays)
+        overlays_layout.addWidget(self.show_mask_overlays_checkbox)
+        overlays_group.setLayout(overlays_layout)
+        self.control_layout.addWidget(overlays_group)
 
         self.apply_preview_minimum_sizes()
         self.apply_control_sizing()
@@ -518,8 +552,12 @@ class ProjectionMappingApp(QMainWindow):
     def apply_control_sizing(self):
         for button in self.control_panel.findChildren(QPushButton):
             button.setMinimumHeight(42)
+            button.setMinimumWidth(260)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for combo in self.control_panel.findChildren(QComboBox):
             combo.setMinimumHeight(34)
+            combo.setMinimumWidth(260)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def cache_latest_frame(self, image):
         self.latest_camera_qimage = image.copy()
@@ -806,6 +844,12 @@ class ProjectionMappingApp(QMainWindow):
     def retry_camera(self):
         self.worker.retry_camera()
         self.statusBar().showMessage("Retrying camera connection...", 2000)
+
+    def update_camera_mode(self, _index):
+        self.worker.set_camera_mode(self.camera_mode_combo.currentData())
+
+    def update_camera_info(self, message):
+        self.camera_info_label.setText(message)
 
     def calibrate_depth(self):
         self.worker.calibrate_depth()

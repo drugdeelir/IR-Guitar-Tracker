@@ -50,7 +50,7 @@ class MarkerSelectionDialog(QDialog):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        percentile_threshold = int(np.percentile(enhanced, 99.2))
+        percentile_threshold = int(np.percentile(enhanced, 99.4))
         _, otsu_thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         _, pct_thresh = cv2.threshold(enhanced, percentile_threshold, 255, cv2.THRESH_BINARY)
         thresh = cv2.bitwise_or(otsu_thresh, pct_thresh)
@@ -62,27 +62,32 @@ class MarkerSelectionDialog(QDialog):
         candidates = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 6 or area > 300:
+            if area < 4 or area > 1200:
                 continue
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.45:
+            if circularity < 0.2:
                 continue
+
+            contour_mask = np.zeros(enhanced.shape, dtype=np.uint8)
+            cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+            peak = float(cv2.minMaxLoc(enhanced, mask=contour_mask)[1])
+            mean_intensity = float(cv2.mean(enhanced, mask=contour_mask)[0])
+            if peak < 180 and mean_intensity < 110:
+                continue
+
             moments = cv2.moments(contour)
             if moments["m00"] == 0:
                 continue
             cx = int(moments["m10"] / moments["m00"])
             cy = int(moments["m01"] / moments["m00"])
-            x, y, ww, hh = cv2.boundingRect(contour)
-            roi = enhanced[y : y + hh, x : x + ww]
-            peak = int(np.max(roi)) if roi.size else 0
-            score = circularity * 1000.0 + area * 0.2 + peak
+            score = peak * 2.2 + mean_intensity * 1.4 + circularity * 120.0 + area * 0.1
             candidates.append((score, QPoint(cx, cy)))
 
         candidates.sort(key=lambda item: item[0], reverse=True)
-        return [pt for _, pt in candidates[:40]]
+        return [pt for _, pt in candidates[:60]]
 
     def _snap_to_ir_point(self, point, max_distance=40):
         if not self.detected_ir_points:

@@ -19,6 +19,7 @@ class Worker(QObject):
     trackers_detected = pyqtSignal(int)
     camera_error = pyqtSignal(int)
     performance_updated = pyqtSignal(float, float, float, float, float, float)
+    camera_info_updated = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -63,13 +64,10 @@ class Worker(QObject):
         self._camera_height = 720
         self._camera_fps = 30
         self._is_windows = platform.system().lower() == "windows"
+        self.camera_mode = "native"
+        self.show_mask_overlays = True
 
         if self._is_windows:
-            # Windows 10 laptop defaults: lower camera load while keeping enough detail
-            # for IR marker tracking, and limit target FPS to a realistic sustained value.
-            self._camera_width = 960
-            self._camera_height = 540
-            self._camera_fps = 30
             self._target_fps = 30.0
             self._detection_scale = 0.45
 
@@ -133,6 +131,13 @@ class Worker(QObject):
     def set_active_cue_index(self, index):
         self.active_cue_index = index
 
+    def set_camera_mode(self, mode):
+        self.camera_mode = mode if mode in {"native", "performance", "hd"} else "native"
+        self._camera_changed = True
+
+    def set_show_mask_overlays(self, enabled):
+        self.show_mask_overlays = bool(enabled)
+
     def _ensure_buffers(self, h, w):
         if self._buffer_shape == (h, w):
             return
@@ -158,7 +163,7 @@ class Worker(QObject):
             enhanced = enhanced_full
 
         if self.threshold_mode == "auto":
-            percentile_threshold = int(np.percentile(enhanced, 99.2))
+            percentile_threshold = int(np.percentile(enhanced, 99.4))
             _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             _, pct = cv2.threshold(enhanced, percentile_threshold, 255, cv2.THRESH_BINARY)
             thresh = cv2.bitwise_or(otsu, pct)
@@ -173,14 +178,21 @@ class Worker(QObject):
         scale_back = 1.0 / self._detection_scale if self._detection_scale < 1.0 else 1.0
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area <= 6 or area >= 360:
+            if area <= 4 or area >= 1200:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.4:
+            if circularity < 0.2:
+                continue
+
+            mask = np.zeros(enhanced.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+            peak = float(cv2.minMaxLoc(enhanced, mask=mask)[1])
+            mean_intensity = float(cv2.mean(enhanced, mask=mask)[0])
+            if peak < 180 and mean_intensity < 110:
                 continue
 
             moments = cv2.moments(contour)
@@ -192,10 +204,7 @@ class Worker(QObject):
             cx = int(cx_scaled * scale_back)
             cy = int(cy_scaled * scale_back)
 
-            x, y, w, h = cv2.boundingRect(contour)
-            roi = enhanced[y : y + h, x : x + w]
-            peak = float(np.max(roi)) if roi.size else 0.0
-            score = circularity * 1000.0 + area * 0.25 + peak
+            score = peak * 2.2 + mean_intensity * 1.4 + circularity * 120.0 + area * 0.1
             contour_candidates.append((score, (cx, cy)))
 
         contour_candidates.sort(key=lambda item: item[0], reverse=True)
@@ -318,16 +327,33 @@ class Worker(QObject):
         return True
 
     def _open_camera(self):
+        mode_profiles = {
+            "native": (None, None, None),
+            "performance": (960, 540, 30),
+            "hd": (1280, 720, 30),
+        }
+        req_w, req_h, req_fps = mode_profiles.get(self.camera_mode, mode_profiles["native"])
+
         for backend in self._camera_backends():
             cap = self._open_capture_with_backend(self.video_source, backend)
             if not cap.isOpened():
                 cap.release()
                 continue
 
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._camera_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._camera_height)
-            cap.set(cv2.CAP_PROP_FPS, self._camera_fps)
+            if req_w and req_h:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
+            if req_fps:
+                cap.set(cv2.CAP_PROP_FPS, req_fps)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            mode_name = self.camera_mode
+            self.camera_info_updated.emit(
+                f"Camera mode: {mode_name} | Actual: {actual_w}x{actual_h} @ {actual_fps:.1f} fps"
+            )
             return cap
 
         return None
@@ -388,11 +414,30 @@ class Worker(QObject):
             for point in tracked_points:
                 cv2.circle(main_frame, point, 5, (0, 0, 255), -1)
 
+            if self.show_mask_overlays:
+                for mask in self.masks:
+                    if not mask.source_points:
+                        continue
+                    pts = np.array(mask.source_points, dtype=np.int32).reshape((-1, 1, 2))
+                    if len(pts) >= 3:
+                        cv2.polylines(main_frame, [pts], True, (0, 255, 255), 2)
+
             t0 = time.perf_counter()
             for i, mask in enumerate(self.masks):
                 if self.active_cue_index >= 0 and i != self.active_cue_index:
                     continue
-                if not mask.video_path or not mask.source_points:
+                if not mask.source_points:
+                    continue
+
+                if not mask.video_path:
+                    if not self.show_mask_overlays:
+                        continue
+                    dst_pts = np.float32(mask.source_points)
+                    if len(dst_pts) < 3:
+                        continue
+                    overlay_color = (30, 30, 30) if mask.name.lower() == "background" else (0, 120, 255)
+                    cv2.fillPoly(projector_output, [np.int32(dst_pts)], overlay_color)
+                    cv2.polylines(projector_output, [np.int32(dst_pts)], True, (255, 255, 255), 2)
                     continue
 
                 if mask.type == "dynamic":
