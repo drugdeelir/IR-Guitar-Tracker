@@ -27,8 +27,8 @@ class Worker(QObject):
         self.warp_points = [[0, 0], [1, 0], [1, 1], [0, 1]]
         self.masks = []
         self.video_captures = {}
-        self.ir_threshold = 200
-        self.threshold_mode = "manual"
+        self.ir_threshold = 215
+        self.threshold_mode = "auto"
         self._camera_changed = True
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
@@ -142,50 +142,61 @@ class Worker(QObject):
 
     def _extract_detected_points(self, main_frame):
         gray_full = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+        gray_full = cv2.GaussianBlur(gray_full, (5, 5), 0)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced_full = clahe.apply(gray_full)
+
         if self._detection_scale < 1.0:
-            gray_frame = cv2.resize(
-                gray_full,
+            enhanced = cv2.resize(
+                enhanced_full,
                 None,
                 fx=self._detection_scale,
                 fy=self._detection_scale,
                 interpolation=cv2.INTER_AREA,
             )
         else:
-            gray_frame = gray_full
+            enhanced = enhanced_full
 
         if self.threshold_mode == "auto":
-            _, thresh = cv2.threshold(
-                gray_frame, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
+            percentile_threshold = int(np.percentile(enhanced, 99.2))
+            _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            _, pct = cv2.threshold(enhanced, percentile_threshold, 255, cv2.THRESH_BINARY)
+            thresh = cv2.bitwise_or(otsu, pct)
         else:
-            _, thresh = cv2.threshold(
-                gray_frame, self.ir_threshold, 255, cv2.THRESH_BINARY
-            )
+            _, thresh = cv2.threshold(enhanced, self.ir_threshold, 255, cv2.THRESH_BINARY)
 
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, self._noise_kernel)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, self._noise_kernel)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         contour_candidates = []
         scale_back = 1.0 / self._detection_scale if self._detection_scale < 1.0 else 1.0
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area <= 12:
+            if area <= 6 or area >= 360:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.3:
+            if circularity < 0.4:
                 continue
 
             moments = cv2.moments(contour)
             if moments["m00"] == 0:
                 continue
 
-            cx = int((moments["m10"] / moments["m00"]) * scale_back)
-            cy = int((moments["m01"] / moments["m00"]) * scale_back)
-            contour_candidates.append((area, (cx, cy)))
+            cx_scaled = int(moments["m10"] / moments["m00"])
+            cy_scaled = int(moments["m01"] / moments["m00"])
+            cx = int(cx_scaled * scale_back)
+            cy = int(cy_scaled * scale_back)
+
+            x, y, w, h = cv2.boundingRect(contour)
+            roi = enhanced[y : y + h, x : x + w]
+            peak = float(np.max(roi)) if roi.size else 0.0
+            score = circularity * 1000.0 + area * 0.25 + peak
+            contour_candidates.append((score, (cx, cy)))
 
         contour_candidates.sort(key=lambda item: item[0], reverse=True)
         return [point for _, point in contour_candidates]
