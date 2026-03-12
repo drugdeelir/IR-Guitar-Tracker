@@ -43,8 +43,9 @@ These instructions are for running the application directly from the source code
 
 4.  **Run the Application:**
     ```bash
-    python main.py
+    python start.py
     ```
+    (`start.py` installs requirements if needed, validates key files, then launches `main.py`.)
 
     Or on Windows, double-click `run_windows.bat` to launch it automatically.
 
@@ -84,8 +85,9 @@ If you want to run this without opening a terminal each time, you can build a `.
     *   Click on the main video feed to draw the vertices of your custom mask shape.
     *   When you are done, click **"Finish Mask"**. The mask points are now associated with the selected video cue.
 6.  **Link Trackers:**
-    *   Click **"Select Guitar Markers"**, capture a still frame, and click the marker positions directly on the image in order.
-    *   Click **"Confirm Markers"**, then click **"Link Mask to Markers"** for the selected cue.
+    *   In the full calibration wizard, upload a reference guitar image and manually pick 4 markers.
+    *   Then capture live IR markers and pick the same 4 points in the live frame.
+    *   Click **"Confirm Markers"**, then click **"Link Mask to Markers"** for the selected cue if needed.
 7.  **Calibrate Projector:**
     *   Click **"Enable Warping"**. You will see four red dots on the projector output window.
     *   Drag these dots to the corners of your real-world projection surface to correct for keystone distortion.
