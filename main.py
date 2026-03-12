@@ -282,10 +282,6 @@ class ProjectionMappingApp(QMainWindow):
             self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
             self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
 
-    def log_debug(self, message):
-        self.logger.info(message)
-        self.statusBar().showMessage(message, 3000)
-
     def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
         self.marker_selection_dialog.setWindowTitle(title)
         self.marker_selection_dialog.clear_selection()
@@ -633,9 +629,7 @@ class ProjectionMappingApp(QMainWindow):
             result["image"] = image.copy()
             loop.quit()
 
-        self.logger.info("Requesting still frame: %s", label)
-        if self.statusBar() is not None:
-            self.statusBar().showMessage(f"Requesting still frame: {label}", 3000)
+        self.log_debug(f"Requesting still frame: {label}")
         self.worker.still_frame_ready.connect(on_frame)
         self.worker.capture_still_frame()
         QTimer.singleShot(timeout_ms, loop.quit)
