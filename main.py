@@ -104,14 +104,16 @@ class StartupWizardDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-def _get_camera_backends():
+def _get_camera_backends(include_fallback_any=False):
     is_windows = platform.system().lower() == "windows"
     if not is_windows:
         return [cv2.CAP_ANY]
 
-    # MSMF has repeatedly produced hard crashes on some Windows camera drivers.
-    # Prioritize DirectShow and fall back to CAP_ANY for better stability.
-    preferred = ["CAP_DSHOW", "CAP_ANY"]
+    # Prefer DirectShow while probing to reduce noisy backend warnings.
+    preferred = ["CAP_DSHOW"]
+    if include_fallback_any:
+        preferred.append("CAP_ANY")
+
     backends = []
     for name in preferred:
         backend = getattr(cv2, name, None)
@@ -127,10 +129,11 @@ def _open_capture(index, backend):
         return cv2.VideoCapture(index)
 
 
-def get_available_cameras(max_probe=10):
+def get_available_cameras(max_probe=8):
     arr = []
-    backends = _get_camera_backends()
+    backends = _get_camera_backends(include_fallback_any=False)
     misses_after_first = 0
+    misses_before_first = 0
 
     for index in range(max_probe):
         opened = False
@@ -151,6 +154,10 @@ def get_available_cameras(max_probe=10):
         elif arr:
             misses_after_first += 1
             if misses_after_first >= 3:
+                break
+        else:
+            misses_before_first += 1
+            if misses_before_first >= 4 and index >= 3:
                 break
     return arr
 
@@ -1108,17 +1115,33 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.set_video_source(self.available_cameras[index])
 
     def change_projector(self, index):
-        if index >= len(self.screens):
+        self.screens = QApplication.screens()
+        if index < 0 or index >= len(self.screens):
             return
 
         screen = self.screens[index]
+        target_geometry = screen.geometry()
+
+        # Ensure the window has a native handle before assigning a screen.
+        self.projector_window.showNormal()
+        QApplication.processEvents()
+
         window_handle = self.projector_window.windowHandle()
         if window_handle is not None:
             window_handle.setScreen(screen)
-        else:
-            self.projector_window.setGeometry(screen.geometry())
 
+        self.projector_window.setGeometry(target_geometry)
+        self.projector_window.move(target_geometry.topLeft())
         self.projector_window.showFullScreen()
+        self.projector_window.raise_()
+        self.projector_window.activateWindow()
+
+        self.logger.info(
+            "Projector display changed to index=%d name=%s geometry=%s",
+            index,
+            screen.name(),
+            target_geometry,
+        )
 
     def remove_cue(self):
         current_item = self.cue_list_widget.currentItem()
