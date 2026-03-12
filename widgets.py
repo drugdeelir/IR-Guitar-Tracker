@@ -287,6 +287,7 @@ class ProjectorWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projector Output")
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.layout = QVBoxLayout()
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)

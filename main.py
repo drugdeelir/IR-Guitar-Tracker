@@ -427,12 +427,13 @@ class ProjectionMappingApp(QMainWindow):
         )
 
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
+        self.logger.info("Detected displays: %s", [f"{i}:{s.name()} {s.geometry()}" for i, s in enumerate(self.screens)])
         projector_layout.addWidget(self.projector_combo)
         projector_group.setLayout(projector_layout)
         self.control_layout.addWidget(projector_group)
 
         self.setup_wizard_button = QPushButton("Run Full Calibration Wizard")
-        self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard)
+        self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard_safe)
         self.control_layout.addWidget(self.setup_wizard_button)
 
         cue_group = QGroupBox("Cues")
@@ -781,6 +782,17 @@ class ProjectionMappingApp(QMainWindow):
         self.masks.append(mask)
         self.cue_list_widget.addItem(name)
         return mask
+
+    def run_full_calibration_wizard_safe(self):
+        try:
+            self.run_full_calibration_wizard()
+        except Exception:
+            self.logger.exception("Calibration wizard crashed")
+            QMessageBox.critical(
+                self,
+                "Calibration Error",
+                "Calibration wizard crashed. Check terminal logs for stack trace and retry.",
+            )
 
     def run_full_calibration_wizard(self):
         # Stage 1: room scan + projector bounds
