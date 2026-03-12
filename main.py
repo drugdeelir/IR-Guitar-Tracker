@@ -282,10 +282,6 @@ class ProjectionMappingApp(QMainWindow):
             self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
             self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
 
-    def log_debug(self, message):
-        self.logger.info(message)
-        self.statusBar().showMessage(message, 3000)
-
     def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
         self.marker_selection_dialog.setWindowTitle(title)
         self.marker_selection_dialog.clear_selection()
