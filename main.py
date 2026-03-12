@@ -156,6 +156,7 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
         self.selected_markers = []
+        self.reference_markers = []
         self.latest_camera_qimage = None
         self.settings = self.load_settings()
 
@@ -267,21 +268,62 @@ class ProjectionMappingApp(QMainWindow):
             self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
             self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
 
-    def open_marker_selection_dialog(self):
+    def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
+        self.marker_selection_dialog.setWindowTitle(title)
         self.marker_selection_dialog.clear_selection()
+        self.marker_selection_dialog.set_ir_assist_enabled(ir_assist)
+        self.marker_selection_dialog.take_picture_button.setVisible(use_live_capture)
+        self.marker_selection_dialog.take_picture_button.setEnabled(use_live_capture)
         self.marker_selection_dialog.take_picture_button.setText("Take Picture")
-        self.marker_selection_dialog.take_picture_button.setEnabled(True)
+
+        if reference_pixmap is not None:
+            self.marker_selection_dialog.set_pixmap(reference_pixmap)
 
         if self.marker_selection_dialog.exec_():
             markers = self.marker_selection_dialog.get_selected_points()
-            if len(markers) < 4:
+            if len(markers) != 4:
                 QMessageBox.warning(self, "Marker Selection", "Please select exactly 4 guitar markers.")
-                return
-            self.selected_markers = markers[:4]
-            self.worker.set_marker_points(self.selected_markers)
-            self.statusBar().showMessage(
-                f"Selected {len(self.selected_markers)} markers.", 3000
-            )
+                return []
+            return markers[:4]
+        return []
+
+    def select_reference_guitar_markers(self):
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Reference Guitar Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not image_path:
+            return []
+
+        reference_pixmap = QPixmap(image_path)
+        if reference_pixmap.isNull():
+            QMessageBox.warning(self, "Reference Image", "Could not load the selected image.")
+            return []
+
+        return self._run_marker_selection_dialog(
+            use_live_capture=False,
+            reference_pixmap=reference_pixmap,
+            title="Select 4 Reference Markers (uploaded image)",
+            ir_assist=False,
+        )
+
+    def open_marker_selection_dialog(self):
+        markers = self._run_marker_selection_dialog(
+            use_live_capture=True,
+            reference_pixmap=None,
+            title="Select Live IR Markers",
+            ir_assist=True,
+        )
+        if not markers:
+            return
+
+        self.selected_markers = markers
+        self.worker.set_marker_points(self.selected_markers)
+        self.statusBar().showMessage(
+            f"Selected {len(self.selected_markers)} markers.", 3000
+        )
 
     def start_marker_capture_countdown(self):
         self.marker_selection_dialog.take_picture_button.setEnabled(False)
@@ -780,10 +822,22 @@ class ProjectionMappingApp(QMainWindow):
             "Projector bounds and background mask applied. Continue to marker selection.",
         )
 
-        # Stage 2: guitar markers + guitar mask + depth baseline
+        # Stage 2: uploaded reference + live marker alignment + guitar mask + depth baseline
+        reference_markers = self.select_reference_guitar_markers()
+        if len(reference_markers) != 4:
+            QMessageBox.warning(self, "Stage 2", "Upload a guitar image and select exactly 4 reference markers to continue.")
+            return
+
+        self.reference_markers = reference_markers
+
+        QMessageBox.information(
+            self,
+            "Stage 2",
+            "Now tune threshold until only live IR blobs are visible, then capture and select the same 4 markers in live video.",
+        )
         self.open_marker_selection_dialog()
-        if len(self.selected_markers) < 4:
-            QMessageBox.warning(self, "Stage 2", "Select at least 4 IR markers on the guitar to continue.")
+        if len(self.selected_markers) != 4:
+            QMessageBox.warning(self, "Stage 2", "Select exactly 4 live IR markers on the guitar to continue.")
             return
 
         still2 = self.capture_still_frame_sync()

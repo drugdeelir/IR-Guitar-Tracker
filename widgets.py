@@ -16,6 +16,7 @@ class MarkerSelectionDialog(QDialog):
         self.original_pixmap = None
         self.detected_ir_points = []
         self.max_markers = 4
+        self.ir_assist_enabled = True
 
         self.layout = QVBoxLayout(self)
         self.image_label = QLabel("Press 'Take Picture' to begin.")
@@ -33,9 +34,18 @@ class MarkerSelectionDialog(QDialog):
         self.layout.addWidget(self.auto_select_button)
         self.layout.addWidget(self.confirm_button)
 
+    def set_ir_assist_enabled(self, enabled):
+        self.ir_assist_enabled = bool(enabled)
+        self.auto_select_button.setEnabled(self.ir_assist_enabled)
+        if self.original_pixmap:
+            self.detected_ir_points = (
+                self._detect_ir_points(self.original_pixmap) if self.ir_assist_enabled else []
+            )
+            self._render_preview()
+
     def set_pixmap(self, pixmap):
         self.original_pixmap = pixmap
-        self.detected_ir_points = self._detect_ir_points(pixmap)
+        self.detected_ir_points = self._detect_ir_points(pixmap) if self.ir_assist_enabled else []
         self._render_preview()
 
     def _detect_ir_points(self, pixmap):
@@ -103,6 +113,8 @@ class MarkerSelectionDialog(QDialog):
         return point
 
     def auto_select_markers(self):
+        if not self.ir_assist_enabled:
+            return
         self.selected_points = [QPoint(p.x(), p.y()) for p in self.detected_ir_points[: self.max_markers]]
         self._render_preview()
 
@@ -163,7 +175,8 @@ class MarkerSelectionDialog(QDialog):
         point = self._label_to_image(event.pos())
         if point is None:
             return
-        point = self._snap_to_ir_point(point)
+        if self.ir_assist_enabled:
+            point = self._snap_to_ir_point(point)
 
         for existing in self.selected_points:
             distance = ((existing.x() - point.x()) ** 2 + (existing.y() - point.y()) ** 2) ** 0.5
