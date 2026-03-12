@@ -70,9 +70,12 @@ class MarkerSelectionDialog(QDialog):
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
+        frame_area = float(enhanced.shape[0] * enhanced.shape[1])
+        min_area = max(3.0, frame_area * 0.000005)
+        max_area = max(1200.0, frame_area * 0.08)
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 4 or area > 1200:
+            if area < min_area or area > max_area:
                 continue
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
@@ -85,7 +88,7 @@ class MarkerSelectionDialog(QDialog):
             cv2.drawContours(contour_mask, [contour], -1, 255, -1)
             peak = float(cv2.minMaxLoc(enhanced, mask=contour_mask)[1])
             mean_intensity = float(cv2.mean(enhanced, mask=contour_mask)[0])
-            if peak < 180 and mean_intensity < 110:
+            if peak < 145 and mean_intensity < 90:
                 continue
 
             moments = cv2.moments(contour)
@@ -314,6 +317,11 @@ class ProjectorWindow(QWidget):
         self.pattern_brightness = int(max(1, min(255, brightness)))
         if self.pattern_mode:
             self.render_calibration_pattern()
+        else:
+            self.label.clear()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
 
     def render_calibration_pattern(self):
         size = self.label.size()

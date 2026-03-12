@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import platform
 import sys
@@ -45,6 +46,11 @@ SETTINGS_PATH = Path("settings.json")
 
 
 def configure_opencv_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     try:
         cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
     except AttributeError:
@@ -159,6 +165,7 @@ class ProjectionMappingApp(QMainWindow):
         self.reference_markers = []
         self.latest_camera_qimage = None
         self.settings = self.load_settings()
+        self.logger = logging.getLogger("ProjectionMappingApp")
 
         self.setStatusBar(QStatusBar(self))
 
@@ -606,7 +613,7 @@ class ProjectionMappingApp(QMainWindow):
     def cache_latest_frame(self, image):
         self.latest_camera_qimage = image.copy()
 
-    def capture_still_frame_sync(self, timeout_ms=5000):
+    def capture_still_frame_sync(self, timeout_ms=5000, label="capture"):
         loop = QEventLoop(self)
         result = {"image": None}
 
@@ -614,6 +621,7 @@ class ProjectionMappingApp(QMainWindow):
             result["image"] = image.copy()
             loop.quit()
 
+        self.log_debug(f"Requesting still frame: {label}")
         self.worker.still_frame_ready.connect(on_frame)
         self.worker.capture_still_frame()
         QTimer.singleShot(timeout_ms, loop.quit)
@@ -622,7 +630,22 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.still_frame_ready.disconnect(on_frame)
         except Exception:
             pass
+
+        if result["image"] is None:
+            self.logger.warning("Still capture timed out for %s", label)
+        else:
+            self.logger.info("Still capture succeeded for %s (%dx%d)", label, result["image"].width(), result["image"].height())
         return result["image"]
+
+    def capture_still_frame_warmed(self, label, warmup_ms=250, samples=2):
+        QApplication.processEvents()
+        time.sleep(max(0.0, warmup_ms / 1000.0))
+        still = None
+        for i in range(max(1, samples)):
+            still = self.capture_still_frame_sync(label=f"{label}#{i+1}")
+            QApplication.processEvents()
+            time.sleep(0.08)
+        return still
 
     def _qimage_to_bgr(self, image):
         if image is None:
@@ -669,7 +692,13 @@ class ProjectionMappingApp(QMainWindow):
 
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return None
+            self.logger.warning("Projector bounds detection: no contours from off/on diff; trying bright-frame fallback")
+            _, thresh = cv2.threshold(cv2.cvtColor(on_frame, cv2.COLOR_BGR2GRAY), 170, 255, cv2.THRESH_BINARY)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                self.logger.error("Projector bounds detection failed after fallback")
+                return None
 
         best_quad = None
         best_score = -1.0
@@ -751,7 +780,7 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.set_pattern_mode(False)
         QApplication.processEvents()
         time.sleep(0.25)
-        still_off = self.capture_still_frame_sync()
+        still_off = self.capture_still_frame_warmed("projector_off", warmup_ms=350, samples=2)
         if still_off is None:
             QMessageBox.warning(self, "Calibration", "Could not capture a camera frame for room scan (projector off frame).")
             return
@@ -759,7 +788,7 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.set_pattern_mode(True, brightness=255)
         QApplication.processEvents()
         time.sleep(0.35)
-        still_on = self.capture_still_frame_sync()
+        still_on = self.capture_still_frame_warmed("projector_on", warmup_ms=900, samples=3)
         self.projector_window.set_pattern_mode(False)
 
         if still_on is None:
@@ -773,6 +802,15 @@ class ProjectionMappingApp(QMainWindow):
             initial_points = [
                 QPoint(int(p[0] * still.width()), int(p[1] * still.height()))
                 for p in bounds
+            ]
+            self.logger.info("Auto projector bounds detected: %s", bounds)
+        else:
+            self.logger.warning("Auto projector bounds unavailable; seeding with full-frame corners")
+            initial_points = [
+                QPoint(0, 0),
+                QPoint(still.width() - 1, 0),
+                QPoint(still.width() - 1, still.height() - 1),
+                QPoint(0, still.height() - 1),
             ]
 
         bounds_dialog = PolygonMaskDialog("Confirm projector bounds", self)
@@ -812,6 +850,7 @@ class ProjectionMappingApp(QMainWindow):
         bg_points_q = background_dialog.get_points()
         bg_points = [(p.x(), p.y()) for p in bg_points_q]
         self.ensure_mask("Background", bg_points, mask_type="static", linked_marker_count=0)
+        self.logger.info("Background mask saved with %d points", len(bg_points))
         overlay = self._draw_polygon_overlay(still, bg_points_q, Qt.yellow)
         if overlay is not None:
             self.update_projector_preview(overlay)
@@ -840,7 +879,7 @@ class ProjectionMappingApp(QMainWindow):
             QMessageBox.warning(self, "Stage 2", "Select exactly 4 live IR markers on the guitar to continue.")
             return
 
-        still2 = self.capture_still_frame_sync()
+        still2 = self.capture_still_frame_warmed("guitar_mask", warmup_ms=250, samples=2)
         if still2 is None:
             QMessageBox.warning(self, "Stage 2", "Could not capture still frame for guitar mask.")
             return
@@ -850,6 +889,7 @@ class ProjectionMappingApp(QMainWindow):
         source = [(int(p[0]), int(p[1])) for p in auto_source]
 
         self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
+        self.logger.info("Guitar mask saved with %d points", len(source))
         self.worker.set_marker_points(self.selected_markers[:4])
         self.worker.calibrate_depth()
 
@@ -867,9 +907,10 @@ class ProjectionMappingApp(QMainWindow):
             if guitar_dialog.exec_() and len(guitar_dialog.get_points()) == 4:
                 source = [(p.x(), p.y()) for p in guitar_dialog.get_points()]
                 self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
+        self.logger.info("Guitar mask saved with %d points", len(source))
 
         # Stage 3: amp mask
-        still3 = self.capture_still_frame_sync()
+        still3 = self.capture_still_frame_warmed("amp_mask", warmup_ms=250, samples=2)
         if still3 is None:
             QMessageBox.warning(self, "Stage 3", "Could not capture still frame for amp mask.")
             return
@@ -878,6 +919,7 @@ class ProjectionMappingApp(QMainWindow):
         if amp_dialog.exec_() and len(amp_dialog.get_points()) == 4:
             amp_source = [(p.x(), p.y()) for p in amp_dialog.get_points()]
             self.ensure_mask("Amp", amp_source, mask_type="static", linked_marker_count=0)
+            self.logger.info("Amp mask saved with %d points", len(amp_source))
 
         self.worker.set_masks(self.masks)
         self.statusBar().showMessage("Calibration wizard complete. Assign cues to masks in the Cues list.", 6000)
@@ -945,12 +987,23 @@ class ProjectionMappingApp(QMainWindow):
         self.video_display.set_mask_creation_mode(False)
         mask_points = self.video_display.get_mask_points()
 
-        current_item = self.cue_list_widget.currentItem()
-        if current_item and mask_points:
-            row = self.cue_list_widget.row(current_item)
+        if not mask_points:
+            self.log_debug("Finish Mask clicked with no points; nothing saved.")
+        else:
+            row = self.cue_list_widget.currentRow()
+            source_points = [(p.x(), p.y()) for p in mask_points]
             if 0 <= row < len(self.masks):
-                self.masks[row].source_points = [(p.x(), p.y()) for p in mask_points]
-                self.worker.set_masks(self.masks)
+                self.masks[row].source_points = source_points
+                self.log_debug(f"Updated mask '{self.masks[row].name}' with {len(source_points)} points.")
+            else:
+                mask_name = f"Mask {len(self.masks) + 1}"
+                mask = Mask(mask_name, source_points, None)
+                mask.type = "static"
+                self.masks.append(mask)
+                self.cue_list_widget.addItem(mask_name)
+                self.cue_list_widget.setCurrentRow(len(self.masks) - 1)
+                self.log_debug(f"Created new mask '{mask_name}' with {len(source_points)} points.")
+            self.worker.set_masks(self.masks)
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
