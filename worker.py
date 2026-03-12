@@ -1,6 +1,7 @@
 import time
 from itertools import combinations
 import os
+import logging
 import platform
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
@@ -66,6 +67,8 @@ class Worker(QObject):
         self._is_windows = platform.system().lower() == "windows"
         self.camera_mode = "native"
         self.show_mask_overlays = True
+        self.logger = logging.getLogger("Worker")
+        self._last_debug_emit = 0.0
 
         if self._is_windows:
             self._target_fps = 30.0
@@ -176,9 +179,12 @@ class Worker(QObject):
 
         contour_candidates = []
         scale_back = 1.0 / self._detection_scale if self._detection_scale < 1.0 else 1.0
+        frame_area = float(enhanced.shape[0] * enhanced.shape[1])
+        min_area = max(3.0, frame_area * 0.000005)
+        max_area = max(1200.0, frame_area * 0.08)
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area <= 4 or area >= 1200:
+            if area <= min_area or area >= max_area:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
@@ -192,7 +198,7 @@ class Worker(QObject):
             cv2.drawContours(mask, [contour], -1, 255, -1)
             peak = float(cv2.minMaxLoc(enhanced, mask=mask)[1])
             mean_intensity = float(cv2.mean(enhanced, mask=mask)[0])
-            if peak < 180 and mean_intensity < 110:
+            if self.threshold_mode == "auto" and peak < 145 and mean_intensity < 90:
                 continue
 
             moments = cv2.moments(contour)
@@ -512,6 +518,7 @@ class Worker(QObject):
                     rgb_image_still.data, w, h, w * 3, QImage.Format_RGB888
                 ).copy()
                 self.still_frame_ready.emit(qt_image_still)
+                self.logger.info("still_frame_ready emitted (%dx%d)", w, h)
                 self._capture_still_frame_flag = False
 
             rgb_image_main = cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB)
@@ -538,6 +545,19 @@ class Worker(QObject):
 
             frame_time_ms = (time.perf_counter() - frame_start) * 1000.0
             self._recent_frame_times.append(frame_time_ms)
+
+            now = time.perf_counter()
+            if now - self._last_debug_emit > 2.0:
+                self.logger.info(
+                    "frame %.1fms | detected=%d tracked=%d masks=%d threshold=%s:%d",
+                    frame_time_ms,
+                    len(all_detected_points),
+                    len(tracked_points),
+                    len(self.masks),
+                    self.threshold_mode,
+                    self.ir_threshold,
+                )
+                self._last_debug_emit = now
             if len(self._recent_frame_times) > 20:
                 self._recent_frame_times.pop(0)
 

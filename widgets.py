@@ -16,6 +16,7 @@ class MarkerSelectionDialog(QDialog):
         self.original_pixmap = None
         self.detected_ir_points = []
         self.max_markers = 4
+        self.ir_assist_enabled = True
 
         self.layout = QVBoxLayout(self)
         self.image_label = QLabel("Press 'Take Picture' to begin.")
@@ -33,9 +34,18 @@ class MarkerSelectionDialog(QDialog):
         self.layout.addWidget(self.auto_select_button)
         self.layout.addWidget(self.confirm_button)
 
+    def set_ir_assist_enabled(self, enabled):
+        self.ir_assist_enabled = bool(enabled)
+        self.auto_select_button.setEnabled(self.ir_assist_enabled)
+        if self.original_pixmap:
+            self.detected_ir_points = (
+                self._detect_ir_points(self.original_pixmap) if self.ir_assist_enabled else []
+            )
+            self._render_preview()
+
     def set_pixmap(self, pixmap):
         self.original_pixmap = pixmap
-        self.detected_ir_points = self._detect_ir_points(pixmap)
+        self.detected_ir_points = self._detect_ir_points(pixmap) if self.ir_assist_enabled else []
         self._render_preview()
 
     def _detect_ir_points(self, pixmap):
@@ -60,9 +70,12 @@ class MarkerSelectionDialog(QDialog):
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
+        frame_area = float(enhanced.shape[0] * enhanced.shape[1])
+        min_area = max(3.0, frame_area * 0.000005)
+        max_area = max(1200.0, frame_area * 0.08)
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 4 or area > 1200:
+            if area < min_area or area > max_area:
                 continue
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
@@ -75,7 +88,7 @@ class MarkerSelectionDialog(QDialog):
             cv2.drawContours(contour_mask, [contour], -1, 255, -1)
             peak = float(cv2.minMaxLoc(enhanced, mask=contour_mask)[1])
             mean_intensity = float(cv2.mean(enhanced, mask=contour_mask)[0])
-            if peak < 180 and mean_intensity < 110:
+            if peak < 145 and mean_intensity < 90:
                 continue
 
             moments = cv2.moments(contour)
@@ -103,6 +116,8 @@ class MarkerSelectionDialog(QDialog):
         return point
 
     def auto_select_markers(self):
+        if not self.ir_assist_enabled:
+            return
         self.selected_points = [QPoint(p.x(), p.y()) for p in self.detected_ir_points[: self.max_markers]]
         self._render_preview()
 
@@ -163,7 +178,8 @@ class MarkerSelectionDialog(QDialog):
         point = self._label_to_image(event.pos())
         if point is None:
             return
-        point = self._snap_to_ir_point(point)
+        if self.ir_assist_enabled:
+            point = self._snap_to_ir_point(point)
 
         for existing in self.selected_points:
             distance = ((existing.x() - point.x()) ** 2 + (existing.y() - point.y()) ** 2) ** 0.5
@@ -271,6 +287,7 @@ class ProjectorWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Projector Output")
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.layout = QVBoxLayout()
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
@@ -301,6 +318,11 @@ class ProjectorWindow(QWidget):
         self.pattern_brightness = int(max(1, min(255, brightness)))
         if self.pattern_mode:
             self.render_calibration_pattern()
+        else:
+            self.label.clear()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
 
     def render_calibration_pattern(self):
         size = self.label.size()
