@@ -33,6 +33,8 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStatusBar,
+    QTabWidget,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +43,11 @@ from mask import Mask
 from splash import SplashScreen
 from widgets import MarkerSelectionDialog, PolygonMaskDialog, ProjectorWindow, VideoDisplay
 from worker import Worker
+
+try:
+    import mido
+except Exception:
+    mido = None
 
 SETTINGS_PATH = Path("settings.json")
 
@@ -218,6 +225,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
         self.apply_loaded_settings()
+        self.refresh_mask_views()
         self.change_projector(self.projector_combo.currentIndex())
         self.maybe_show_startup_wizard()
 
@@ -436,26 +444,108 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard_safe)
         self.control_layout.addWidget(self.setup_wizard_button)
 
-        cue_group = QGroupBox("Cues")
+        self.mapping_tabs = QTabWidget()
+
+        # Page 1: Masks
+        masks_page = QWidget()
+        masks_layout = QVBoxLayout(masks_page)
+
+        mask_list_group = QGroupBox("Masks")
+        mask_list_layout = QVBoxLayout()
+        self.mask_list_widget = QListWidget()
+        self.mask_list_widget.currentRowChanged.connect(self.on_mask_selection_changed)
+        self.remove_mask_button = QPushButton("Remove Selected Mask")
+        self.remove_mask_button.clicked.connect(self.remove_mask)
+        mask_list_layout.addWidget(self.mask_list_widget)
+        mask_list_layout.addWidget(self.remove_mask_button)
+        mask_list_group.setLayout(mask_list_layout)
+        masks_layout.addWidget(mask_list_group)
+
+        mask_group = QGroupBox("Mask Creation")
+        mask_layout = QVBoxLayout()
+        self.create_mask_button = QPushButton("Create Mask")
+        self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
+        self.finish_mask_button = QPushButton("Finish Mask")
+        self.finish_mask_button.clicked.connect(self.finish_mask_creation)
+        self.finish_mask_button.setEnabled(False)
+        self.cancel_mask_button = QPushButton("Cancel")
+        self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
+        self.cancel_mask_button.setEnabled(False)
+        self.mask_points_list = QListWidget()
+
+        mask_layout.addWidget(self.create_mask_button)
+        mask_layout.addWidget(self.finish_mask_button)
+        mask_layout.addWidget(self.cancel_mask_button)
+        mask_layout.addWidget(self.mask_points_list)
+
+        self.link_mask_button = QPushButton("Link Mask to Markers")
+        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
+        self.auto_sync_checkbox = QCheckBox("Auto-sync marker links")
+        self.auto_sync_checkbox.setChecked(True)
+        mask_layout.addWidget(self.link_mask_button)
+        mask_layout.addWidget(self.auto_sync_checkbox)
+
+        mask_group.setLayout(mask_layout)
+        masks_layout.addWidget(mask_group)
+
+        # Page 2: Cues + MIDI
+        cues_page = QWidget()
+        cues_layout = QVBoxLayout(cues_page)
+
+        cue_group = QGroupBox("Cue Queues per Mask")
         cue_layout = QVBoxLayout()
-        self.cue_list_widget = QListWidget()
-        self.cue_list_widget.currentRowChanged.connect(self.worker.set_active_cue_index)
-        self.add_cue_button = QPushButton("Add New Cue/Mask")
+        self.cue_mask_combo = QComboBox()
+        self.cue_mask_combo.currentIndexChanged.connect(self.refresh_cues_for_selected_mask)
+        self.mask_cue_list_widget = QListWidget()
+        self.mask_cue_list_widget.currentRowChanged.connect(self.on_mask_cue_selected)
+
+        self.add_cue_button = QPushButton("Add Video Cue to Mask")
         self.add_cue_button.clicked.connect(self.add_cue)
-        self.assign_cue_button = QPushButton("Assign Cue to Selected Mask")
-        self.assign_cue_button.clicked.connect(self.assign_cue_to_selected_mask)
-        self.remove_cue_button = QPushButton("Remove Cue")
+        self.remove_cue_button = QPushButton("Remove Selected Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
-        self.render_all_cues_button = QPushButton("Render All Cues")
+
+        self.cc_spin = QSpinBox()
+        self.cc_spin.setRange(0, 127)
+        self.cc_spin.setPrefix("CC ")
+        self.map_cc_button = QPushButton("Map CC to Selected Cue")
+        self.map_cc_button.clicked.connect(self.map_cc_to_selected_cue)
+
+        self.render_all_cues_button = QPushButton("Render All Masks")
         self.render_all_cues_button.clicked.connect(lambda: self.worker.set_active_cue_index(-1))
-        cue_layout.addWidget(self.cue_list_widget)
+
+        cue_layout.addWidget(QLabel("Mask"))
+        cue_layout.addWidget(self.cue_mask_combo)
+        cue_layout.addWidget(self.mask_cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
-        cue_layout.addWidget(self.assign_cue_button)
         cue_layout.addWidget(self.remove_cue_button)
+        cue_layout.addWidget(self.cc_spin)
+        cue_layout.addWidget(self.map_cc_button)
         cue_layout.addWidget(self.render_all_cues_button)
         cue_group.setLayout(cue_layout)
-        self.control_layout.addWidget(cue_group)
+        cues_layout.addWidget(cue_group)
 
+        midi_group = QGroupBox("MIDI CC Input (Network MIDI capable)")
+        midi_layout = QVBoxLayout()
+        self.midi_input_combo = QComboBox()
+        self.refresh_midi_button = QPushButton("Refresh MIDI Inputs")
+        self.refresh_midi_button.clicked.connect(self.refresh_midi_inputs)
+        self.connect_midi_button = QPushButton("Connect MIDI")
+        self.connect_midi_button.clicked.connect(self.connect_midi_input)
+        midi_layout.addWidget(self.midi_input_combo)
+        midi_layout.addWidget(self.refresh_midi_button)
+        midi_layout.addWidget(self.connect_midi_button)
+        midi_group.setLayout(midi_layout)
+        cues_layout.addWidget(midi_group)
+
+        self.mapping_tabs.addTab(masks_page, "Masks")
+        self.mapping_tabs.addTab(cues_page, "Cues")
+        self.control_layout.addWidget(self.mapping_tabs)
+
+        self.midi_inport = None
+        self.midi_poll_timer = QTimer(self)
+        self.midi_poll_timer.timeout.connect(self.poll_midi_messages)
+        self.midi_poll_timer.start(20)
+        self.refresh_midi_inputs()
 
         warping_group = QGroupBox("Projector Warping")
         warping_layout = QVBoxLayout()
@@ -491,39 +581,10 @@ class ProjectionMappingApp(QMainWindow):
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
         self.clear_markers_button = QPushButton("Clear Marker Selection")
         self.clear_markers_button.clicked.connect(self.clear_marker_selection)
-
         ir_layout.addWidget(self.select_markers_button)
         ir_layout.addWidget(self.clear_markers_button)
-
         ir_group.setLayout(ir_layout)
         self.control_layout.addWidget(ir_group)
-
-        mask_group = QGroupBox("Mask Creation")
-        mask_layout = QVBoxLayout()
-        self.create_mask_button = QPushButton("Create Mask")
-        self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
-        self.finish_mask_button = QPushButton("Finish Mask")
-        self.finish_mask_button.clicked.connect(self.finish_mask_creation)
-        self.finish_mask_button.setEnabled(False)
-        self.cancel_mask_button = QPushButton("Cancel")
-        self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
-        self.cancel_mask_button.setEnabled(False)
-        self.mask_points_list = QListWidget()
-
-        mask_layout.addWidget(self.create_mask_button)
-        mask_layout.addWidget(self.finish_mask_button)
-        mask_layout.addWidget(self.cancel_mask_button)
-        mask_layout.addWidget(self.mask_points_list)
-
-        self.link_mask_button = QPushButton("Link Mask to Markers")
-        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
-        self.auto_sync_checkbox = QCheckBox("Auto-sync marker links")
-        self.auto_sync_checkbox.setChecked(True)
-        mask_layout.addWidget(self.link_mask_button)
-        mask_layout.addWidget(self.auto_sync_checkbox)
-
-        mask_group.setLayout(mask_layout)
-        self.control_layout.addWidget(mask_group)
 
         depth_group = QGroupBox("Depth Estimation")
         depth_layout = QVBoxLayout()
@@ -770,17 +831,18 @@ class ProjectionMappingApp(QMainWindow):
         return overlay
 
     def ensure_mask(self, name, points, mask_type="static", linked_marker_count=0):
-        for mask in self.masks:
+        for i, mask in enumerate(self.masks):
             if mask.name == name:
                 mask.source_points = points
                 mask.type = mask_type
                 mask.linked_marker_count = linked_marker_count
+                self.refresh_mask_views(select_index=i)
                 return mask
         mask = Mask(name, points, None)
         mask.type = mask_type
         mask.linked_marker_count = linked_marker_count
         self.masks.append(mask)
-        self.cue_list_widget.addItem(name)
+        self.refresh_mask_views(select_index=len(self.masks) - 1)
         return mask
 
     def run_full_calibration_wizard_safe(self):
@@ -1003,8 +1065,8 @@ class ProjectionMappingApp(QMainWindow):
         self.cancel_mask_button.setEnabled(True)
 
     def finish_mask_creation(self):
+        mask_points = list(self.video_display.get_mask_points())
         self.video_display.set_mask_creation_mode(False)
-        mask_points = self.video_display.get_mask_points()
 
         if not mask_points:
             self.log_debug("Finish Mask clicked with no points; nothing saved.")
@@ -1043,7 +1105,7 @@ class ProjectionMappingApp(QMainWindow):
         self.mask_points_list.addItem(f"({point.x()}, {point.y()})")
 
     def link_mask_to_markers(self):
-        current_item = self.cue_list_widget.currentItem()
+        current_item = self.mask_list_widget.currentItem()
         if not current_item:
             self.statusBar().showMessage("Please select a cue to link.", 3000)
             return
@@ -1052,7 +1114,7 @@ class ProjectionMappingApp(QMainWindow):
             self.statusBar().showMessage("Please select IR markers first.", 3000)
             return
 
-        row = self.cue_list_widget.row(current_item)
+        row = self.mask_list_widget.row(current_item)
         if 0 <= row < len(self.masks):
             mask = self.masks[row]
             if len(mask.source_points) != len(self.selected_markers):
@@ -1098,29 +1160,144 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.set_calibration_mode(checked)
         self.enable_warping_button.setText("Disable Warping" if checked else "Enable Warping")
 
-    def assign_cue_to_selected_mask(self):
-        current_item = self.cue_list_widget.currentItem()
-        if not current_item:
-            self.statusBar().showMessage("Select a mask first.", 3000)
+    def refresh_mask_views(self, select_index=None):
+        self.mask_list_widget.blockSignals(True)
+        self.cue_mask_combo.blockSignals(True)
+        self.mask_list_widget.clear()
+        self.cue_mask_combo.clear()
+        for mask in self.masks:
+            self.mask_list_widget.addItem(mask.name)
+            self.cue_mask_combo.addItem(mask.name)
+        self.mask_list_widget.blockSignals(False)
+        self.cue_mask_combo.blockSignals(False)
+
+        if self.masks:
+            idx = select_index if select_index is not None else min(self.mask_list_widget.currentRow(), len(self.masks) - 1)
+            if idx < 0:
+                idx = 0
+            self.mask_list_widget.setCurrentRow(idx)
+            self.cue_mask_combo.setCurrentIndex(idx)
+        self.refresh_cues_for_selected_mask()
+
+    def on_mask_selection_changed(self, row):
+        if 0 <= row < len(self.masks):
+            self.worker.set_active_cue_index(row)
+            if self.cue_mask_combo.currentIndex() != row:
+                self.cue_mask_combo.setCurrentIndex(row)
+        self.refresh_cues_for_selected_mask()
+
+    def refresh_cues_for_selected_mask(self):
+        idx = self.cue_mask_combo.currentIndex()
+        self.mask_cue_list_widget.clear()
+        if idx < 0 or idx >= len(self.masks):
             return
-        row = self.cue_list_widget.row(current_item)
-        if row < 0 or row >= len(self.masks):
+        mask = self.masks[idx]
+        for i, cue in enumerate(mask.cues):
+            cc_list = [str(cc) for cc, cue_index in mask.midi_cc_map.items() if cue_index == i]
+            cc_suffix = f" [CC: {', '.join(cc_list)}]" if cc_list else ""
+            active = "* " if i == mask.active_cue else ""
+            self.mask_cue_list_widget.addItem(f"{active}{Path(cue).name}{cc_suffix}")
+        if mask.cues:
+            self.mask_cue_list_widget.setCurrentRow(mask.active_cue)
+
+    def on_mask_cue_selected(self, row):
+        idx = self.cue_mask_combo.currentIndex()
+        if idx < 0 or idx >= len(self.masks):
+            return
+        mask = self.masks[idx]
+        if 0 <= row < len(mask.cues):
+            mask.active_cue = row
+            self.worker.set_masks(self.masks)
+
+    def add_cue(self):
+        idx = self.cue_mask_combo.currentIndex()
+        if idx < 0 or idx >= len(self.masks):
+            self.statusBar().showMessage("Create/select a mask first.", 3000)
             return
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
         if not video_path:
             return
-        self.masks[row].video_path = video_path
-        self.cue_list_widget.item(row).setText(f"{self.masks[row].name}: {Path(video_path).name}")
+        self.masks[idx].add_cue(video_path)
         self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
 
-    def add_cue(self):
-        video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
-        if video_path:
-            mask_name = f"Cue {len(self.masks) + 1}"
-            new_mask = Mask(mask_name, [], video_path)
-            self.masks.append(new_mask)
-            self.cue_list_widget.addItem(f"{mask_name}: {Path(video_path).name}")
+    def remove_cue(self):
+        idx = self.cue_mask_combo.currentIndex()
+        cue_idx = self.mask_cue_list_widget.currentRow()
+        if idx < 0 or idx >= len(self.masks) or cue_idx < 0:
+            return
+        self.masks[idx].remove_cue(cue_idx)
+        self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
+
+    def map_cc_to_selected_cue(self):
+        idx = self.cue_mask_combo.currentIndex()
+        cue_idx = self.mask_cue_list_widget.currentRow()
+        if idx < 0 or idx >= len(self.masks):
+            return
+        if cue_idx < 0:
+            cue_idx = self.masks[idx].active_cue
+        cc = int(self.cc_spin.value())
+        self.masks[idx].midi_cc_map[cc] = cue_idx
+        self.refresh_cues_for_selected_mask()
+        self.statusBar().showMessage(f"Mapped CC {cc} to cue {cue_idx + 1} on '{self.masks[idx].name}'.", 3000)
+
+    def refresh_midi_inputs(self):
+        self.midi_input_combo.clear()
+        if mido is None:
+            self.midi_input_combo.addItem("mido not installed")
+            self.midi_input_combo.setEnabled(False)
+            return
+        names = mido.get_input_names()
+        if not names:
+            self.midi_input_combo.addItem("No MIDI input ports")
+            self.midi_input_combo.setEnabled(False)
+            return
+        self.midi_input_combo.setEnabled(True)
+        self.midi_input_combo.addItems(names)
+
+    def connect_midi_input(self):
+        if mido is None or not self.midi_input_combo.isEnabled():
+            self.statusBar().showMessage("MIDI backend unavailable.", 3000)
+            return
+        if self.midi_inport is not None:
+            self.midi_inport.close()
+            self.midi_inport = None
+        name = self.midi_input_combo.currentText()
+        try:
+            self.midi_inport = mido.open_input(name)
+            self.statusBar().showMessage(f"Connected MIDI input: {name}", 3000)
+        except Exception as exc:
+            self.logger.exception("Failed to open MIDI input")
+            self.statusBar().showMessage(f"MIDI connect failed: {exc}", 5000)
+
+    def poll_midi_messages(self):
+        if self.midi_inport is None:
+            return
+        try:
+            for msg in self.midi_inport.iter_pending():
+                if msg.type == "control_change":
+                    self.route_midi_cc(int(msg.control), int(msg.value))
+        except Exception:
+            self.logger.exception("MIDI polling error")
+
+    def route_midi_cc(self, cc, value):
+        if value <= 0:
+            return
+        for mask in self.masks:
+            if cc in mask.midi_cc_map:
+                cue_idx = mask.midi_cc_map[cc]
+                if 0 <= cue_idx < len(mask.cues):
+                    mask.active_cue = cue_idx
+        self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
+
+    def remove_mask(self):
+        row = self.mask_list_widget.currentRow()
+        if 0 <= row < len(self.masks):
+            del self.masks[row]
             self.worker.set_masks(self.masks)
+            self.refresh_mask_views(select_index=max(0, row - 1))
 
     def change_camera(self, index):
         if self.available_cameras and 0 <= index < len(self.available_cameras):
@@ -1165,6 +1342,11 @@ class ProjectionMappingApp(QMainWindow):
 
     def closeEvent(self, event):
         self.save_settings()
+        if self.midi_inport is not None:
+            try:
+                self.midi_inport.close()
+            except Exception:
+                pass
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()

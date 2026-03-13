@@ -48,6 +48,15 @@ class MarkerSelectionDialog(QDialog):
         self.detected_ir_points = self._detect_ir_points(pixmap) if self.ir_assist_enabled else []
         self._render_preview()
 
+    def _nms_points(self, scored_points, min_distance=28, limit=24):
+        selected = []
+        for score, point in sorted(scored_points, key=lambda item: item[0], reverse=True):
+            if all((point.x() - p.x()) ** 2 + (point.y() - p.y()) ** 2 >= min_distance ** 2 for _, p in selected):
+                selected.append((score, point))
+            if len(selected) >= limit:
+                break
+        return [pt for _, pt in selected]
+
     def _detect_ir_points(self, pixmap):
         image = pixmap.toImage().convertToFormat(QImage.Format_RGB888)
         w, h = image.width(), image.height()
@@ -60,10 +69,14 @@ class MarkerSelectionDialog(QDialog):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        percentile_threshold = int(np.percentile(enhanced, 99.4))
+        percentile_threshold = int(np.percentile(enhanced, 99.6))
         _, otsu_thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         _, pct_thresh = cv2.threshold(enhanced, percentile_threshold, 255, cv2.THRESH_BINARY)
-        thresh = cv2.bitwise_or(otsu_thresh, pct_thresh)
+        adaptive = cv2.bitwise_or(otsu_thresh, pct_thresh)
+
+        _, bright = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY)
+        thresh = cv2.bitwise_or(adaptive, bright)
+
         kernel = np.ones((3, 3), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
@@ -96,11 +109,10 @@ class MarkerSelectionDialog(QDialog):
                 continue
             cx = int(moments["m10"] / moments["m00"])
             cy = int(moments["m01"] / moments["m00"])
-            score = peak * 2.2 + mean_intensity * 1.4 + circularity * 120.0 + area * 0.1
+            score = peak * 2.8 + mean_intensity * 1.0 + circularity * 90.0 + min(area, 2500.0) * 0.05
             candidates.append((score, QPoint(cx, cy)))
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return [pt for _, pt in candidates[:60]]
+        return self._nms_points(candidates, min_distance=26, limit=24)
 
     def _snap_to_ir_point(self, point, max_distance=40):
         if not self.detected_ir_points:

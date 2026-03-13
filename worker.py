@@ -148,6 +148,15 @@ class Worker(QObject):
         self._mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
         self._buffer_shape = (h, w)
 
+    def _nms_points(self, scored_points, min_distance=28, limit=20):
+        selected = []
+        for score, point in sorted(scored_points, key=lambda item: item[0], reverse=True):
+            if all((point[0] - p[0]) ** 2 + (point[1] - p[1]) ** 2 >= min_distance ** 2 for _, p in selected):
+                selected.append((score, point))
+            if len(selected) >= limit:
+                break
+        return [point for _, point in selected]
+
     def _extract_detected_points(self, main_frame):
         gray_full = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
         gray_full = cv2.GaussianBlur(gray_full, (5, 5), 0)
@@ -165,14 +174,21 @@ class Worker(QObject):
         else:
             enhanced = enhanced_full
 
+        # Adaptive mask catches dim markers; bright mask catches very bright large blobs.
         if self.threshold_mode == "auto":
-            percentile_threshold = int(np.percentile(enhanced, 99.4))
+            percentile_threshold = int(np.percentile(enhanced, 99.6))
             _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             _, pct = cv2.threshold(enhanced, percentile_threshold, 255, cv2.THRESH_BINARY)
-            thresh = cv2.bitwise_or(otsu, pct)
+            adaptive = cv2.bitwise_or(otsu, pct)
         else:
-            _, thresh = cv2.threshold(enhanced, self.ir_threshold, 255, cv2.THRESH_BINARY)
+            _, adaptive = cv2.threshold(enhanced, self.ir_threshold, 255, cv2.THRESH_BINARY)
 
+        bright_threshold = 245 if self.threshold_mode == "auto" else max(int(self.ir_threshold), 220)
+        _, bright = cv2.threshold(gray_full, bright_threshold, 255, cv2.THRESH_BINARY)
+        if self._detection_scale < 1.0:
+            bright = cv2.resize(bright, (enhanced.shape[1], enhanced.shape[0]), interpolation=cv2.INTER_AREA)
+
+        thresh = cv2.bitwise_or(adaptive, bright)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, self._noise_kernel)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, self._noise_kernel)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -210,11 +226,10 @@ class Worker(QObject):
             cx = int(cx_scaled * scale_back)
             cy = int(cy_scaled * scale_back)
 
-            score = peak * 2.2 + mean_intensity * 1.4 + circularity * 120.0 + area * 0.1
+            score = peak * 2.8 + mean_intensity * 1.0 + circularity * 90.0 + min(area, 2500.0) * 0.05
             contour_candidates.append((score, (cx, cy)))
 
-        contour_candidates.sort(key=lambda item: item[0], reverse=True)
-        return [point for _, point in contour_candidates]
+        return self._nms_points(contour_candidates, min_distance=26, limit=24)
 
     def _match_marker_configuration(self, detected_points):
         if not (
@@ -450,7 +465,9 @@ class Worker(QObject):
                 if not mask.source_points:
                     continue
 
-                if not mask.video_path:
+                cue_path = mask.get_active_video_path() if hasattr(mask, "get_active_video_path") else mask.video_path
+
+                if not cue_path:
                     if not self.show_mask_overlays:
                         continue
                     dst_pts = np.float32(mask.source_points)
@@ -477,10 +494,10 @@ class Worker(QObject):
                     if len(dst_pts) != 4:
                         continue
 
-                if mask.video_path not in self.video_captures:
-                    self.video_captures[mask.video_path] = cv2.VideoCapture(mask.video_path)
+                if cue_path not in self.video_captures:
+                    self.video_captures[cue_path] = cv2.VideoCapture(cue_path)
 
-                cap = self.video_captures[mask.video_path]
+                cap = self.video_captures[cue_path]
                 ret_cue, frame_cue = cap.read()
 
                 if not ret_cue:
@@ -603,7 +620,12 @@ class Worker(QObject):
 
     def set_masks(self, masks):
         self.masks = masks
-        current_cues = {mask.video_path for mask in self.masks}
+        current_cues = set()
+        for mask in self.masks:
+            if getattr(mask, "cues", None):
+                current_cues.update([c for c in mask.cues if c])
+            elif mask.video_path:
+                current_cues.add(mask.video_path)
 
         valid_mask_ids = {id(mask) for mask in self.masks}
         for cache_id in list(self._transform_cache.keys()):
