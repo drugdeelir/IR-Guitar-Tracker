@@ -196,8 +196,8 @@ class Worker(QObject):
         contour_candidates = []
         scale_back = 1.0 / self._detection_scale if self._detection_scale < 1.0 else 1.0
         frame_area = float(enhanced.shape[0] * enhanced.shape[1])
-        min_area = max(6.0, frame_area * 0.00001)
-        max_area = max(8000.0, frame_area * 0.22)
+        min_area = max(3.0, frame_area * 0.000005)
+        max_area = max(1200.0, frame_area * 0.08)
         for contour in contours:
             area = cv2.contourArea(contour)
             if area <= min_area or area >= max_area:

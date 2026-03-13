@@ -180,7 +180,6 @@ class ProjectionMappingApp(QMainWindow):
         self.latest_camera_qimage = None
         self.settings = self.load_settings()
         self.logger = logging.getLogger("ProjectionMappingApp")
-        self._last_projector_index = -1
 
         self.setStatusBar(QStatusBar(self))
 
@@ -290,15 +289,6 @@ class ProjectionMappingApp(QMainWindow):
         if isinstance(warp_points, list) and len(warp_points) == 4:
             self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
             self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
-
-    def _status_log(self, message):
-        self.logger.info(message)
-        if self.statusBar() is not None:
-            self.statusBar().showMessage(message, 3000)
-
-    def log_debug(self, message):
-        # Backward-compatible alias for older code paths/copies.
-        self._status_log(message)
 
     def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
         self.marker_selection_dialog.setWindowTitle(title)
@@ -700,9 +690,7 @@ class ProjectionMappingApp(QMainWindow):
             result["image"] = image.copy()
             loop.quit()
 
-        self.logger.info("Requesting still frame: %s", label)
-        if self.statusBar() is not None:
-            self.statusBar().showMessage(f"Requesting still frame: {label}", 3000)
+        self.log_debug(f"Requesting still frame: {label}")
         self.worker.still_frame_ready.connect(on_frame)
         self.worker.capture_still_frame()
         QTimer.singleShot(timeout_ms, loop.quit)
@@ -1080,13 +1068,11 @@ class ProjectionMappingApp(QMainWindow):
         mask_points = list(self.video_display.get_mask_points())
         self.video_display.set_mask_creation_mode(False)
 
-        if len(mask_points) < 3:
-            self.log_debug("Finish Mask requires at least 3 points.")
+        if not mask_points:
+            self.log_debug("Finish Mask clicked with no points; nothing saved.")
         else:
-            row = self.mask_list_widget.currentRow()
+            row = self.cue_list_widget.currentRow()
             source_points = [(p.x(), p.y()) for p in mask_points]
-            if len(source_points) >= 3 and source_points[0] != source_points[-1]:
-                source_points.append(source_points[0])
             if 0 <= row < len(self.masks):
                 self.masks[row].source_points = source_points
                 self.log_debug(f"Updated mask '{self.masks[row].name}' with {len(source_points)} points.")
@@ -1095,10 +1081,10 @@ class ProjectionMappingApp(QMainWindow):
                 mask = Mask(mask_name, source_points, None)
                 mask.type = "static"
                 self.masks.append(mask)
-                self.refresh_mask_views(select_index=len(self.masks) - 1)
+                self.cue_list_widget.addItem(mask_name)
+                self.cue_list_widget.setCurrentRow(len(self.masks) - 1)
                 self.log_debug(f"Created new mask '{mask_name}' with {len(source_points)} points.")
             self.worker.set_masks(self.masks)
-            self.refresh_cues_for_selected_mask()
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
@@ -1322,9 +1308,6 @@ class ProjectionMappingApp(QMainWindow):
         if index < 0 or index >= len(self.screens):
             return
 
-        if index == self._last_projector_index:
-            return
-
         screen = self.screens[index]
         target_geometry = screen.geometry()
 
@@ -1342,13 +1325,20 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.raise_()
         self.projector_window.activateWindow()
 
-        self._last_projector_index = index
         self.logger.info(
             "Projector display changed to index=%d name=%s geometry=%s",
             index,
             screen.name(),
             target_geometry,
         )
+
+    def remove_cue(self):
+        current_item = self.cue_list_widget.currentItem()
+        if current_item:
+            row = self.cue_list_widget.row(current_item)
+            self.cue_list_widget.takeItem(row)
+            del self.masks[row]
+            self.worker.set_masks(self.masks)
 
     def closeEvent(self, event):
         self.save_settings()
