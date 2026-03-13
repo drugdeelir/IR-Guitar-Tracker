@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import platform
 import sys
@@ -32,6 +33,8 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStatusBar,
+    QTabWidget,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -41,10 +44,20 @@ from splash import SplashScreen
 from widgets import MarkerSelectionDialog, PolygonMaskDialog, ProjectorWindow, VideoDisplay
 from worker import Worker
 
+try:
+    import mido
+except Exception:
+    mido = None
+
 SETTINGS_PATH = Path("settings.json")
 
 
 def configure_opencv_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     try:
         cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
     except AttributeError:
@@ -98,14 +111,16 @@ class StartupWizardDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-def _get_camera_backends():
+def _get_camera_backends(include_fallback_any=False):
     is_windows = platform.system().lower() == "windows"
     if not is_windows:
         return [cv2.CAP_ANY]
 
-    # MSMF has repeatedly produced hard crashes on some Windows camera drivers.
-    # Prioritize DirectShow and fall back to CAP_ANY for better stability.
-    preferred = ["CAP_DSHOW", "CAP_ANY"]
+    # Prefer DirectShow while probing to reduce noisy backend warnings.
+    preferred = ["CAP_DSHOW"]
+    if include_fallback_any:
+        preferred.append("CAP_ANY")
+
     backends = []
     for name in preferred:
         backend = getattr(cv2, name, None)
@@ -121,10 +136,11 @@ def _open_capture(index, backend):
         return cv2.VideoCapture(index)
 
 
-def get_available_cameras(max_probe=10):
+def get_available_cameras(max_probe=8):
     arr = []
-    backends = _get_camera_backends()
+    backends = _get_camera_backends(include_fallback_any=False)
     misses_after_first = 0
+    misses_before_first = 0
 
     for index in range(max_probe):
         opened = False
@@ -146,6 +162,10 @@ def get_available_cameras(max_probe=10):
             misses_after_first += 1
             if misses_after_first >= 3:
                 break
+        else:
+            misses_before_first += 1
+            if misses_before_first >= 4 and index >= 3:
+                break
     return arr
 
 
@@ -156,8 +176,11 @@ class ProjectionMappingApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
         self.selected_markers = []
+        self.reference_markers = []
         self.latest_camera_qimage = None
         self.settings = self.load_settings()
+        self.logger = logging.getLogger("ProjectionMappingApp")
+        self._last_projector_index = -1
 
         self.setStatusBar(QStatusBar(self))
 
@@ -203,6 +226,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
         self.apply_loaded_settings()
+        self.refresh_mask_views()
         self.change_projector(self.projector_combo.currentIndex())
         self.maybe_show_startup_wizard()
 
@@ -267,21 +291,71 @@ class ProjectionMappingApp(QMainWindow):
             self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
             self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
 
-    def open_marker_selection_dialog(self):
+    def _status_log(self, message):
+        self.logger.info(message)
+        if self.statusBar() is not None:
+            self.statusBar().showMessage(message, 3000)
+
+    def log_debug(self, message):
+        # Backward-compatible alias for older code paths/copies.
+        self._status_log(message)
+
+    def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
+        self.marker_selection_dialog.setWindowTitle(title)
         self.marker_selection_dialog.clear_selection()
+        self.marker_selection_dialog.set_ir_assist_enabled(ir_assist)
+        self.marker_selection_dialog.take_picture_button.setVisible(use_live_capture)
+        self.marker_selection_dialog.take_picture_button.setEnabled(use_live_capture)
         self.marker_selection_dialog.take_picture_button.setText("Take Picture")
-        self.marker_selection_dialog.take_picture_button.setEnabled(True)
+
+        if reference_pixmap is not None:
+            self.marker_selection_dialog.set_pixmap(reference_pixmap)
 
         if self.marker_selection_dialog.exec_():
             markers = self.marker_selection_dialog.get_selected_points()
-            if len(markers) < 4:
+            if len(markers) != 4:
                 QMessageBox.warning(self, "Marker Selection", "Please select exactly 4 guitar markers.")
-                return
-            self.selected_markers = markers[:4]
-            self.worker.set_marker_points(self.selected_markers)
-            self.statusBar().showMessage(
-                f"Selected {len(self.selected_markers)} markers.", 3000
-            )
+                return []
+            return markers[:4]
+        return []
+
+    def select_reference_guitar_markers(self):
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Reference Guitar Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not image_path:
+            return []
+
+        reference_pixmap = QPixmap(image_path)
+        if reference_pixmap.isNull():
+            QMessageBox.warning(self, "Reference Image", "Could not load the selected image.")
+            return []
+
+        return self._run_marker_selection_dialog(
+            use_live_capture=False,
+            reference_pixmap=reference_pixmap,
+            title="Select 4 Reference Markers (uploaded image)",
+            ir_assist=False,
+        )
+
+    def open_marker_selection_dialog(self):
+        markers = self._run_marker_selection_dialog(
+            use_live_capture=True,
+            reference_pixmap=None,
+            title="Select Live IR Markers",
+            ir_assist=True,
+        )
+        if not markers:
+            return
+
+        self.selected_markers = markers
+        self.worker.set_marker_points(self.selected_markers)
+        self.statusBar().showMessage(
+            f"Selected {len(self.selected_markers)} markers.", 3000
+        )
 
     def start_marker_capture_countdown(self):
         self.marker_selection_dialog.take_picture_button.setEnabled(False)
@@ -371,34 +445,117 @@ class ProjectionMappingApp(QMainWindow):
         )
 
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
+        self.logger.info("Detected displays: %s", [f"{i}:{s.name()} {s.geometry()}" for i, s in enumerate(self.screens)])
         projector_layout.addWidget(self.projector_combo)
         projector_group.setLayout(projector_layout)
         self.control_layout.addWidget(projector_group)
 
         self.setup_wizard_button = QPushButton("Run Full Calibration Wizard")
-        self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard)
+        self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard_safe)
         self.control_layout.addWidget(self.setup_wizard_button)
 
-        cue_group = QGroupBox("Cues")
+        self.mapping_tabs = QTabWidget()
+
+        # Page 1: Masks
+        masks_page = QWidget()
+        masks_layout = QVBoxLayout(masks_page)
+
+        mask_list_group = QGroupBox("Masks")
+        mask_list_layout = QVBoxLayout()
+        self.mask_list_widget = QListWidget()
+        self.mask_list_widget.currentRowChanged.connect(self.on_mask_selection_changed)
+        self.remove_mask_button = QPushButton("Remove Selected Mask")
+        self.remove_mask_button.clicked.connect(self.remove_mask)
+        mask_list_layout.addWidget(self.mask_list_widget)
+        mask_list_layout.addWidget(self.remove_mask_button)
+        mask_list_group.setLayout(mask_list_layout)
+        masks_layout.addWidget(mask_list_group)
+
+        mask_group = QGroupBox("Mask Creation")
+        mask_layout = QVBoxLayout()
+        self.create_mask_button = QPushButton("Create Mask")
+        self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
+        self.finish_mask_button = QPushButton("Finish Mask")
+        self.finish_mask_button.clicked.connect(self.finish_mask_creation)
+        self.finish_mask_button.setEnabled(False)
+        self.cancel_mask_button = QPushButton("Cancel")
+        self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
+        self.cancel_mask_button.setEnabled(False)
+        self.mask_points_list = QListWidget()
+
+        mask_layout.addWidget(self.create_mask_button)
+        mask_layout.addWidget(self.finish_mask_button)
+        mask_layout.addWidget(self.cancel_mask_button)
+        mask_layout.addWidget(self.mask_points_list)
+
+        self.link_mask_button = QPushButton("Link Mask to Markers")
+        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
+        self.auto_sync_checkbox = QCheckBox("Auto-sync marker links")
+        self.auto_sync_checkbox.setChecked(True)
+        mask_layout.addWidget(self.link_mask_button)
+        mask_layout.addWidget(self.auto_sync_checkbox)
+
+        mask_group.setLayout(mask_layout)
+        masks_layout.addWidget(mask_group)
+
+        # Page 2: Cues + MIDI
+        cues_page = QWidget()
+        cues_layout = QVBoxLayout(cues_page)
+
+        cue_group = QGroupBox("Cue Queues per Mask")
         cue_layout = QVBoxLayout()
-        self.cue_list_widget = QListWidget()
-        self.cue_list_widget.currentRowChanged.connect(self.worker.set_active_cue_index)
-        self.add_cue_button = QPushButton("Add New Cue/Mask")
+        self.cue_mask_combo = QComboBox()
+        self.cue_mask_combo.currentIndexChanged.connect(self.refresh_cues_for_selected_mask)
+        self.mask_cue_list_widget = QListWidget()
+        self.mask_cue_list_widget.currentRowChanged.connect(self.on_mask_cue_selected)
+
+        self.add_cue_button = QPushButton("Add Video Cue to Mask")
         self.add_cue_button.clicked.connect(self.add_cue)
-        self.assign_cue_button = QPushButton("Assign Cue to Selected Mask")
-        self.assign_cue_button.clicked.connect(self.assign_cue_to_selected_mask)
-        self.remove_cue_button = QPushButton("Remove Cue")
+        self.remove_cue_button = QPushButton("Remove Selected Cue")
         self.remove_cue_button.clicked.connect(self.remove_cue)
-        self.render_all_cues_button = QPushButton("Render All Cues")
+
+        self.cc_spin = QSpinBox()
+        self.cc_spin.setRange(0, 127)
+        self.cc_spin.setPrefix("CC ")
+        self.map_cc_button = QPushButton("Map CC to Selected Cue")
+        self.map_cc_button.clicked.connect(self.map_cc_to_selected_cue)
+
+        self.render_all_cues_button = QPushButton("Render All Masks")
         self.render_all_cues_button.clicked.connect(lambda: self.worker.set_active_cue_index(-1))
-        cue_layout.addWidget(self.cue_list_widget)
+
+        cue_layout.addWidget(QLabel("Mask"))
+        cue_layout.addWidget(self.cue_mask_combo)
+        cue_layout.addWidget(self.mask_cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
-        cue_layout.addWidget(self.assign_cue_button)
         cue_layout.addWidget(self.remove_cue_button)
+        cue_layout.addWidget(self.cc_spin)
+        cue_layout.addWidget(self.map_cc_button)
         cue_layout.addWidget(self.render_all_cues_button)
         cue_group.setLayout(cue_layout)
-        self.control_layout.addWidget(cue_group)
+        cues_layout.addWidget(cue_group)
 
+        midi_group = QGroupBox("MIDI CC Input (Network MIDI capable)")
+        midi_layout = QVBoxLayout()
+        self.midi_input_combo = QComboBox()
+        self.refresh_midi_button = QPushButton("Refresh MIDI Inputs")
+        self.refresh_midi_button.clicked.connect(self.refresh_midi_inputs)
+        self.connect_midi_button = QPushButton("Connect MIDI")
+        self.connect_midi_button.clicked.connect(self.connect_midi_input)
+        midi_layout.addWidget(self.midi_input_combo)
+        midi_layout.addWidget(self.refresh_midi_button)
+        midi_layout.addWidget(self.connect_midi_button)
+        midi_group.setLayout(midi_layout)
+        cues_layout.addWidget(midi_group)
+
+        self.mapping_tabs.addTab(masks_page, "Masks")
+        self.mapping_tabs.addTab(cues_page, "Cues")
+        self.control_layout.addWidget(self.mapping_tabs)
+
+        self.midi_inport = None
+        self.midi_poll_timer = QTimer(self)
+        self.midi_poll_timer.timeout.connect(self.poll_midi_messages)
+        self.midi_poll_timer.start(20)
+        self.refresh_midi_inputs()
 
         warping_group = QGroupBox("Projector Warping")
         warping_layout = QVBoxLayout()
@@ -434,39 +591,10 @@ class ProjectionMappingApp(QMainWindow):
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
         self.clear_markers_button = QPushButton("Clear Marker Selection")
         self.clear_markers_button.clicked.connect(self.clear_marker_selection)
-
         ir_layout.addWidget(self.select_markers_button)
         ir_layout.addWidget(self.clear_markers_button)
-
         ir_group.setLayout(ir_layout)
         self.control_layout.addWidget(ir_group)
-
-        mask_group = QGroupBox("Mask Creation")
-        mask_layout = QVBoxLayout()
-        self.create_mask_button = QPushButton("Create Mask")
-        self.create_mask_button.clicked.connect(self.enter_mask_creation_mode)
-        self.finish_mask_button = QPushButton("Finish Mask")
-        self.finish_mask_button.clicked.connect(self.finish_mask_creation)
-        self.finish_mask_button.setEnabled(False)
-        self.cancel_mask_button = QPushButton("Cancel")
-        self.cancel_mask_button.clicked.connect(self.cancel_mask_creation)
-        self.cancel_mask_button.setEnabled(False)
-        self.mask_points_list = QListWidget()
-
-        mask_layout.addWidget(self.create_mask_button)
-        mask_layout.addWidget(self.finish_mask_button)
-        mask_layout.addWidget(self.cancel_mask_button)
-        mask_layout.addWidget(self.mask_points_list)
-
-        self.link_mask_button = QPushButton("Link Mask to Markers")
-        self.link_mask_button.clicked.connect(self.link_mask_to_markers)
-        self.auto_sync_checkbox = QCheckBox("Auto-sync marker links")
-        self.auto_sync_checkbox.setChecked(True)
-        mask_layout.addWidget(self.link_mask_button)
-        mask_layout.addWidget(self.auto_sync_checkbox)
-
-        mask_group.setLayout(mask_layout)
-        self.control_layout.addWidget(mask_group)
 
         depth_group = QGroupBox("Depth Estimation")
         depth_layout = QVBoxLayout()
@@ -564,7 +692,7 @@ class ProjectionMappingApp(QMainWindow):
     def cache_latest_frame(self, image):
         self.latest_camera_qimage = image.copy()
 
-    def capture_still_frame_sync(self, timeout_ms=5000):
+    def capture_still_frame_sync(self, timeout_ms=5000, label="capture"):
         loop = QEventLoop(self)
         result = {"image": None}
 
@@ -572,6 +700,9 @@ class ProjectionMappingApp(QMainWindow):
             result["image"] = image.copy()
             loop.quit()
 
+        self.logger.info("Requesting still frame: %s", label)
+        if self.statusBar() is not None:
+            self.statusBar().showMessage(f"Requesting still frame: {label}", 3000)
         self.worker.still_frame_ready.connect(on_frame)
         self.worker.capture_still_frame()
         QTimer.singleShot(timeout_ms, loop.quit)
@@ -580,7 +711,22 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.still_frame_ready.disconnect(on_frame)
         except Exception:
             pass
+
+        if result["image"] is None:
+            self.logger.warning("Still capture timed out for %s", label)
+        else:
+            self.logger.info("Still capture succeeded for %s (%dx%d)", label, result["image"].width(), result["image"].height())
         return result["image"]
+
+    def capture_still_frame_warmed(self, label, warmup_ms=250, samples=2):
+        QApplication.processEvents()
+        time.sleep(max(0.0, warmup_ms / 1000.0))
+        still = None
+        for i in range(max(1, samples)):
+            still = self.capture_still_frame_sync(label=f"{label}#{i+1}")
+            QApplication.processEvents()
+            time.sleep(0.08)
+        return still
 
     def _qimage_to_bgr(self, image):
         if image is None:
@@ -627,7 +773,13 @@ class ProjectionMappingApp(QMainWindow):
 
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return None
+            self.logger.warning("Projector bounds detection: no contours from off/on diff; trying bright-frame fallback")
+            _, thresh = cv2.threshold(cv2.cvtColor(on_frame, cv2.COLOR_BGR2GRAY), 170, 255, cv2.THRESH_BINARY)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                self.logger.error("Projector bounds detection failed after fallback")
+                return None
 
         best_quad = None
         best_score = -1.0
@@ -691,25 +843,37 @@ class ProjectionMappingApp(QMainWindow):
         return overlay
 
     def ensure_mask(self, name, points, mask_type="static", linked_marker_count=0):
-        for mask in self.masks:
+        for i, mask in enumerate(self.masks):
             if mask.name == name:
                 mask.source_points = points
                 mask.type = mask_type
                 mask.linked_marker_count = linked_marker_count
+                self.refresh_mask_views(select_index=i)
                 return mask
         mask = Mask(name, points, None)
         mask.type = mask_type
         mask.linked_marker_count = linked_marker_count
         self.masks.append(mask)
-        self.cue_list_widget.addItem(name)
+        self.refresh_mask_views(select_index=len(self.masks) - 1)
         return mask
+
+    def run_full_calibration_wizard_safe(self):
+        try:
+            self.run_full_calibration_wizard()
+        except Exception:
+            self.logger.exception("Calibration wizard crashed")
+            QMessageBox.critical(
+                self,
+                "Calibration Error",
+                "Calibration wizard crashed. Check terminal logs for stack trace and retry.",
+            )
 
     def run_full_calibration_wizard(self):
         # Stage 1: room scan + projector bounds
         self.projector_window.set_pattern_mode(False)
         QApplication.processEvents()
         time.sleep(0.25)
-        still_off = self.capture_still_frame_sync()
+        still_off = self.capture_still_frame_warmed("projector_off", warmup_ms=350, samples=2)
         if still_off is None:
             QMessageBox.warning(self, "Calibration", "Could not capture a camera frame for room scan (projector off frame).")
             return
@@ -717,7 +881,7 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.set_pattern_mode(True, brightness=255)
         QApplication.processEvents()
         time.sleep(0.35)
-        still_on = self.capture_still_frame_sync()
+        still_on = self.capture_still_frame_warmed("projector_on", warmup_ms=900, samples=3)
         self.projector_window.set_pattern_mode(False)
 
         if still_on is None:
@@ -731,6 +895,15 @@ class ProjectionMappingApp(QMainWindow):
             initial_points = [
                 QPoint(int(p[0] * still.width()), int(p[1] * still.height()))
                 for p in bounds
+            ]
+            self.logger.info("Auto projector bounds detected: %s", bounds)
+        else:
+            self.logger.warning("Auto projector bounds unavailable; seeding with full-frame corners")
+            initial_points = [
+                QPoint(0, 0),
+                QPoint(still.width() - 1, 0),
+                QPoint(still.width() - 1, still.height() - 1),
+                QPoint(0, still.height() - 1),
             ]
 
         bounds_dialog = PolygonMaskDialog("Confirm projector bounds", self)
@@ -770,6 +943,7 @@ class ProjectionMappingApp(QMainWindow):
         bg_points_q = background_dialog.get_points()
         bg_points = [(p.x(), p.y()) for p in bg_points_q]
         self.ensure_mask("Background", bg_points, mask_type="static", linked_marker_count=0)
+        self.logger.info("Background mask saved with %d points", len(bg_points))
         overlay = self._draw_polygon_overlay(still, bg_points_q, Qt.yellow)
         if overlay is not None:
             self.update_projector_preview(overlay)
@@ -780,13 +954,25 @@ class ProjectionMappingApp(QMainWindow):
             "Projector bounds and background mask applied. Continue to marker selection.",
         )
 
-        # Stage 2: guitar markers + guitar mask + depth baseline
-        self.open_marker_selection_dialog()
-        if len(self.selected_markers) < 4:
-            QMessageBox.warning(self, "Stage 2", "Select at least 4 IR markers on the guitar to continue.")
+        # Stage 2: uploaded reference + live marker alignment + guitar mask + depth baseline
+        reference_markers = self.select_reference_guitar_markers()
+        if len(reference_markers) != 4:
+            QMessageBox.warning(self, "Stage 2", "Upload a guitar image and select exactly 4 reference markers to continue.")
             return
 
-        still2 = self.capture_still_frame_sync()
+        self.reference_markers = reference_markers
+
+        QMessageBox.information(
+            self,
+            "Stage 2",
+            "Now tune threshold until only live IR blobs are visible, then capture and select the same 4 markers in live video.",
+        )
+        self.open_marker_selection_dialog()
+        if len(self.selected_markers) != 4:
+            QMessageBox.warning(self, "Stage 2", "Select exactly 4 live IR markers on the guitar to continue.")
+            return
+
+        still2 = self.capture_still_frame_warmed("guitar_mask", warmup_ms=250, samples=2)
         if still2 is None:
             QMessageBox.warning(self, "Stage 2", "Could not capture still frame for guitar mask.")
             return
@@ -796,6 +982,7 @@ class ProjectionMappingApp(QMainWindow):
         source = [(int(p[0]), int(p[1])) for p in auto_source]
 
         self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
+        self.logger.info("Guitar mask saved with %d points", len(source))
         self.worker.set_marker_points(self.selected_markers[:4])
         self.worker.calibrate_depth()
 
@@ -813,9 +1000,10 @@ class ProjectionMappingApp(QMainWindow):
             if guitar_dialog.exec_() and len(guitar_dialog.get_points()) == 4:
                 source = [(p.x(), p.y()) for p in guitar_dialog.get_points()]
                 self.ensure_mask("Guitar", source, mask_type="dynamic", linked_marker_count=4)
+        self.logger.info("Guitar mask saved with %d points", len(source))
 
         # Stage 3: amp mask
-        still3 = self.capture_still_frame_sync()
+        still3 = self.capture_still_frame_warmed("amp_mask", warmup_ms=250, samples=2)
         if still3 is None:
             QMessageBox.warning(self, "Stage 3", "Could not capture still frame for amp mask.")
             return
@@ -824,6 +1012,7 @@ class ProjectionMappingApp(QMainWindow):
         if amp_dialog.exec_() and len(amp_dialog.get_points()) == 4:
             amp_source = [(p.x(), p.y()) for p in amp_dialog.get_points()]
             self.ensure_mask("Amp", amp_source, mask_type="static", linked_marker_count=0)
+            self.logger.info("Amp mask saved with %d points", len(amp_source))
 
         self.worker.set_masks(self.masks)
         self.statusBar().showMessage("Calibration wizard complete. Assign cues to masks in the Cues list.", 6000)
@@ -888,15 +1077,28 @@ class ProjectionMappingApp(QMainWindow):
         self.cancel_mask_button.setEnabled(True)
 
     def finish_mask_creation(self):
+        mask_points = list(self.video_display.get_mask_points())
         self.video_display.set_mask_creation_mode(False)
-        mask_points = self.video_display.get_mask_points()
 
-        current_item = self.cue_list_widget.currentItem()
-        if current_item and mask_points:
-            row = self.cue_list_widget.row(current_item)
+        if len(mask_points) < 3:
+            self.log_debug("Finish Mask requires at least 3 points.")
+        else:
+            row = self.mask_list_widget.currentRow()
+            source_points = [(p.x(), p.y()) for p in mask_points]
+            if len(source_points) >= 3 and source_points[0] != source_points[-1]:
+                source_points.append(source_points[0])
             if 0 <= row < len(self.masks):
-                self.masks[row].source_points = [(p.x(), p.y()) for p in mask_points]
-                self.worker.set_masks(self.masks)
+                self.masks[row].source_points = source_points
+                self.log_debug(f"Updated mask '{self.masks[row].name}' with {len(source_points)} points.")
+            else:
+                mask_name = f"Mask {len(self.masks) + 1}"
+                mask = Mask(mask_name, source_points, None)
+                mask.type = "static"
+                self.masks.append(mask)
+                self.refresh_mask_views(select_index=len(self.masks) - 1)
+                self.log_debug(f"Created new mask '{mask_name}' with {len(source_points)} points.")
+            self.worker.set_masks(self.masks)
+            self.refresh_cues_for_selected_mask()
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
@@ -917,7 +1119,7 @@ class ProjectionMappingApp(QMainWindow):
         self.mask_points_list.addItem(f"({point.x()}, {point.y()})")
 
     def link_mask_to_markers(self):
-        current_item = self.cue_list_widget.currentItem()
+        current_item = self.mask_list_widget.currentItem()
         if not current_item:
             self.statusBar().showMessage("Please select a cue to link.", 3000)
             return
@@ -926,7 +1128,7 @@ class ProjectionMappingApp(QMainWindow):
             self.statusBar().showMessage("Please select IR markers first.", 3000)
             return
 
-        row = self.cue_list_widget.row(current_item)
+        row = self.mask_list_widget.row(current_item)
         if 0 <= row < len(self.masks):
             mask = self.masks[row]
             if len(mask.source_points) != len(self.selected_markers):
@@ -972,57 +1174,189 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.set_calibration_mode(checked)
         self.enable_warping_button.setText("Disable Warping" if checked else "Enable Warping")
 
-    def assign_cue_to_selected_mask(self):
-        current_item = self.cue_list_widget.currentItem()
-        if not current_item:
-            self.statusBar().showMessage("Select a mask first.", 3000)
+    def refresh_mask_views(self, select_index=None):
+        self.mask_list_widget.blockSignals(True)
+        self.cue_mask_combo.blockSignals(True)
+        self.mask_list_widget.clear()
+        self.cue_mask_combo.clear()
+        for mask in self.masks:
+            self.mask_list_widget.addItem(mask.name)
+            self.cue_mask_combo.addItem(mask.name)
+        self.mask_list_widget.blockSignals(False)
+        self.cue_mask_combo.blockSignals(False)
+
+        if self.masks:
+            idx = select_index if select_index is not None else min(self.mask_list_widget.currentRow(), len(self.masks) - 1)
+            if idx < 0:
+                idx = 0
+            self.mask_list_widget.setCurrentRow(idx)
+            self.cue_mask_combo.setCurrentIndex(idx)
+        self.refresh_cues_for_selected_mask()
+
+    def on_mask_selection_changed(self, row):
+        if 0 <= row < len(self.masks):
+            self.worker.set_active_cue_index(row)
+            if self.cue_mask_combo.currentIndex() != row:
+                self.cue_mask_combo.setCurrentIndex(row)
+        self.refresh_cues_for_selected_mask()
+
+    def refresh_cues_for_selected_mask(self):
+        idx = self.cue_mask_combo.currentIndex()
+        self.mask_cue_list_widget.clear()
+        if idx < 0 or idx >= len(self.masks):
             return
-        row = self.cue_list_widget.row(current_item)
-        if row < 0 or row >= len(self.masks):
+        mask = self.masks[idx]
+        for i, cue in enumerate(mask.cues):
+            cc_list = [str(cc) for cc, cue_index in mask.midi_cc_map.items() if cue_index == i]
+            cc_suffix = f" [CC: {', '.join(cc_list)}]" if cc_list else ""
+            active = "* " if i == mask.active_cue else ""
+            self.mask_cue_list_widget.addItem(f"{active}{Path(cue).name}{cc_suffix}")
+        if mask.cues:
+            self.mask_cue_list_widget.setCurrentRow(mask.active_cue)
+
+    def on_mask_cue_selected(self, row):
+        idx = self.cue_mask_combo.currentIndex()
+        if idx < 0 or idx >= len(self.masks):
+            return
+        mask = self.masks[idx]
+        if 0 <= row < len(mask.cues):
+            mask.active_cue = row
+            self.worker.set_masks(self.masks)
+
+    def add_cue(self):
+        idx = self.cue_mask_combo.currentIndex()
+        if idx < 0 or idx >= len(self.masks):
+            self.statusBar().showMessage("Create/select a mask first.", 3000)
             return
         video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
         if not video_path:
             return
-        self.masks[row].video_path = video_path
-        self.cue_list_widget.item(row).setText(f"{self.masks[row].name}: {Path(video_path).name}")
+        self.masks[idx].add_cue(video_path)
         self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
 
-    def add_cue(self):
-        video_path, _ = QFileDialog.getOpenFileName(self, "Select Video File")
-        if video_path:
-            mask_name = f"Cue {len(self.masks) + 1}"
-            new_mask = Mask(mask_name, [], video_path)
-            self.masks.append(new_mask)
-            self.cue_list_widget.addItem(f"{mask_name}: {Path(video_path).name}")
+    def remove_cue(self):
+        idx = self.cue_mask_combo.currentIndex()
+        cue_idx = self.mask_cue_list_widget.currentRow()
+        if idx < 0 or idx >= len(self.masks) or cue_idx < 0:
+            return
+        self.masks[idx].remove_cue(cue_idx)
+        self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
+
+    def map_cc_to_selected_cue(self):
+        idx = self.cue_mask_combo.currentIndex()
+        cue_idx = self.mask_cue_list_widget.currentRow()
+        if idx < 0 or idx >= len(self.masks):
+            return
+        if cue_idx < 0:
+            cue_idx = self.masks[idx].active_cue
+        cc = int(self.cc_spin.value())
+        self.masks[idx].midi_cc_map[cc] = cue_idx
+        self.refresh_cues_for_selected_mask()
+        self.statusBar().showMessage(f"Mapped CC {cc} to cue {cue_idx + 1} on '{self.masks[idx].name}'.", 3000)
+
+    def refresh_midi_inputs(self):
+        self.midi_input_combo.clear()
+        if mido is None:
+            self.midi_input_combo.addItem("mido not installed")
+            self.midi_input_combo.setEnabled(False)
+            return
+        names = mido.get_input_names()
+        if not names:
+            self.midi_input_combo.addItem("No MIDI input ports")
+            self.midi_input_combo.setEnabled(False)
+            return
+        self.midi_input_combo.setEnabled(True)
+        self.midi_input_combo.addItems(names)
+
+    def connect_midi_input(self):
+        if mido is None or not self.midi_input_combo.isEnabled():
+            self.statusBar().showMessage("MIDI backend unavailable.", 3000)
+            return
+        if self.midi_inport is not None:
+            self.midi_inport.close()
+            self.midi_inport = None
+        name = self.midi_input_combo.currentText()
+        try:
+            self.midi_inport = mido.open_input(name)
+            self.statusBar().showMessage(f"Connected MIDI input: {name}", 3000)
+        except Exception as exc:
+            self.logger.exception("Failed to open MIDI input")
+            self.statusBar().showMessage(f"MIDI connect failed: {exc}", 5000)
+
+    def poll_midi_messages(self):
+        if self.midi_inport is None:
+            return
+        try:
+            for msg in self.midi_inport.iter_pending():
+                if msg.type == "control_change":
+                    self.route_midi_cc(int(msg.control), int(msg.value))
+        except Exception:
+            self.logger.exception("MIDI polling error")
+
+    def route_midi_cc(self, cc, value):
+        if value <= 0:
+            return
+        for mask in self.masks:
+            if cc in mask.midi_cc_map:
+                cue_idx = mask.midi_cc_map[cc]
+                if 0 <= cue_idx < len(mask.cues):
+                    mask.active_cue = cue_idx
+        self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
+
+    def remove_mask(self):
+        row = self.mask_list_widget.currentRow()
+        if 0 <= row < len(self.masks):
+            del self.masks[row]
             self.worker.set_masks(self.masks)
+            self.refresh_mask_views(select_index=max(0, row - 1))
 
     def change_camera(self, index):
         if self.available_cameras and 0 <= index < len(self.available_cameras):
             self.worker.set_video_source(self.available_cameras[index])
 
     def change_projector(self, index):
-        if index >= len(self.screens):
+        self.screens = QApplication.screens()
+        if index < 0 or index >= len(self.screens):
+            return
+
+        if index == self._last_projector_index:
             return
 
         screen = self.screens[index]
+        target_geometry = screen.geometry()
+
+        # Ensure the window has a native handle before assigning a screen.
+        self.projector_window.showNormal()
+        QApplication.processEvents()
+
         window_handle = self.projector_window.windowHandle()
         if window_handle is not None:
             window_handle.setScreen(screen)
-        else:
-            self.projector_window.setGeometry(screen.geometry())
 
+        self.projector_window.setGeometry(target_geometry)
+        self.projector_window.move(target_geometry.topLeft())
         self.projector_window.showFullScreen()
+        self.projector_window.raise_()
+        self.projector_window.activateWindow()
 
-    def remove_cue(self):
-        current_item = self.cue_list_widget.currentItem()
-        if current_item:
-            row = self.cue_list_widget.row(current_item)
-            self.cue_list_widget.takeItem(row)
-            del self.masks[row]
-            self.worker.set_masks(self.masks)
+        self._last_projector_index = index
+        self.logger.info(
+            "Projector display changed to index=%d name=%s geometry=%s",
+            index,
+            screen.name(),
+            target_geometry,
+        )
 
     def closeEvent(self, event):
         self.save_settings()
+        if self.midi_inport is not None:
+            try:
+                self.midi_inport.close()
+            except Exception:
+                pass
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()

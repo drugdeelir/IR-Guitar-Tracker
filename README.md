@@ -8,7 +8,8 @@ This is a comprehensive tool for creating real-time projection mapping effects, 
 *   **Real-Time IR Tracking:** Tracks configurable IR marker constellations with smoothing and dropout recovery.
 *   **Dynamic Mask Warping:** Warps a video source to a mask defined by the live positions of the IR trackers.
 *   **Custom Mask Creation:** An interactive mode to draw a custom polygon mask directly on the video feed.
-*   **Cue System:** A list-based system to manage and trigger different video cues.
+*   **Cue Queues per Mask:** Each mask has its own cue queue on a dedicated Cues page.
+*   **MIDI CC Cue Mapping:** Map MIDI CC messages to specific cues per mask (works with local/network MIDI inputs exposed to the OS).
 *   **Built-in Projector Preview:** See the projector output directly inside the main control panel.
 *   **Auto-Sync Marker Linking:** Automatically links compatible masks when marker selection and mask point counts match.
 *   **Startup Wizard:** First-run guided setup for camera, projector, threshold mode, and auto-sync defaults.
@@ -43,8 +44,9 @@ These instructions are for running the application directly from the source code
 
 4.  **Run the Application:**
     ```bash
-    python main.py
+    python start.py
     ```
+    (`start.py` installs requirements if needed, validates key files, then launches `main.py`.)
 
     Or on Windows, double-click `run_windows.bat` to launch it automatically.
 
@@ -74,23 +76,29 @@ If you want to run this without opening a terminal each time, you can build a `.
 2.  **Select Devices:**
     *   Use the **Camera** dropdown to select your IR camera.
     *   Use the **Projector Display** dropdown to select the screen or projector you want to use for the output. The projector window will automatically move to that screen and go fullscreen.
-3.  **Add a Video Cue:**
-    *   Click **"Add Video Cue"** and select a video file. It will appear in the "Cues" list.
-4.  **Calibrate IR Tracking:**
+3.  **Create or Select a Mask:**
+    *   Use the **Masks** page to create/select masks.
+4.  **Add Cues to a Mask:**
+    *   Open the **Cues** page, choose a mask, then click **"Add Video Cue to Mask"**.
+    *   Select a cue row to make it active for that mask.
+5.  **Map MIDI CC (optional):**
+    *   In the **Cues** page, connect a MIDI input (including network MIDI ports), select a cue, set a CC number, and click **"Map CC to Selected Cue"**.
+6.  **Calibrate IR Tracking:**
     *   Adjust the **IR Threshold** slider until the application reliably detects your IR markers. The "Trackers detected" label will show you how many points it sees. You should also see red circles drawn over the trackers in the main video display.
-5.  **Create a Mask:**
+7.  **Create a Mask:**
     *   Select the video cue you want to associate the mask with from the list.
     *   Click **"Create Mask"**.
     *   Click on the main video feed to draw the vertices of your custom mask shape.
     *   When you are done, click **"Finish Mask"**. The mask points are now associated with the selected video cue.
-6.  **Link Trackers:**
-    *   Click **"Select Guitar Markers"**, capture a still frame, and click the marker positions directly on the image in order.
-    *   Click **"Confirm Markers"**, then click **"Link Mask to Markers"** for the selected cue.
-7.  **Calibrate Projector:**
+8.  **Link Trackers:**
+    *   In the full calibration wizard, upload a reference guitar image and manually pick 4 markers.
+    *   Then capture live IR markers and pick the same 4 points in the live frame.
+    *   Click **"Confirm Markers"**, then click **"Link Mask to Markers"** for the selected cue if needed.
+9.  **Calibrate Projector:**
     *   Click **"Enable Warping"**. You will see four red dots on the projector output window.
     *   Drag these dots to the corners of your real-world projection surface to correct for keystone distortion.
     *   Click **"Disable Warping"** when you are done.
-8.  **Calibrate Depth:**
+10.  **Calibrate Depth:**
     *   Position your guitar at a neutral, middle-distance from the camera.
     *   Click **"Calibrate Depth"**. This sets the baseline distance for the 3D effect.
     *   Now, as you move the guitar closer or further away, the mask will scale in size. Use the **Sensitivity** slider to adjust the strength of the effect.
