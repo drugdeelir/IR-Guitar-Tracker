@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
-os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
+# Note: DO NOT disable MSMF — it's the only backend that works for camera 0 on this machine
 
 import cv2
 import numpy as np
@@ -217,6 +217,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.camera_error.connect(self.show_camera_error)
         self.worker.performance_updated.connect(self.update_performance_label)
         self.worker.camera_info_updated.connect(self.update_camera_info)
+        self.worker.markers_calibrated.connect(self._on_markers_calibrated)
 
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.marker_selection_dialog.take_picture_button.clicked.connect(
@@ -228,6 +229,7 @@ class ProjectionMappingApp(QMainWindow):
         self.refresh_mask_views()
         self.change_projector(self.projector_combo.currentIndex())
         self.maybe_show_startup_wizard()
+        self._auto_create_test_masks()
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
@@ -443,6 +445,11 @@ class ProjectionMappingApp(QMainWindow):
         self.setup_wizard_button = QPushButton("Run Full Calibration Wizard")
         self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard_safe)
         self.control_layout.addWidget(self.setup_wizard_button)
+
+        self.calibrate_button = QPushButton("Calibrate Guitar + Homography")
+        self.calibrate_button.setStyleSheet("QPushButton { background-color: #2a5; color: white; font-weight: bold; padding: 8px; }")
+        self.calibrate_button.clicked.connect(self._start_calibration)
+        self.control_layout.addWidget(self.calibrate_button)
 
         self.mapping_tabs = QTabWidget()
 
@@ -690,7 +697,7 @@ class ProjectionMappingApp(QMainWindow):
             result["image"] = image.copy()
             loop.quit()
 
-        self.log_debug(f"Requesting still frame: {label}")
+        self.logger.debug("Requesting still frame: %s", label)
         self.worker.still_frame_ready.connect(on_frame)
         self.worker.capture_still_frame()
         QTimer.singleShot(timeout_ms, loop.quit)
@@ -844,6 +851,166 @@ class ProjectionMappingApp(QMainWindow):
         self.masks.append(mask)
         self.refresh_mask_views(select_index=len(self.masks) - 1)
         return mask
+
+    def _auto_create_test_masks(self):
+        """Auto-create guitar and background masks for testing if none exist."""
+        import os
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        guitar_video = os.path.join(base_dir, "test_guitar.mp4")
+        bg_video = os.path.join(base_dir, "test_background.mp4")
+
+        if not os.path.exists(guitar_video) or not os.path.exists(bg_video):
+            return
+        if self.masks:
+            return  # don't overwrite existing masks
+
+        self.logger.info("Auto-creating test masks (waiting for marker calibration)")
+
+        # Use actual camera resolution for mask coordinates.
+        # Camera 0 is 640x480 — masks must be in camera pixel space.
+        cam_w, cam_h = 640, 480
+
+        # Background mask: full camera frame (static, always projected)
+        bg_points = [
+            (0, 0),
+            (cam_w, 0),
+            (cam_w, cam_h),
+            (0, cam_h),
+        ]
+        bg_mask = self.ensure_mask("Background", bg_points, mask_type="static")
+        bg_mask.add_cue(bg_video)
+
+        # Store camera dimensions for guitar mask computation
+        self._cam_w = cam_w
+        self._cam_h = cam_h
+
+        # Guitar mask will be created dynamically after auto-calibration
+        # detects the 4 marker positions. Store the video path for later.
+        self._guitar_video_path = guitar_video
+
+        self.worker.set_active_cue_index(-1)  # render ALL masks
+        self.worker.set_masks(self.masks)
+        self.refresh_mask_views(select_index=0)
+        self.logger.info("Test masks created: Background (%dx%d), Guitar pending calibration", cam_w, cam_h)
+
+    def _on_markers_calibrated(self, marker_positions):
+        """Called when worker auto-detects stable marker positions.
+        Uses the actual guitar polygon from silhouette detection for the mask."""
+        self.logger.info("Markers calibrated at: %s", marker_positions)
+
+        # Re-enable calibration button
+        if hasattr(self, 'calibrate_button'):
+            self.calibrate_button.setEnabled(True)
+            self.calibrate_button.setText("Calibrate Guitar + Homography")
+
+        if not hasattr(self, '_guitar_video_path') or not self._guitar_video_path:
+            return
+
+        # Use actual camera resolution from worker (set once frames start)
+        cam_w = self.worker.frame_width or getattr(self, '_cam_w', 640)
+        cam_h = self.worker.frame_height or getattr(self, '_cam_h', 480)
+        self._cam_w = cam_w
+        self._cam_h = cam_h
+
+        # Use the actual guitar polygon from silhouette detection if available.
+        # This is built in worker._detect_markers_from_diff from the actual
+        # contour shape, giving a much more accurate mask than the old
+        # 4-marker T-shape extrapolation.
+        guitar_polygon = getattr(self.worker, '_guitar_polygon', None)
+        if guitar_polygon and len(guitar_polygon) >= 3:
+            guitar_points = [(int(x), int(y)) for x, y in guitar_polygon]
+            self.logger.info(
+                "Using actual guitar polygon from silhouette (%d points): %s",
+                len(guitar_points), guitar_points
+            )
+        else:
+            # Fallback: construct from marker extremes
+            pts = [(int(x), int(y)) for x, y in marker_positions]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            pad = 10
+            guitar_points = [
+                (min(xs) - pad, min(ys) - pad),
+                (max(xs) + pad, min(ys) - pad),
+                (max(xs) + pad, max(ys) + pad),
+                (min(xs) - pad, max(ys) + pad),
+            ]
+            self.logger.info("Fallback guitar rect from markers: %s", guitar_points)
+
+        guitar_mask = self.ensure_mask("Guitar", guitar_points, mask_type="static")
+        if not guitar_mask.cues or not any(c for c in guitar_mask.cues):
+            guitar_mask.add_cue(self._guitar_video_path)
+
+        # Update the background mask to cover full camera frame
+        self._update_background_exclude_guitar(guitar_points, cam_w, cam_h)
+
+        self.worker.set_masks(self.masks)
+        self.refresh_mask_views(select_index=0)
+        # MUST be after refresh_mask_views, which triggers on_mask_selection_changed
+        # that would set active_cue_index to the selected row (0=Background only).
+        # Setting -1 here ensures ALL masks render (background + guitar).
+        self.worker.set_active_cue_index(-1)
+
+        # Save verification image: camera frame with mask polygon overlaid
+        self._save_mask_verification(guitar_points, cam_w, cam_h)
+
+        self.logger.info(
+            "Guitar mask created with %d polygon points, cam=%dx%d",
+            len(guitar_points), cam_w, cam_h
+        )
+
+    def _save_mask_verification(self, guitar_points, cam_w, cam_h):
+        """Save a debug image showing the camera frame with mask polygons overlaid."""
+        import os as _os
+        _base = _os.path.dirname(_os.path.abspath(__file__))
+        try:
+            # Use the illuminate reference as the background (shows the scene)
+            illum_ref = self.worker._calib_illum_ref
+            if illum_ref is None:
+                return
+            verify = cv2.cvtColor(illum_ref, cv2.COLOR_GRAY2BGR)
+
+            # Draw guitar mask polygon in RED
+            guitar_np = np.array(guitar_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(verify, [guitar_np], True, (0, 0, 255), 3)
+            cv2.fillPoly(verify, [guitar_np], (0, 0, 100))  # semi-transparent red fill
+
+            # Draw background mask polygon in BLUE
+            for mask in self.masks:
+                if mask.name == "Background":
+                    bg_pts = np.array(mask.source_points, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(verify, [bg_pts], True, (255, 100, 0), 2)
+
+            # Label
+            cv2.putText(verify, "RED=Guitar mask, BLUE=Background",
+                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(verify, f"Guitar polygon: {len(guitar_points)} points",
+                        (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+            cv2.imwrite(_os.path.join(_base, "mask_verification.png"), verify)
+            self.logger.info("Mask verification image saved to mask_verification.png")
+        except Exception as e:
+            self.logger.warning("Failed to save mask verification: %s", e)
+
+    def _update_background_exclude_guitar(self, guitar_points, cam_w, cam_h):
+        """Update the Background mask to cover the full camera frame.
+        Guitar mask renders AFTER background and overwrites its area,
+        so no explicit exclusion is needed — just ensure background
+        covers the entire frame."""
+        bg_points = [(0, 0), (cam_w, 0), (cam_w, cam_h), (0, cam_h)]
+        for mask in self.masks:
+            if mask.name == "Background":
+                mask.source_points = bg_points
+                self.logger.info("Background mask updated to %dx%d", cam_w, cam_h)
+                break
+
+    def _start_calibration(self):
+        """Trigger guitar detection + homography calibration sequence."""
+        self.logger.info("User triggered calibration")
+        self.calibrate_button.setEnabled(False)
+        self.calibrate_button.setText("Calibrating...")
+        self.worker.start_calibration()
+        # Re-enable button after calibration completes (via markers_calibrated signal)
 
     def run_full_calibration_wizard_safe(self):
         try:
@@ -1069,22 +1236,21 @@ class ProjectionMappingApp(QMainWindow):
         self.video_display.set_mask_creation_mode(False)
 
         if not mask_points:
-            self.log_debug("Finish Mask clicked with no points; nothing saved.")
+            self.logger.debug("Finish Mask clicked with no points; nothing saved.")
         else:
-            row = self.cue_list_widget.currentRow()
+            row = self.mask_list_widget.currentRow()
             source_points = [(p.x(), p.y()) for p in mask_points]
             if 0 <= row < len(self.masks):
                 self.masks[row].source_points = source_points
-                self.log_debug(f"Updated mask '{self.masks[row].name}' with {len(source_points)} points.")
+                self.logger.debug("Updated mask '%s' with %d points.", self.masks[row].name, len(source_points))
             else:
                 mask_name = f"Mask {len(self.masks) + 1}"
                 mask = Mask(mask_name, source_points, None)
                 mask.type = "static"
                 self.masks.append(mask)
-                self.cue_list_widget.addItem(mask_name)
-                self.cue_list_widget.setCurrentRow(len(self.masks) - 1)
-                self.log_debug(f"Created new mask '{mask_name}' with {len(source_points)} points.")
+                self.logger.debug("Created new mask '%s' with %d points.", mask_name, len(source_points))
             self.worker.set_masks(self.masks)
+            self.refresh_mask_views(select_index=len(self.masks) - 1)
 
         self.create_mask_button.setEnabled(True)
         self.finish_mask_button.setEnabled(False)
@@ -1331,14 +1497,6 @@ class ProjectionMappingApp(QMainWindow):
             screen.name(),
             target_geometry,
         )
-
-    def remove_cue(self):
-        current_item = self.cue_list_widget.currentItem()
-        if current_item:
-            row = self.cue_list_widget.row(current_item)
-            self.cue_list_widget.takeItem(row)
-            del self.masks[row]
-            self.worker.set_masks(self.masks)
 
     def closeEvent(self, event):
         self.save_settings()

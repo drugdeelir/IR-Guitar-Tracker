@@ -1,0 +1,7 @@
+[16:14:16] INFO ProjectionMappingApp: Detected displays: ['0:\\\\.\\DISPLAY1 PyQt5.QtCore.QRect(0, 0, 2560, 1600)', '1:\\\\.\\DISPLAY5 PyQt5.QtCore.QRect(2560, 0, 1920, 1080)']
+[16:14:16] INFO ProjectionMappingApp: Projector display changed to index=1 name=\\.\DISPLAY5 geometry=PyQt5.QtCore.QRect(2560, 0, 1920, 1080)
+[16:14:16] INFO ProjectionMappingApp: Projector display changed to index=1 name=\\.\DISPLAY5 geometry=PyQt5.QtCore.QRect(2560, 0, 1920, 1080)
+[16:14:16] INFO ProjectionMappingApp: Auto-creating test masks (waiting for marker calibration)
+[16:14:16] INFO ProjectionMappingApp: Test masks created: Background (640x480), Guitar pending calibration
+[16:14:16] INFO Worker: Trying camera 1 with backend 1400
+[16:14:18] INFO Worker: Camera opened with backend 1400

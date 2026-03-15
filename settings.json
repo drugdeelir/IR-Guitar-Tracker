@@ -1,0 +1,30 @@
+{
+  "ir_threshold": 200,
+  "threshold_mode": 1,
+  "depth_sensitivity": 100,
+  "camera_index": 1,
+  "projector_index": 1,
+  "warp_points": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      1.0,
+      0.0
+    ],
+    [
+      1.0,
+      1.0
+    ],
+    [
+      0.0,
+      1.0
+    ]
+  ],
+  "auto_sync_enabled": true,
+  "show_preview_enabled": true,
+  "camera_mode": "performance",
+  "show_mask_overlays": true,
+  "wizard_completed": true
+}
