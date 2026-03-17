@@ -5,6 +5,7 @@ class Mask:
         self.video_path = video_path
         self.type = 'dynamic'
         self.linked_marker_count = 0
+        self.marker_anchor_points = []
 
         # New cue model: each mask has its own queue.
         self.cues = []

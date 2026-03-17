@@ -843,11 +843,14 @@ class ProjectionMappingApp(QMainWindow):
                 mask.source_points = points
                 mask.type = mask_type
                 mask.linked_marker_count = linked_marker_count
+                if linked_marker_count <= 0:
+                    mask.marker_anchor_points = []
                 self.refresh_mask_views(select_index=i)
                 return mask
         mask = Mask(name, points, None)
         mask.type = mask_type
         mask.linked_marker_count = linked_marker_count
+        mask.marker_anchor_points = []
         self.masks.append(mask)
         self.refresh_mask_views(select_index=len(self.masks) - 1)
         return mask
@@ -1283,16 +1286,21 @@ class ProjectionMappingApp(QMainWindow):
         row = self.mask_list_widget.row(current_item)
         if 0 <= row < len(self.masks):
             mask = self.masks[row]
-            if len(mask.source_points) != len(self.selected_markers):
+            marker_points = [(int(p.x()), int(p.y())) for p in self.selected_markers]
+            if len(marker_points) < 4:
                 self.statusBar().showMessage(
-                    f"Error: Mask has {len(mask.source_points)} points, but {len(self.selected_markers)} markers are selected.",
+                    "Need 4 IR markers selected to link a dynamic mask.",
                     5000,
                 )
-            else:
-                mask.linked_marker_count = len(self.selected_markers)
-                self.statusBar().showMessage(
-                    f"Mask '{mask.name}' linked to {len(self.selected_markers)} markers.", 3000
-                )
+                return
+
+            mask.linked_marker_count = len(marker_points)
+            mask.marker_anchor_points = marker_points
+            mask.type = "dynamic"
+            self.statusBar().showMessage(
+                f"Mask '{mask.name}' linked to {len(marker_points)} markers (mask points: {len(mask.source_points)}).",
+                4000,
+            )
 
     def auto_sync_marker_links(self):
         if not self.auto_sync_checkbox.isChecked() or not self.selected_markers:
@@ -1300,10 +1308,16 @@ class ProjectionMappingApp(QMainWindow):
 
         marker_count = len(self.selected_markers)
         linked = 0
+        marker_points = [(int(p.x()), int(p.y())) for p in self.selected_markers]
+        if marker_count < 4:
+            return
+
         for mask in self.masks:
-            if len(mask.source_points) == marker_count:
-                mask.linked_marker_count = marker_count
-                linked += 1
+            if mask.type != "dynamic":
+                continue
+            mask.linked_marker_count = marker_count
+            mask.marker_anchor_points = list(marker_points)
+            linked += 1
 
         if linked:
             self.statusBar().showMessage(
