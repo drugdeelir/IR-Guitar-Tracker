@@ -84,8 +84,8 @@ class MarkerSelectionDialog(QDialog):
 
         candidates = []
         frame_area = float(enhanced.shape[0] * enhanced.shape[1])
-        min_area = max(3.0, frame_area * 0.000005)
-        max_area = max(1200.0, frame_area * 0.08)
+        min_area = max(40.0, frame_area * 0.00004)
+        max_area = max(5000.0, frame_area * 0.08)
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < min_area or area > max_area:
@@ -95,6 +95,14 @@ class MarkerSelectionDialog(QDialog):
                 continue
             circularity = 4 * np.pi * area / (perimeter * perimeter)
             if circularity < 0.2:
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(contour)
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            if aspect > 1.9:
+                continue
+            (_, _), radius = cv2.minEnclosingCircle(contour)
+            if radius < 4.5:
                 continue
 
             contour_mask = np.zeros(enhanced.shape, dtype=np.uint8)
@@ -109,10 +117,16 @@ class MarkerSelectionDialog(QDialog):
                 continue
             cx = int(moments["m10"] / moments["m00"])
             cy = int(moments["m01"] / moments["m00"])
-            score = peak * 2.8 + mean_intensity * 1.0 + circularity * 90.0 + min(area, 2500.0) * 0.05
+            score = (
+                peak * 2.5
+                + mean_intensity * 1.1
+                + circularity * 120.0
+                + min(area, 5000.0) * 0.18
+                + min(radius, 40.0) * 12.0
+            )
             candidates.append((score, QPoint(cx, cy)))
 
-        return self._nms_points(candidates, min_distance=26, limit=24)
+        return self._nms_points(candidates, min_distance=34, limit=24)
 
     def _snap_to_ir_point(self, point, max_distance=40):
         if not self.detected_ir_points:
@@ -172,7 +186,7 @@ class MarkerSelectionDialog(QDialog):
         painter = QPainter(preview)
         painter.setPen(QPen(Qt.red, 5))
         for point in self.detected_ir_points:
-            painter.drawEllipse(point, 4, 4)
+            painter.drawEllipse(point, 7, 7)
         painter.setPen(QPen(Qt.green, 10))
         for i, point in enumerate(self.selected_points, start=1):
             painter.drawPoint(point)

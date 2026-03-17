@@ -1676,10 +1676,20 @@ class Worker(QObject):
                 if mask.type == "dynamic":
                     if mask.linked_marker_count != len(tracked_points):
                         continue
-                    if len(tracked_points) != len(mask.source_points):
-                        continue
+
                     src_pts = self._get_cached_source_points(mask)
-                    dst_pts = self._calculate_destination_points(tracked_points)
+                    dst_markers = self._calculate_destination_points(tracked_points)
+                    anchor_pts = np.float32(getattr(mask, "marker_anchor_points", []) or [])
+
+                    if len(anchor_pts) == len(dst_markers) and len(anchor_pts) >= 4:
+                        marker_matrix = cv2.getPerspectiveTransform(anchor_pts[:4], np.float32(dst_markers[:4]))
+                        if marker_matrix is None:
+                            continue
+                        dst_pts = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), marker_matrix).reshape(-1, 2)
+                    else:
+                        if len(tracked_points) != len(mask.source_points):
+                            continue
+                        dst_pts = dst_markers
                 else:
                     # Use bounding rect of polygon for perspective transform
                     all_x = [p[0] for p in mask.source_points]
