@@ -174,8 +174,8 @@ class MarkerSelectionDialog(QDialog):
 
         img_w = self.original_pixmap.width()
         img_h = self.original_pixmap.height()
-        img_x = int(rel_x * img_w / max(draw_w, 1))
-        img_y = int(rel_y * img_h / max(draw_h, 1))
+        img_x = max(0, min(round(rel_x * img_w / max(draw_w, 1)), img_w - 1))
+        img_y = max(0, min(round(rel_y * img_h / max(draw_h, 1)), img_h - 1))
         return QPoint(img_x, img_y)
 
     def _render_preview(self):
@@ -237,42 +237,55 @@ class VideoDisplay(QWidget):
         self.mask_creation_mode = False
         self.mask_points = []
         self.current_pixmap = None
-        self._draw_rect = None
 
     def set_image(self, image):
         self.current_pixmap = QPixmap.fromImage(image)
         self.update()
 
+    def _compute_draw_rect(self):
+        if not self.current_pixmap:
+            return None
+        pixmap_size = self.current_pixmap.size()
+        if pixmap_size.width() == 0 or pixmap_size.height() == 0:
+            return None
+        scaled = pixmap_size.scaled(self.size(), Qt.KeepAspectRatio)
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        return (x, y, scaled.width(), scaled.height())
+
     def _widget_to_image_point(self, point):
-        if not self.current_pixmap or not self._draw_rect:
+        rect = self._compute_draw_rect()
+        if not rect:
             return None
 
-        x, y, draw_w, draw_h = self._draw_rect
+        x, y, draw_w, draw_h = rect
         rel_x = point.x() - x
         rel_y = point.y() - y
         if rel_x < 0 or rel_y < 0 or rel_x > draw_w or rel_y > draw_h:
             return None
 
-        img_x = int(rel_x * self.current_pixmap.width() / max(draw_w, 1))
-        img_y = int(rel_y * self.current_pixmap.height() / max(draw_h, 1))
+        img_w = self.current_pixmap.width()
+        img_h = self.current_pixmap.height()
+        img_x = max(0, min(round(rel_x * img_w / max(draw_w, 1)), img_w - 1))
+        img_y = max(0, min(round(rel_y * img_h / max(draw_h, 1)), img_h - 1))
         return QPoint(img_x, img_y)
 
     def _image_to_widget_point(self, point):
-        if not self.current_pixmap or not self._draw_rect:
+        rect = self._compute_draw_rect()
+        if not rect:
             return None
 
-        x, y, draw_w, draw_h = self._draw_rect
+        x, y, draw_w, draw_h = rect
         widget_x = x + point.x() * draw_w / max(self.current_pixmap.width(), 1)
         widget_y = y + point.y() * draw_h / max(self.current_pixmap.height(), 1)
         return QPointF(widget_x, widget_y)
 
     def paintEvent(self, event):
-        if self.current_pixmap:
+        rect = self._compute_draw_rect()
+        if self.current_pixmap and rect:
             painter = QPainter(self)
+            x, y, draw_w, draw_h = rect
             scaled = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            self._draw_rect = (x, y, scaled.width(), scaled.height())
             painter.drawPixmap(x, y, scaled)
 
             if self.mask_creation_mode and self.mask_points:
@@ -281,8 +294,6 @@ class VideoDisplay(QWidget):
                 widget_points = [p for p in widget_points if p is not None]
                 if len(widget_points) >= 2:
                     painter.drawPolyline(QPolygonF(widget_points))
-        else:
-            self._draw_rect = None
 
     def mousePressEvent(self, event):
         if self.mask_creation_mode:
@@ -495,8 +506,8 @@ class PolygonMaskDialog(QDialog):
             return None
         img_w = self.original_pixmap.width()
         img_h = self.original_pixmap.height()
-        img_x = int(rel_x * img_w / max(draw_w, 1))
-        img_y = int(rel_y * img_h / max(draw_h, 1))
+        img_x = max(0, min(round(rel_x * img_w / max(draw_w, 1)), img_w - 1))
+        img_y = max(0, min(round(rel_y * img_h / max(draw_h, 1)), img_h - 1))
         return QPoint(img_x, img_y)
 
     def image_clicked(self, event):
