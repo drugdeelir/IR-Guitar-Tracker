@@ -1,0 +1,36 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Debug images (generated during calibration)
+diff_image.png
+diff_debug.png
+projector_mask.png
+adaptive_thresh.png
+edges.png
+combined_detection.png
+silhouette.png
+ratio_image.png
+dark_ref.png
+illum_ref.png
+calibration_debug.png
+proj_scan_debug.png
+proj_scan_all_blobs.png
+proj_scan_binary.png
+mask_verification.png
+
+# Logs
+app.log
+output.log
+stagerig_output.log
+
+# User-specific
+.DS_Store

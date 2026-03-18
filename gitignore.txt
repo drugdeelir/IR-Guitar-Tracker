@@ -1,9 +1,0 @@
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# User-specific
-.DS_Store

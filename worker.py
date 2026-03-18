@@ -1,4 +1,5 @@
 import time
+import threading
 from itertools import combinations
 import os
 import logging
@@ -22,6 +23,7 @@ class Worker(QObject):
     performance_updated = pyqtSignal(float, float, float, float, float, float)
     camera_info_updated = pyqtSignal(str)
     markers_calibrated = pyqtSignal(list)  # emits list of (x,y) marker positions
+    calibration_failed = pyqtSignal(str)   # emits failure reason
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,6 +31,7 @@ class Worker(QObject):
         self.video_source = 0
         self.warp_points = [[0, 0], [1, 0], [1, 1], [0, 1]]
         self.masks = []
+        self._masks_lock = threading.Lock()
         self.video_captures = {}
         self.ir_threshold = 215
         self.threshold_mode = "auto"
@@ -89,6 +92,8 @@ class Worker(QObject):
         # Post-calibration local tracking: search near known positions
         self._calibrated_positions = None  # list of (x,y) marker centers
         self._local_search_radius = 50    # pixels around each marker to search
+        self._marker_freshness = []       # frames since each marker was last freshly detected
+        self._marker_stale_threshold = 30  # frames before a marker is considered stale (~1 sec at 30fps)
 
         self._projector_output_buffer = None
         self._mask_buffer = None
@@ -106,6 +111,9 @@ class Worker(QObject):
         self._proj_resolution = (1920, 1080)  # projector native resolution
         self._pending_markers = None  # markers stored during detect, emitted after proj_scan
         self._guitar_polygon = None   # actual guitar polygon in camera pixel coords (list of (x,y) tuples)
+        self._calib_retry_count = 0     # number of consecutive calibration failures
+        self._calib_max_retries = 3     # auto-retry limit before signaling failure
+        self._debug_images = False       # gate debug image writes (toggle from UI)
 
         # Actual camera frame dimensions (set once camera starts)
         self.frame_width = 0
@@ -203,6 +211,7 @@ class Worker(QObject):
         self._calibrated = False
         self._calib_phase = "dark"
         self._calib_frame_count = 0
+        self._calib_retry_count = 0
         self._calib_dark_frames = []
         self._calib_dark_ref = None
         self._calib_illum_frames = []
@@ -215,30 +224,39 @@ class Worker(QObject):
     def _lock_camera_exposure(self, cap):
         """Lock camera exposure at a moderate level for calibration.
         Uses a brightness that can see projector illumination while still being
-        consistent between dark and illuminate phases."""
+        consistent between dark and illuminate phases.
+        Best-effort: if the camera/backend doesn't support manual exposure,
+        logs a warning and continues (auto-exposure is suboptimal but not fatal)."""
         if cap is None:
             return
-        # Read current auto-exposure value
-        current_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
-        # Set manual exposure mode
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # manual mode
-        # Use a brighter exposure than dark-room auto (-6 is too dark)
-        # -4 is a good middle ground: dim enough for dark ref but bright enough
-        # to see projector illumination and marker responses
-        target_exp = max(current_exp + 2, -4.0)  # at least 2 stops brighter, at least -4
-        cap.set(cv2.CAP_PROP_EXPOSURE, target_exp)
-        actual_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
-        self._exposure_locked = True
-        self.logger.info("Camera exposure locked: was=%s, target=%s, actual=%s",
-                         current_exp, target_exp, actual_exp)
+        try:
+            current_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+            # 0.25 = manual mode (DSHOW), 1 = manual mode (MSMF)
+            if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25):
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            target_exp = max(current_exp + 2, -4.0)
+            cap.set(cv2.CAP_PROP_EXPOSURE, target_exp)
+            actual_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+            self._exposure_locked = True
+            self.logger.info("Camera exposure locked: was=%s, target=%s, actual=%s",
+                             current_exp, target_exp, actual_exp)
+        except Exception:
+            self.logger.warning("Could not lock camera exposure (unsupported by backend); "
+                                "continuing with auto-exposure")
+            self._exposure_locked = False
 
     def _unlock_camera_exposure(self, cap):
         """Restore camera auto-exposure after calibration."""
         if cap is None:
             return
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # auto
-        self._exposure_locked = False
-        self.logger.info("Camera exposure unlocked (auto-exposure restored)")
+        try:
+            # 0.75 = auto mode (DSHOW), 3 = auto mode (MSMF)
+            if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75):
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+            self._exposure_locked = False
+            self.logger.info("Camera exposure unlocked (auto-exposure restored)")
+        except Exception:
+            self.logger.warning("Could not restore auto-exposure; may need manual camera reset")
 
     def _ensure_buffers(self, h, w):
         if self._buffer_shape == (h, w):
@@ -370,8 +388,11 @@ class Worker(QObject):
 
         radius = self._local_search_radius
         result = []
+        # Ensure freshness array is the right size
+        if len(self._marker_freshness) != len(search_centers):
+            self._marker_freshness = [0] * len(search_centers)
 
-        for cx, cy in search_centers:
+        for idx, (cx, cy) in enumerate(search_centers):
             # Extract local ROI around expected marker position
             x1 = max(0, cx - radius)
             x2 = min(frame_w, cx + radius)
@@ -380,12 +401,14 @@ class Worker(QObject):
 
             roi_gray = gray[y1:y2, x1:x2]
             if roi_gray.size == 0:
+                self._marker_freshness[idx] += 1
                 result.append((cx, cy))  # keep previous position
                 continue
 
             # Find the brightest blob in this local region
             peak_val = float(roi_gray.max())
             if peak_val < 120:
+                self._marker_freshness[idx] += 1
                 result.append((cx, cy))  # no bright blob found, hold position
                 continue
 
@@ -395,6 +418,7 @@ class Worker(QObject):
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             if not contours:
+                self._marker_freshness[idx] += 1
                 result.append((cx, cy))
                 continue
 
@@ -415,6 +439,7 @@ class Worker(QObject):
                     best_contour = cnt
 
             if best_contour is None:
+                self._marker_freshness[idx] += 1
                 result.append((cx, cy))
                 continue
 
@@ -438,9 +463,11 @@ class Worker(QObject):
 
             if avg_sat > 80:
                 # Likely a projector reflection, not IR marker — hold position
+                self._marker_freshness[idx] += 1
                 result.append((cx, cy))
                 continue
 
+            self._marker_freshness[idx] = 0  # freshly detected
             result.append((int(round(wcx)), int(round(wcy))))
 
         self._auto_thresh_info = f"local_search r={radius} found={len(result)}"
@@ -587,7 +614,8 @@ class Worker(QObject):
         # --- Step 1: Compute diff to find projector coverage area ---
         diff = np.clip(illum.astype(np.float32) - dark.astype(np.float32), 0, 255).astype(np.uint8)
         diff_blurred = cv2.GaussianBlur(diff, (15, 15), 0)
-        cv2.imwrite(_os.path.join(_base, "diff_image.png"), diff)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "diff_image.png"), diff)
 
         # Projector mask: areas significantly brighter with projector on
         diff_mean = float(diff_blurred.mean())
@@ -598,7 +626,8 @@ class Worker(QObject):
         kernel = np.ones((15, 15), np.uint8)
         proj_mask = cv2.morphologyEx(proj_mask, cv2.MORPH_OPEN, kernel)
         proj_mask = cv2.morphologyEx(proj_mask, cv2.MORPH_CLOSE, kernel)
-        cv2.imwrite(_os.path.join(_base, "projector_mask.png"), proj_mask)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "projector_mask.png"), proj_mask)
 
         proj_area = int(np.count_nonzero(proj_mask))
         self.logger.info("Projector coverage: %.0f%% of frame, thresh=%d",
@@ -682,14 +711,16 @@ class Worker(QObject):
         adapt_kernel = np.ones((5, 5), np.uint8)
         adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE, adapt_kernel)
         adapt = cv2.morphologyEx(adapt, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        cv2.imwrite(_os.path.join(_base, "adaptive_thresh.png"), adapt)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "adaptive_thresh.png"), adapt)
 
         # Method 2: Canny edge detection on illuminated frame
         edges = cv2.Canny(illum_blurred, 30, 80)
         edges[proj_mask == 0] = 0
         edge_dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
         edge_closed = cv2.morphologyEx(edge_dilated, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        cv2.imwrite(_os.path.join(_base, "edges.png"), edges)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "edges.png"), edges)
 
         # Also use ratio-based detection at a moderate threshold
         ratio_thresh = ratio_median * 0.75  # moderate: things below 75% of median ratio
@@ -703,7 +734,8 @@ class Worker(QObject):
         combined = cv2.bitwise_and(adapt, ratio_sil)
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        cv2.imwrite(_os.path.join(_base, "combined_detection.png"), combined)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "combined_detection.png"), combined)
 
         # Try each detection method: combined first, then adaptive, then ratio alone
         detection_methods = [
@@ -778,11 +810,13 @@ class Worker(QObject):
         sil_kernel = np.ones((7, 7), np.uint8)
         silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE, sil_kernel)
         silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        cv2.imwrite(_os.path.join(_base, "silhouette.png"), silhouette)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "silhouette.png"), silhouette)
 
         # Also save the ratio image for debugging
         ratio_vis = np.clip(ratio * 50, 0, 255).astype(np.uint8)  # scale for visibility
-        cv2.imwrite(_os.path.join(_base, "ratio_image.png"), ratio_vis)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "ratio_image.png"), ratio_vis)
 
         # Collect ALL contours at this threshold for body-merging later
         contours_final, _ = cv2.findContours(silhouette, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -926,7 +960,8 @@ class Worker(QObject):
             cv2.circle(debug, (mx, my), 8, (0, 0, 255), -1)
             cv2.putText(debug, f"{labels[i]} ({mx},{my})",
                         (mx + 12, my - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-        cv2.imwrite(_os.path.join(_base, "diff_debug.png"), debug)
+        if self._debug_images:
+            cv2.imwrite(_os.path.join(_base, "diff_debug.png"), debug)
 
         return markers
 
@@ -1320,9 +1355,10 @@ class Worker(QObject):
                         self._calib_dark_ref = np.mean(
                             self._calib_dark_frames, axis=0
                         ).astype(np.uint8)
-                        import os as _os
-                        _base = _os.path.dirname(_os.path.abspath(__file__))
-                        cv2.imwrite(_os.path.join(_base, "dark_ref.png"), self._calib_dark_ref)
+                        if self._debug_images:
+                            import os as _os
+                            _base = _os.path.dirname(_os.path.abspath(__file__))
+                            cv2.imwrite(_os.path.join(_base, "dark_ref.png"), self._calib_dark_ref)
                     self._calib_dark_frames = []  # free memory
                     self._calib_phase = "illuminate"
                     self._calib_frame_count = 0
@@ -1355,9 +1391,10 @@ class Worker(QObject):
                         self._calib_illum_ref = np.mean(
                             self._calib_illum_frames, axis=0
                         ).astype(np.uint8)
-                        import os as _os
-                        _base = _os.path.dirname(_os.path.abspath(__file__))
-                        cv2.imwrite(_os.path.join(_base, "illum_ref.png"), self._calib_illum_ref)
+                        if self._debug_images:
+                            import os as _os
+                            _base = _os.path.dirname(_os.path.abspath(__file__))
+                            cv2.imwrite(_os.path.join(_base, "illum_ref.png"), self._calib_illum_ref)
                     self._calib_illum_frames = []  # free memory
                     self._calib_phase = "detect"
                     self._calib_frame_count = 0
@@ -1399,31 +1436,46 @@ class Worker(QObject):
                         markers, [f"{d:.1f}" for d in self._marker_distances]
                     )
                     # Save debug image
-                    debug_frame = main_frame.copy()
-                    for mi, (mx, my) in enumerate(markers):
-                        cv2.circle(debug_frame, (mx, my), 15, (0, 0, 255), 3)
-                        cv2.putText(debug_frame, f"M{mi} ({mx},{my})",
-                                    (mx + 18, my - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                    cv2.putText(debug_frame,
-                                f"Calibrated {len(markers)} markers from diff image",
-                                (10, debug_frame.shape[0] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    _base_d = os.path.dirname(os.path.abspath(__file__))
-                    cv2.imwrite(os.path.join(_base_d, "calibration_debug.png"), debug_frame)
+                    if self._debug_images:
+                        debug_frame = main_frame.copy()
+                        for mi, (mx, my) in enumerate(markers):
+                            cv2.circle(debug_frame, (mx, my), 15, (0, 0, 255), 3)
+                            cv2.putText(debug_frame, f"M{mi} ({mx},{my})",
+                                        (mx + 18, my - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                        cv2.putText(debug_frame,
+                                    f"Calibrated {len(markers)} markers from diff image",
+                                    (10, debug_frame.shape[0] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        _base_d = os.path.dirname(os.path.abspath(__file__))
+                        cv2.imwrite(os.path.join(_base_d, "calibration_debug.png"), debug_frame)
                     # Next phase: project 4 corner dots to compute camera→projector homography
                     self._calib_phase = "proj_scan"
                     self._calib_frame_count = 0
                 else:
+                    self._calib_retry_count += 1
+                    found = len(markers) if markers else 0
                     self.logger.warning(
-                        "Calibration failed: found %d markers (need %d). Restarting...",
-                        len(markers) if markers else 0, self.expected_marker_count
+                        "Calibration failed: found %d markers (need %d). Attempt %d/%d",
+                        found, self.expected_marker_count,
+                        self._calib_retry_count, self._calib_max_retries
                     )
-                    self._calib_phase = "dark"
-                    self._calib_frame_count = 0
-                    self._calib_dark_ref = None
-                    self._calib_illum_ref = None
-                    self._blob_history = []
+                    if self._calib_retry_count >= self._calib_max_retries:
+                        reason = (
+                            f"Could not detect {self.expected_marker_count} markers "
+                            f"after {self._calib_max_retries} attempts "
+                            f"(found {found}). Check IR marker visibility and lighting."
+                        )
+                        self.logger.error("Calibration aborted: %s", reason)
+                        self._calib_phase = "idle"
+                        self._calib_retry_count = 0
+                        self.calibration_failed.emit(reason)
+                    else:
+                        self._calib_phase = "dark"
+                        self._calib_frame_count = 0
+                        self._calib_dark_ref = None
+                        self._calib_illum_ref = None
+                        self._blob_history = []
                 continue
 
             # Phase 4: PROJ_SCAN - project 4 corner dots, detect in camera, compute homography
@@ -1507,7 +1559,8 @@ class Worker(QObject):
                                 cv2.circle(dbg, (int(cx_d), int(cy_d)), 10, (0, 0, 255), -1)
                                 cv2.putText(dbg, labels[i_d], (int(cx_d) + 12, int(cy_d)),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                            cv2.imwrite(os.path.join(_base_ps, "proj_scan_debug.png"), dbg)
+                            if self._debug_images:
+                                cv2.imwrite(os.path.join(_base_ps, "proj_scan_debug.png"), dbg)
                         else:
                             self.logger.warning("findHomography returned None")
                     else:
@@ -1536,21 +1589,22 @@ class Worker(QObject):
                                 rx, ry, rw, rh, proj_w, proj_h
                             )
 
-                    # Always save debug image so we can see what the camera saw
-                    _base_ps2 = os.path.dirname(os.path.abspath(__file__))
-                    dbg2 = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
-                    cv2.putText(dbg2, f"Proj scan: {len(blobs)} blobs found (need 4), thresh={int(thresh_val)}, max={int(diff_max)}",
-                                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-                    for bi, (ba, bx_d, by_d) in enumerate(blobs[:8]):
-                        cv2.circle(dbg2, (int(bx_d), int(by_d)), 8, (0, 255, 0), 2)
-                        cv2.putText(dbg2, f"#{bi} a={int(ba)}", (int(bx_d) + 10, int(by_d)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-                    cv2.imwrite(os.path.join(_base_ps2, "proj_scan_all_blobs.png"), dbg2)
-                    cv2.imwrite(os.path.join(_base_ps2, "proj_scan_binary.png"), binary)
+                    if self._debug_images:
+                        _base_ps2 = os.path.dirname(os.path.abspath(__file__))
+                        dbg2 = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
+                        cv2.putText(dbg2, f"Proj scan: {len(blobs)} blobs found (need 4), thresh={int(thresh_val)}, max={int(diff_max)}",
+                                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                        for bi, (ba, bx_d, by_d) in enumerate(blobs[:8]):
+                            cv2.circle(dbg2, (int(bx_d), int(by_d)), 8, (0, 255, 0), 2)
+                            cv2.putText(dbg2, f"#{bi} a={int(ba)}", (int(bx_d) + 10, int(by_d)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+                        cv2.imwrite(os.path.join(_base_ps2, "proj_scan_all_blobs.png"), dbg2)
+                        cv2.imwrite(os.path.join(_base_ps2, "proj_scan_binary.png"), binary)
 
                     # Finalize calibration (with or without homography)
                     markers = self._pending_markers
                     self._calibrated = True
+                    self._marker_freshness = [0] * len(markers)
                     self.logger.info(
                         "Calibration complete. %d markers, homography=%s",
                         len(markers), "YES" if self._cam_to_proj_H is not None else "NO"
@@ -1584,7 +1638,12 @@ class Worker(QObject):
             tracked_points = self._stabilize_tracked_points(tracked_points)
             match_ms = (time.perf_counter() - t0) * 1000.0
 
-            self.trackers_detected.emit(len(tracked_points))
+            # Report only fresh (non-stale) markers
+            fresh_count = sum(
+                1 for f in self._marker_freshness
+                if f < self._marker_stale_threshold
+            ) if self._marker_freshness else len(tracked_points)
+            self.trackers_detected.emit(fresh_count)
 
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
                 self._calibration_distances.append(
@@ -1608,7 +1667,9 @@ class Worker(QObject):
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             if self.show_mask_overlays:
-                for mask in self.masks:
+                with self._masks_lock:
+                    _overlay_masks = list(self.masks)
+                for mask in _overlay_masks:
                     if not mask.source_points:
                         continue
                     pts = np.array(mask.source_points, dtype=np.int32).reshape((-1, 1, 2))
@@ -1624,7 +1685,9 @@ class Worker(QObject):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             t0 = time.perf_counter()
-            for i, mask in enumerate(self.masks):
+            with self._masks_lock:
+                _render_masks = list(self.masks)
+            for i, mask in enumerate(_render_masks):
                 if not self._calibrated:
                     break  # skip video compositing during calibration
                 if self.active_cue_index >= 0 and i != self.active_cue_index:
@@ -1832,9 +1895,10 @@ class Worker(QObject):
         self.warp_points = points
 
     def set_masks(self, masks):
-        self.masks = masks
+        with self._masks_lock:
+            self.masks = masks
         current_cues = set()
-        for mask in self.masks:
+        for mask in masks:
             if getattr(mask, "cues", None):
                 current_cues.update([c for c in mask.cues if c])
             elif mask.video_path:

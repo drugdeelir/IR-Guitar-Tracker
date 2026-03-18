@@ -112,14 +112,18 @@ class StartupWizardDialog(QDialog):
         layout.addWidget(buttons)
 
 def _get_camera_backends(include_fallback_any=False):
+    """Return camera backends in the same order Worker uses for consistency.
+    Probing with a different backend than capture can cause cameras to be
+    detected during setup but fail to open in the worker."""
     is_windows = platform.system().lower() == "windows"
     if not is_windows:
         return [cv2.CAP_ANY]
 
-    # Prefer DirectShow while probing to reduce noisy backend warnings.
-    preferred = ["CAP_DSHOW"]
-    if include_fallback_any:
-        preferred.append("CAP_ANY")
+    # Must match worker.py _camera_backends() order: MSMF → ANY → DSHOW
+    preferred = ["CAP_MSMF", "CAP_ANY", "CAP_DSHOW"]
+    if not include_fallback_any:
+        # For probing, try all backends to find every camera
+        pass
 
     backends = []
     for name in preferred:
@@ -218,6 +222,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.performance_updated.connect(self.update_performance_label)
         self.worker.camera_info_updated.connect(self.update_camera_info)
         self.worker.markers_calibrated.connect(self._on_markers_calibrated)
+        self.worker.calibration_failed.connect(self._on_calibration_failed)
 
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.marker_selection_dialog.take_picture_button.clicked.connect(
@@ -451,6 +456,11 @@ class ProjectionMappingApp(QMainWindow):
         self.calibrate_button.clicked.connect(self._start_calibration)
         self.control_layout.addWidget(self.calibrate_button)
 
+        self.debug_images_checkbox = QCheckBox("Save debug images during calibration")
+        self.debug_images_checkbox.setChecked(False)
+        self.debug_images_checkbox.toggled.connect(self._toggle_debug_images)
+        self.control_layout.addWidget(self.debug_images_checkbox)
+
         self.mapping_tabs = QTabWidget()
 
         # Page 1: Masks
@@ -549,6 +559,10 @@ class ProjectionMappingApp(QMainWindow):
         self.control_layout.addWidget(self.mapping_tabs)
 
         self.midi_inport = None
+        self._midi_last_port_name = None   # for auto-reconnect
+        self._midi_reconnect_timer = QTimer(self)
+        self._midi_reconnect_timer.timeout.connect(self._try_midi_reconnect)
+        self._midi_reconnect_timer.setInterval(5000)  # retry every 5 seconds
         self.midi_poll_timer = QTimer(self)
         self.midi_poll_timer.timeout.connect(self.poll_midi_messages)
         self.midi_poll_timer.start(20)
@@ -910,8 +924,9 @@ class ProjectionMappingApp(QMainWindow):
             return
 
         # Use actual camera resolution from worker (set once frames start)
-        cam_w = self.worker.frame_width or getattr(self, '_cam_w', 640)
-        cam_h = self.worker.frame_height or getattr(self, '_cam_h', 480)
+        # Default to 960x540 (performance mode) rather than 640x480
+        cam_w = self.worker.frame_width or getattr(self, '_cam_w', 960)
+        cam_h = self.worker.frame_height or getattr(self, '_cam_h', 540)
         self._cam_w = cam_w
         self._cam_h = cam_h
 
@@ -962,6 +977,14 @@ class ProjectionMappingApp(QMainWindow):
             len(guitar_points), cam_w, cam_h
         )
 
+    def _on_calibration_failed(self, reason):
+        """Called when calibration fails after max retries."""
+        self.logger.warning("Calibration failed: %s", reason)
+        if hasattr(self, 'calibrate_button'):
+            self.calibrate_button.setEnabled(True)
+            self.calibrate_button.setText("Calibrate Guitar + Homography")
+        self.statusBar().showMessage(f"Calibration failed: {reason}", 8000)
+
     def _save_mask_verification(self, guitar_points, cam_w, cam_h):
         """Save a debug image showing the camera frame with mask polygons overlaid."""
         import os as _os
@@ -1007,6 +1030,9 @@ class ProjectionMappingApp(QMainWindow):
                 self.logger.info("Background mask updated to %dx%d", cam_w, cam_h)
                 break
 
+    def _toggle_debug_images(self, checked):
+        self.worker._debug_images = checked
+
     def _start_calibration(self):
         """Trigger guitar detection + homography calibration sequence."""
         self.logger.info("User triggered calibration")
@@ -1020,6 +1046,9 @@ class ProjectionMappingApp(QMainWindow):
             self.run_full_calibration_wizard()
         except Exception:
             self.logger.exception("Calibration wizard crashed")
+            if hasattr(self, 'calibrate_button'):
+                self.calibrate_button.setEnabled(True)
+                self.calibrate_button.setText("Calibrate Guitar + Homography")
             QMessageBox.critical(
                 self,
                 "Calibration Error",
@@ -1425,10 +1454,16 @@ class ProjectionMappingApp(QMainWindow):
     def refresh_midi_inputs(self):
         self.midi_input_combo.clear()
         if mido is None:
-            self.midi_input_combo.addItem("mido not installed")
+            self.midi_input_combo.addItem("Install mido for MIDI support")
             self.midi_input_combo.setEnabled(False)
             return
-        names = mido.get_input_names()
+        try:
+            names = mido.get_input_names()
+        except Exception as exc:
+            self.logger.warning("MIDI backend unavailable: %s", exc)
+            self.midi_input_combo.addItem("MIDI backend unavailable (install python-rtmidi)")
+            self.midi_input_combo.setEnabled(False)
+            return
         if not names:
             self.midi_input_combo.addItem("No MIDI input ports")
             self.midi_input_combo.setEnabled(False)
@@ -1446,9 +1481,12 @@ class ProjectionMappingApp(QMainWindow):
         name = self.midi_input_combo.currentText()
         try:
             self.midi_inport = mido.open_input(name)
-            self.statusBar().showMessage(f"Connected MIDI input: {name}", 3000)
+            self._midi_last_port_name = name
+            self._midi_reconnect_timer.stop()
+            self.statusBar().showMessage(f"MIDI connected: {name}", 3000)
+            self.logger.info("MIDI connected: %s", name)
         except Exception as exc:
-            self.logger.exception("Failed to open MIDI input")
+            self.logger.warning("Failed to open MIDI input: %s", exc)
             self.statusBar().showMessage(f"MIDI connect failed: {exc}", 5000)
 
     def poll_midi_messages(self):
@@ -1459,7 +1497,26 @@ class ProjectionMappingApp(QMainWindow):
                 if msg.type == "control_change":
                     self.route_midi_cc(int(msg.control), int(msg.value))
         except Exception:
-            self.logger.exception("MIDI polling error")
+            self.logger.warning("MIDI connection lost, starting auto-reconnect")
+            self.midi_inport = None
+            if self._midi_last_port_name:
+                self._midi_reconnect_timer.start()
+                self.statusBar().showMessage("MIDI disconnected — reconnecting...", 5000)
+
+    def _try_midi_reconnect(self):
+        """Auto-reconnect to last MIDI port."""
+        if mido is None or not self._midi_last_port_name:
+            self._midi_reconnect_timer.stop()
+            return
+        try:
+            self.midi_inport = mido.open_input(self._midi_last_port_name)
+            self._midi_reconnect_timer.stop()
+            self.statusBar().showMessage(
+                f"MIDI reconnected: {self._midi_last_port_name}", 3000
+            )
+            self.logger.info("MIDI auto-reconnected: %s", self._midi_last_port_name)
+        except Exception:
+            pass  # will retry on next timer tick
 
     def route_midi_cc(self, cc, value):
         if value <= 0:
