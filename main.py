@@ -260,6 +260,15 @@ class ProjectionMappingApp(QMainWindow):
             "camera_mode": self.camera_mode_combo.currentData(),
             "show_mask_overlays": self.show_mask_overlays_checkbox.isChecked(),
             "wizard_completed": True,
+            # Stage-ready marker tracking settings
+            "marker_min_area": self.worker._marker_min_area,
+            "marker_max_area": self.worker._marker_max_area,
+            "marker_min_circularity": self.worker._marker_min_circularity,
+            "marker_max_aspect_ratio": self.worker._marker_max_aspect_ratio,
+            "jitter_deadzone": self.worker._jitter_deadzone,
+            "max_marker_velocity": self.worker._max_marker_velocity,
+            "local_search_radius": self.worker._local_search_radius_base,
+            "sat_reject_threshold": self.worker._sat_reject_threshold,
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
@@ -283,6 +292,27 @@ class ProjectionMappingApp(QMainWindow):
             self.camera_mode_combo.setCurrentIndex(mode_index)
 
         self.worker.set_show_mask_overlays(self.show_mask_overlays_checkbox.isChecked())
+
+        # Apply stage-ready marker tracking settings
+        if "marker_min_area" in self.settings:
+            self.worker._marker_min_area = self.settings["marker_min_area"]
+        if "marker_max_area" in self.settings:
+            self.worker._marker_max_area = self.settings["marker_max_area"]
+        if "marker_min_circularity" in self.settings:
+            self.worker._marker_min_circularity = self.settings["marker_min_circularity"]
+        if "marker_max_aspect_ratio" in self.settings:
+            self.worker._marker_max_aspect_ratio = self.settings["marker_max_aspect_ratio"]
+        if "jitter_deadzone" in self.settings:
+            self.worker._jitter_deadzone = self.settings["jitter_deadzone"]
+        if "max_marker_velocity" in self.settings:
+            self.worker._max_marker_velocity = self.settings["max_marker_velocity"]
+        if "local_search_radius" in self.settings:
+            self.worker._local_search_radius_base = self.settings["local_search_radius"]
+            self.worker._local_search_radius = self.settings["local_search_radius"]
+        if "sat_reject_threshold" in self.settings:
+            self.worker._sat_reject_threshold = self.settings["sat_reject_threshold"]
+        # Rebuild blob detector with updated size/shape settings
+        self.worker._blob_detector = self.worker._create_blob_detector()
 
         cam_idx = self.settings.get("camera_index", 0)
         if self.camera_combo.count() and self.camera_combo.isEnabled():

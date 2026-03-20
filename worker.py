@@ -58,13 +58,22 @@ class Worker(QObject):
         self.max_lost_tracking_frames = 15
         self.expected_marker_count = 4  # number of IR markers on the guitar
 
+        # --- Marker size constraints (stage-ready) ---
+        # Expected marker area range in pixels (at 960x540).
+        # Markers outside this range are rejected as noise or stage lights.
+        self._marker_min_area = 20      # minimum blob area (px^2)
+        self._marker_max_area = 8000    # maximum blob area (px^2) — large stage lights rejected
+        self._marker_min_circularity = 0.3   # reject elongated blobs (stage light streaks)
+        self._marker_max_aspect_ratio = 3.0  # reject blobs wider/taller than 3:1
+        self._marker_size_consistency_tol = 3.0  # max ratio between largest and smallest marker
+
         # Kalman filters: one per marker point for ultra-smooth tracking
         self._kalman_filters = []  # list of cv2.KalmanFilter objects
         self._kalman_initialized = False
 
         # Temporal blob tracking: keep history of blob positions across frames
         # Only report blobs that are consistently present
-        self._blob_history = []       # list of (cx, cy, peak, age, hit_count)
+        self._blob_history = []       # list of (cx, cy, peak, age, hit_count, area)
         self._blob_history_radius = 40  # px radius to match blobs across frames
         self._blob_min_hits = 8        # min frames present before reporting (more strict)
         self._blob_max_age = 15        # max frames a blob survives without a hit
@@ -92,8 +101,55 @@ class Worker(QObject):
         # Post-calibration local tracking: search near known positions
         self._calibrated_positions = None  # list of (x,y) marker centers
         self._local_search_radius = 50    # pixels around each marker to search
+        self._local_search_radius_base = 50  # base radius (grows dynamically)
         self._marker_freshness = []       # frames since each marker was last freshly detected
         self._marker_stale_threshold = 30  # frames before a marker is considered stale (~1 sec at 30fps)
+
+        # --- Stage-ready improvements ---
+        # Max marker velocity (px/frame) — reject teleporting detections
+        self._max_marker_velocity = 80    # pixels per frame max movement
+        self._marker_velocities = []      # estimated velocity per marker (px/frame)
+
+        # Jitter dead zone: ignore sub-pixel jitter when guitar is stationary
+        self._jitter_deadzone = 2.0       # pixels — movements smaller than this are suppressed
+
+        # Marker lost/found hysteresis: require N consecutive finds before accepting
+        self._marker_found_streak = []    # consecutive frames each marker was found
+        self._marker_found_threshold = 3  # need this many consecutive finds to accept
+
+        # Occlusion prediction: how many frames to predict forward when marker hidden
+        self._max_occlusion_predict = 20  # frames (~0.67s at 30fps)
+
+        # Global re-detection fallback: if local search fails for N frames, go global
+        self._local_fail_count = 0
+        self._local_fail_threshold = 10   # frames before falling back to global search
+
+        # Ambient light baseline: rolling average of scene brightness
+        self._ambient_brightness = None   # rolling mean brightness
+        self._ambient_alpha = 0.02        # EMA update rate for ambient tracking
+
+        # Adaptive saturation threshold for stage light rejection
+        self._sat_reject_threshold = 80   # base value, adapts over time
+        self._sat_history = []            # recent saturation readings for adaptation
+
+        # Calibration quality score (0-100)
+        self._calibration_quality = 0.0
+
+        # Auto-recalibration: trigger when tracking quality degrades
+        self._tracking_quality_history = []  # recent quality scores
+        self._recalib_quality_threshold = 30  # trigger recalib below this
+
+        # Rolling dark reference update for gradual lighting changes
+        self._dark_ref_update_alpha = 0.005  # very slow update to dark reference
+        self._dark_ref_update_enabled = True
+
+        # Projector flicker rejection: detect sudden full-frame brightness changes
+        self._prev_frame_brightness = None
+        self._flicker_threshold = 40  # brightness change per frame to consider flicker
+
+        # Adaptive frame skipping under load
+        self._skip_frame_counter = 0
+        self._skip_frame_interval = 0  # 0 = no skipping, 1 = skip every other, etc.
 
         self._projector_output_buffer = None
         self._mask_buffer = None
@@ -265,20 +321,21 @@ class Worker(QObject):
         self._mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
         self._buffer_shape = (h, w)
 
-    @staticmethod
-    def _create_blob_detector():
-        """Create a SimpleBlobDetector tuned for large bright IR markers."""
+    def _create_blob_detector(self):
+        """Create a SimpleBlobDetector tuned for IR markers with size/shape filtering."""
         params = cv2.SimpleBlobDetector_Params()
         params.blobColor = 0
         params.minThreshold = 10
         params.maxThreshold = 255
         params.thresholdStep = 5
         params.filterByArea = True
-        params.minArea = 30  # IR markers should be larger, but keep low for distance
-        params.maxArea = 200000
-        params.filterByCircularity = False
+        params.minArea = getattr(self, '_marker_min_area', 20)
+        params.maxArea = getattr(self, '_marker_max_area', 8000)
+        params.filterByCircularity = True
+        params.minCircularity = getattr(self, '_marker_min_circularity', 0.3)
         params.filterByConvexity = False
-        params.filterByInertia = False
+        params.filterByInertia = True
+        params.minInertiaRatio = 0.2  # reject very elongated blobs (light streaks)
         params.minDistBetweenBlobs = 8
         params.minRepeatability = 2
         return cv2.SimpleBlobDetector_create(params)
@@ -318,30 +375,39 @@ class Worker(QObject):
         return wcx, wcy, peak
 
     def _update_blob_history(self, new_blobs):
-        """Update temporal blob tracking. new_blobs = list of (cx, cy, score).
-        Returns list of (cx, cy) for blobs that have been stable for enough frames."""
+        """Update temporal blob tracking. new_blobs = list of (cx, cy, score, area).
+        Returns list of (score, cx, cy) for blobs that have been stable for enough frames."""
+        # Adaptive radius based on frame resolution
+        if self.frame_width > 0:
+            self._blob_history_radius = max(30, int(self.frame_width * 0.04))
         radius = self._blob_history_radius
         matched_history = [False] * len(self._blob_history)
         matched_new = [False] * len(new_blobs)
 
         # Match new blobs to existing history entries
-        for ni, (ncx, ncy, nscore) in enumerate(new_blobs):
+        for ni, blob_data in enumerate(new_blobs):
+            ncx, ncy, nscore = blob_data[0], blob_data[1], blob_data[2]
+            narea = blob_data[3] if len(blob_data) > 3 else 0
             best_hi = -1
             best_dist = radius
-            for hi, (hcx, hcy, hpeak, hage, hhits) in enumerate(self._blob_history):
+            for hi, entry in enumerate(self._blob_history):
                 if matched_history[hi]:
                     continue
+                hcx, hcy = entry[0], entry[1]
                 d = ((ncx - hcx) ** 2 + (ncy - hcy) ** 2) ** 0.5
                 if d < best_dist:
                     best_dist = d
                     best_hi = hi
             if best_hi >= 0:
                 # Update existing history entry with smoothed position
-                hcx, hcy, hpeak, hage, hhits = self._blob_history[best_hi]
+                entry = self._blob_history[best_hi]
+                hcx, hcy, hpeak, hage, hhits = entry[0], entry[1], entry[2], entry[3], entry[4]
+                harea = entry[5] if len(entry) > 5 else narea
                 alpha = 0.15  # moderate smoothing on history — Kalman handles the rest
                 new_hcx = hcx * (1 - alpha) + ncx * alpha
                 new_hcy = hcy * (1 - alpha) + ncy * alpha
-                self._blob_history[best_hi] = (new_hcx, new_hcy, nscore, 0, hhits + 1)
+                new_area = harea * (1 - alpha) + narea * alpha
+                self._blob_history[best_hi] = (new_hcx, new_hcy, nscore, 0, hhits + 1, new_area)
                 matched_history[best_hi] = True
                 matched_new[ni] = True
 
@@ -349,24 +415,29 @@ class Worker(QObject):
         original_len = len(matched_history)
         updated = []
         for hi in range(original_len):
-            hcx, hcy, hpeak, hage, hhits = self._blob_history[hi]
+            entry = self._blob_history[hi]
+            hcx, hcy, hpeak, hage, hhits = entry[0], entry[1], entry[2], entry[3], entry[4]
+            harea = entry[5] if len(entry) > 5 else 0
             if not matched_history[hi]:
                 hage += 1
                 if hage > self._blob_max_age:
                     continue  # remove stale blob
-                self._blob_history[hi] = (hcx, hcy, hpeak, hage, hhits)
+                self._blob_history[hi] = (hcx, hcy, hpeak, hage, hhits, harea)
             updated.append(self._blob_history[hi])
 
         # Add unmatched new blobs to history
-        for ni, (ncx, ncy, nscore) in enumerate(new_blobs):
+        for ni, blob_data in enumerate(new_blobs):
             if not matched_new[ni]:
-                updated.append((ncx, ncy, nscore, 0, 1))
+                ncx, ncy, nscore = blob_data[0], blob_data[1], blob_data[2]
+                narea = blob_data[3] if len(blob_data) > 3 else 0
+                updated.append((ncx, ncy, nscore, 0, 1, narea))
 
         self._blob_history = updated
 
         # Return stable blobs sorted by score
         stable = []
-        for hcx, hcy, hpeak, hage, hhits in self._blob_history:
+        for entry in self._blob_history:
+            hcx, hcy, hpeak, hage, hhits = entry[0], entry[1], entry[2], entry[3], entry[4]
             if hhits >= self._blob_min_hits:
                 stable.append((hpeak, hcx, hcy))
         stable.sort(key=lambda x: -x[0])
@@ -374,25 +445,67 @@ class Worker(QObject):
 
     def _extract_detected_points_local(self, main_frame):
         """Post-calibration: search for each marker near its last known position.
-        Much more robust than global search when the scene has many bright spots."""
+        Much more robust than global search when the scene has many bright spots.
+        Includes velocity check, dynamic radius, occlusion prediction, and hysteresis."""
         gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(main_frame, cv2.COLOR_BGR2HSV)
         sat_channel = hsv[:, :, 1]
         frame_h, frame_w = gray.shape[:2]
 
+        # Update ambient brightness baseline
+        frame_brightness = float(gray.mean())
+        if self._ambient_brightness is None:
+            self._ambient_brightness = frame_brightness
+        else:
+            self._ambient_brightness = (
+                self._ambient_brightness * (1 - self._ambient_alpha)
+                + frame_brightness * self._ambient_alpha
+            )
+
+        # Projector flicker rejection: detect sudden brightness spike
+        if self._prev_frame_brightness is not None:
+            brightness_delta = abs(frame_brightness - self._prev_frame_brightness)
+            if brightness_delta > self._flicker_threshold:
+                # Likely a projector flicker or stage strobe — hold positions
+                self._prev_frame_brightness = frame_brightness
+                self._auto_thresh_info = f"flicker_rejected delta={brightness_delta:.0f}"
+                return self.smoothed_points if self.smoothed_points else []
+        self._prev_frame_brightness = frame_brightness
+
         # Use smoothed_points (Kalman-filtered) as search centers,
         # fall back to calibrated positions
         search_centers = self.smoothed_points if self.smoothed_points else self._calibrated_positions
         if not search_centers or len(search_centers) != self.expected_marker_count:
+            self._local_fail_count += 1
+            if self._local_fail_count > self._local_fail_threshold:
+                self._local_fail_count = 0
+                return self._extract_detected_points_global(main_frame)
             return self._extract_detected_points_global(main_frame)
 
-        radius = self._local_search_radius
+        # Ensure tracking arrays are the right size
+        n_markers = len(search_centers)
+        if len(self._marker_freshness) != n_markers:
+            self._marker_freshness = [0] * n_markers
+        if len(self._marker_velocities) != n_markers:
+            self._marker_velocities = [0.0] * n_markers
+        if len(self._marker_found_streak) != n_markers:
+            self._marker_found_streak = [self._marker_found_threshold] * n_markers
+
         result = []
-        # Ensure freshness array is the right size
-        if len(self._marker_freshness) != len(search_centers):
-            self._marker_freshness = [0] * len(search_centers)
+        markers_found = 0
 
         for idx, (cx, cy) in enumerate(search_centers):
+            # Dynamic search radius: grow when marker is moving fast or stale
+            velocity = self._marker_velocities[idx]
+            staleness = self._marker_freshness[idx]
+            radius = self._local_search_radius_base + int(velocity * 1.5) + min(staleness * 2, 40)
+
+            # ROI padding growth when markers near edge of search region
+            if cx - radius < 10 or cx + radius > frame_w - 10:
+                radius = min(radius + 20, frame_w // 3)
+            if cy - radius < 10 or cy + radius > frame_h - 10:
+                radius = min(radius + 20, frame_h // 3)
+
             # Extract local ROI around expected marker position
             x1 = max(0, cx - radius)
             x2 = min(frame_w, cx + radius)
@@ -402,14 +515,27 @@ class Worker(QObject):
             roi_gray = gray[y1:y2, x1:x2]
             if roi_gray.size == 0:
                 self._marker_freshness[idx] += 1
+                self._marker_found_streak[idx] = 0
                 result.append((cx, cy))  # keep previous position
                 continue
 
             # Find the brightest blob in this local region
             peak_val = float(roi_gray.max())
-            if peak_val < 120:
+            # Adaptive brightness threshold based on ambient light
+            min_peak = max(80, int(self._ambient_brightness * 1.5)) if self._ambient_brightness else 120
+            if peak_val < min_peak:
                 self._marker_freshness[idx] += 1
-                result.append((cx, cy))  # no bright blob found, hold position
+                self._marker_found_streak[idx] = 0
+                # Occlusion prediction: use Kalman prediction if available
+                if staleness < self._max_occlusion_predict and self._kalman_initialized and idx < len(self._kalman_filters):
+                    kf = self._kalman_filters[idx]
+                    predicted = kf.predict()
+                    px, py = int(round(float(predicted[0, 0]))), int(round(float(predicted[1, 0])))
+                    px = max(0, min(frame_w - 1, px))
+                    py = max(0, min(frame_h - 1, py))
+                    result.append((px, py))
+                else:
+                    result.append((cx, cy))  # hold position
                 continue
 
             # Threshold at 70% of peak to find the bright region
@@ -419,27 +545,40 @@ class Worker(QObject):
 
             if not contours:
                 self._marker_freshness[idx] += 1
+                self._marker_found_streak[idx] = 0
                 result.append((cx, cy))
                 continue
 
             # Find the contour closest to the center of the search region
             best_contour = None
             best_dist = float('inf')
-            roi_cx, roi_cy = radius, radius  # center of ROI
+            roi_center_x = cx - x1  # center relative to ROI
+            roi_center_y = cy - y1
 
             for cnt in contours:
                 M = cv2.moments(cnt)
                 if M["m00"] < 3:
                     continue
+                cnt_area = cv2.contourArea(cnt)
+                # Size filter in local search too
+                if cnt_area < self._marker_min_area or cnt_area > self._marker_max_area:
+                    continue
+                # Aspect ratio filter
+                cbx, cby, cbw, cbh = cv2.boundingRect(cnt)
+                if cbw > 0 and cbh > 0:
+                    cnt_aspect = max(cbw, cbh) / max(1, min(cbw, cbh))
+                    if cnt_aspect > self._marker_max_aspect_ratio:
+                        continue
                 cnt_cx = M["m10"] / M["m00"]
                 cnt_cy = M["m01"] / M["m00"]
-                d = ((cnt_cx - roi_cx) ** 2 + (cnt_cy - roi_cy) ** 2) ** 0.5
+                d = ((cnt_cx - roi_center_x) ** 2 + (cnt_cy - roi_center_y) ** 2) ** 0.5
                 if d < best_dist:
                     best_dist = d
                     best_contour = cnt
 
             if best_contour is None:
                 self._marker_freshness[idx] += 1
+                self._marker_found_streak[idx] = 0
                 result.append((cx, cy))
                 continue
 
@@ -461,21 +600,90 @@ class Worker(QObject):
             sat_roi = sat_channel[sy1:sy2, sx1:sx2]
             avg_sat = float(sat_roi.mean()) if sat_roi.size else 128
 
-            if avg_sat > 80:
-                # Likely a projector reflection, not IR marker — hold position
+            # Adaptive saturation threshold
+            if avg_sat > self._sat_reject_threshold:
                 self._marker_freshness[idx] += 1
+                self._marker_found_streak[idx] = 0
+                result.append((cx, cy))
+                continue
+
+            # Velocity sanity check: reject if marker moved impossibly fast
+            new_x, new_y = int(round(wcx)), int(round(wcy))
+            dist_moved = ((new_x - cx) ** 2 + (new_y - cy) ** 2) ** 0.5
+            if dist_moved > self._max_marker_velocity:
+                self._marker_freshness[idx] += 1
+                self._marker_found_streak[idx] = 0
+                result.append((cx, cy))  # reject — too fast, likely noise
+                continue
+
+            # Update velocity estimate
+            self._marker_velocities[idx] = (
+                self._marker_velocities[idx] * 0.7 + dist_moved * 0.3
+            )
+
+            # Hysteresis: require consecutive detections before accepting new position
+            self._marker_found_streak[idx] += 1
+            if self._marker_found_streak[idx] < self._marker_found_threshold and staleness > 5:
+                # Not enough consecutive finds yet — hold previous position
                 result.append((cx, cy))
                 continue
 
             self._marker_freshness[idx] = 0  # freshly detected
-            result.append((int(round(wcx)), int(round(wcy))))
+            self._local_fail_count = 0  # reset global fallback counter
+            markers_found += 1
+            result.append((new_x, new_y))
 
-        self._auto_thresh_info = f"local_search r={radius} found={len(result)}"
+        # If all markers stale, increment global fallback counter
+        if markers_found == 0:
+            self._local_fail_count += 1
+            if self._local_fail_count > self._local_fail_threshold:
+                self._local_fail_count = 0
+                self.logger.info("Local search failed %d frames, falling back to global",
+                                 self._local_fail_threshold)
+                return self._extract_detected_points_global(main_frame)
+
+        self._auto_thresh_info = (
+            f"local_search r={self._local_search_radius_base}+dyn "
+            f"found={markers_found}/{n_markers} "
+            f"ambient={self._ambient_brightness:.0f}"
+        )
         return result
+
+    def _adapt_marker_size_for_depth(self):
+        """Adjust marker area bounds based on estimated depth (distance from camera).
+        When markers are farther away, they appear smaller. When closer, larger.
+        Uses inter-marker distance as a proxy for depth."""
+        if not self._marker_distances or not self._calibration_distances:
+            return
+        if self.baseline_distance <= 0:
+            return
+        # Current average marker distance vs calibrated baseline
+        if self.smoothed_points and len(self.smoothed_points) >= 2:
+            current_dist = float(np.linalg.norm(
+                np.array(self.smoothed_points[0], dtype=np.float64) -
+                np.array(self.smoothed_points[1], dtype=np.float64)
+            ))
+            if current_dist > 0:
+                scale = current_dist / self.baseline_distance
+                # Scale area bounds (area scales with square of linear dimension)
+                scale_sq = scale * scale
+                base_min = 20
+                base_max = 8000
+                self._marker_min_area = max(5, int(base_min * scale_sq))
+                self._marker_max_area = max(100, int(base_max * scale_sq))
 
     def _extract_detected_points(self, main_frame):
         """Main detection entry point. Uses local search after calibration,
-        global search before."""
+        global search before. Includes adaptive frame skipping under load."""
+        # Adaptive frame skipping: if running behind, skip detection frames
+        if self._skip_frame_interval > 0:
+            self._skip_frame_counter += 1
+            if self._skip_frame_counter % (self._skip_frame_interval + 1) != 0:
+                return self.smoothed_points if self.smoothed_points else []
+
+        # Adapt marker size expectations based on depth
+        self._adapt_marker_size_for_depth()
+
         if self._calibrated and self._calibrated_positions:
             return self._extract_detected_points_local(main_frame)
         return self._extract_detected_points_global(main_frame)
@@ -504,6 +712,11 @@ class Worker(QObject):
         for kp in blob_keypoints:
             bcx, bcy = kp.pt[0], kp.pt[1]
             r = max(4, int(kp.size / 2))
+            blob_area = kp.size * kp.size * 0.785  # approximate area from diameter
+
+            # Reject blobs outside configured size range
+            if blob_area < self._marker_min_area or blob_area > self._marker_max_area:
+                continue
 
             # Brightness-weighted centroid
             wcx, wcy, peak = self._brightness_weighted_centroid(
@@ -515,6 +728,25 @@ class Worker(QObject):
             if wcy < edge_margin or wcy > frame_h - edge_margin:
                 continue
 
+            # Aspect ratio filter: measure blob shape in local ROI
+            br = max(6, r + 2)
+            by1 = max(0, int(wcy) - br)
+            by2 = min(frame_h, int(wcy) + br)
+            bx1 = max(0, int(wcx) - br)
+            bx2 = min(frame_w, int(wcx) + br)
+            blob_roi = blurred[by1:by2, bx1:bx2]
+            if blob_roi.size > 0:
+                _, blob_bin = cv2.threshold(blob_roi, int(peak * 0.5), 255, cv2.THRESH_BINARY)
+                blob_cnts, _ = cv2.findContours(blob_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if blob_cnts:
+                    largest_blob = max(blob_cnts, key=cv2.contourArea)
+                    bbx, bby, bbw, bbh = cv2.boundingRect(largest_blob)
+                    if bbw > 0 and bbh > 0:
+                        blob_aspect = max(bbw, bbh) / max(1, min(bbw, bbh))
+                        if blob_aspect > self._marker_max_aspect_ratio:
+                            continue  # reject elongated blob (stage light streak)
+                        blob_area = cv2.contourArea(largest_blob)  # use actual area
+
             # Check saturation for all blobs (needed for scoring and filtering)
             sr = max(4, int(kp.size / 2) + 2)
             sy1 = max(0, int(wcy) - sr)
@@ -523,6 +755,11 @@ class Worker(QObject):
             sx2 = min(frame_w, int(wcx) + sr)
             sat_roi = sat_channel[sy1:sy2, sx1:sx2]
             avg_sat = float(sat_roi.mean()) if sat_roi.size else 128
+
+            # Adaptive saturation rejection for stage lights
+            sat_thresh = self._sat_reject_threshold
+            if avg_sat > sat_thresh and not has_dark_ref:
+                continue  # colored stage light, not IR marker
 
             # Compute differential brightness: how much brighter is this spot
             # compared to when the projector was OFF?
@@ -559,7 +796,7 @@ class Worker(QObject):
                 sat_penalty = max(0, avg_sat - 40) * 0.3 + max(0, avg_sat - 120) * 1.0
                 score = kp.size * 10.0 + peak * 2.0 - sat_penalty
 
-            frame_blobs.append((wcx, wcy, score))
+            frame_blobs.append((wcx, wcy, score, blob_area))
 
         # Dump diagnostic for first few frames
         if diag_all and not self._calibrated and self._warmup_frames < 5:
@@ -575,6 +812,29 @@ class Worker(QObject):
         scored = [(s, (int(round(cx)), int(round(cy)))) for s, cx, cy in stable]
         all_candidates = self._nms_points(scored, min_distance=15, limit=target_n * 3)
         result = all_candidates[:target_n]
+
+        # Marker size consistency check: if we have stable blobs with area info,
+        # verify they are roughly the same size (real markers are identical)
+        if len(result) == target_n and self._blob_history:
+            areas = []
+            for (rx, ry) in result:
+                for entry in self._blob_history:
+                    hcx, hcy = entry[0], entry[1]
+                    harea = entry[5] if len(entry) > 5 else 0
+                    if ((rx - hcx) ** 2 + (ry - hcy) ** 2) < 400 and harea > 0:
+                        areas.append(harea)
+                        break
+            if len(areas) == target_n and min(areas) > 0:
+                size_ratio = max(areas) / min(areas)
+                if size_ratio > self._marker_size_consistency_tol:
+                    # Sizes too different — likely mixing real markers with noise
+                    # Keep only the markers closest to median size
+                    median_area = sorted(areas)[len(areas) // 2]
+                    filtered = [
+                        (r, a) for r, a in zip(result, areas)
+                        if 0.33 * median_area < a < 3.0 * median_area
+                    ]
+                    result = [r for r, a in filtered]
 
         # Log top candidate sizes for debugging
         top_sizes = ""
@@ -1125,17 +1385,17 @@ class Worker(QObject):
         ], dtype=np.float32)
 
         # Process noise: very low = trust the model, resist jitter
-        # Markers are mostly stationary, so keep this very small
-        pn = 0.005  # process noise magnitude
+        # Stage environment: markers mostly stationary, occasional slow movement
+        pn = 0.003  # process noise magnitude (lower = smoother, less responsive)
         kf.processNoiseCov = np.array([
             [pn, 0,  0,  0],
             [0,  pn, 0,  0],
-            [0,  0,  pn * 0.5, 0],
-            [0,  0,  0,  pn * 0.5],
+            [0,  0,  pn * 0.3, 0],
+            [0,  0,  0,  pn * 0.3],
         ], dtype=np.float32)
 
-        # Measurement noise: moderate = measurements are somewhat noisy
-        mn = 8.0  # measurement noise — higher = more smoothing
+        # Measurement noise: higher for stage use = more smoothing against vibration
+        mn = 12.0  # measurement noise — higher = more smoothing, less jitter
         kf.measurementNoiseCov = np.array([
             [mn, 0],
             [0,  mn],
@@ -1203,6 +1463,11 @@ class Worker(QObject):
 
             sx = int(round(float(corrected[0, 0])))
             sy = int(round(float(corrected[1, 0])))
+
+            # Jitter dead zone: suppress sub-pixel jitter when guitar is stationary
+            if dist < self._jitter_deadzone:
+                sx, sy = prev[0], prev[1]
+
             stabilized.append((sx, sy))
 
         self.smoothed_points = stabilized
@@ -1605,10 +1870,36 @@ class Worker(QObject):
                     markers = self._pending_markers
                     self._calibrated = True
                     self._marker_freshness = [0] * len(markers)
+                    self._marker_velocities = [0.0] * len(markers)
+                    self._marker_found_streak = [self._marker_found_threshold] * len(markers)
+                    self._tracking_quality_history.clear()
+                    self._local_fail_count = 0
+
+                    # Compute calibration quality score (0-100)
+                    cal_quality = 50.0  # base score
+                    if self._cam_to_proj_H is not None:
+                        cal_quality += 25.0  # bonus for homography
+                    if self._marker_distances:
+                        # Bonus for consistent marker spacing (low variance)
+                        dist_std = float(np.std(self._marker_distances))
+                        dist_mean = float(np.mean(self._marker_distances))
+                        if dist_mean > 0:
+                            cv_score = max(0, 25 - (dist_std / dist_mean) * 50)
+                            cal_quality += cv_score
+                    self._calibration_quality = min(100.0, cal_quality)
+
                     self.logger.info(
-                        "Calibration complete. %d markers, homography=%s",
-                        len(markers), "YES" if self._cam_to_proj_H is not None else "NO"
+                        "Calibration complete. %d markers, homography=%s, quality=%.0f/100",
+                        len(markers),
+                        "YES" if self._cam_to_proj_H is not None else "NO",
+                        self._calibration_quality,
                     )
+                    if self._calibration_quality < 50:
+                        self.logger.warning(
+                            "Low calibration quality (%.0f/100). "
+                            "Check marker visibility and lighting conditions.",
+                            self._calibration_quality
+                        )
                     self.markers_calibrated.emit(markers)
 
                 # Status overlay and frame emission
@@ -1629,12 +1920,40 @@ class Worker(QObject):
 
             # Post-calibration: projector outputs composited masks (handled below)
 
+            # Rolling dark reference update: adapt to gradual lighting changes
+            if (self._dark_ref_update_enabled and self._calib_dark_ref is not None
+                    and self._calibrated):
+                gray_update = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                # Only update in areas far from known markers (avoid updating marker areas)
+                mask_update = np.ones_like(gray_update, dtype=bool)
+                if self.smoothed_points:
+                    for (mx, my) in self.smoothed_points:
+                        uy1 = max(0, my - 30)
+                        uy2 = min(h, my + 30)
+                        ux1 = max(0, mx - 30)
+                        ux2 = min(w, mx + 30)
+                        mask_update[uy1:uy2, ux1:ux2] = False
+                alpha = self._dark_ref_update_alpha
+                updated_ref = self._calib_dark_ref.astype(np.float32)
+                gray_f = gray_update.astype(np.float32)
+                updated_ref[mask_update] = (
+                    updated_ref[mask_update] * (1 - alpha)
+                    + gray_f[mask_update] * alpha
+                )
+                self._calib_dark_ref = updated_ref.astype(np.uint8)
+
             t0 = time.perf_counter()
             all_detected_points = self._extract_detected_points(main_frame)
             detect_ms = (time.perf_counter() - t0) * 1000.0
 
             t0 = time.perf_counter()
             tracked_points = self._match_marker_configuration(all_detected_points)
+
+            # Inter-marker rigidity constraint: after calibration, verify the
+            # geometric constellation hasn't broken (would indicate false detection)
+            if self._calibrated and self._marker_distances and len(tracked_points) == self.expected_marker_count:
+                tracked_points = self._validate_marker_distances(tracked_points)
+
             tracked_points = self._stabilize_tracked_points(tracked_points)
             match_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -1644,6 +1963,22 @@ class Worker(QObject):
                 if f < self._marker_stale_threshold
             ) if self._marker_freshness else len(tracked_points)
             self.trackers_detected.emit(fresh_count)
+
+            # Tracking quality assessment and auto-recalibration trigger
+            quality = (fresh_count / max(1, self.expected_marker_count)) * 100.0
+            self._tracking_quality_history.append(quality)
+            if len(self._tracking_quality_history) > 90:  # ~3 sec window
+                self._tracking_quality_history.pop(0)
+            avg_quality = sum(self._tracking_quality_history) / max(1, len(self._tracking_quality_history))
+            if (len(self._tracking_quality_history) >= 90
+                    and avg_quality < self._recalib_quality_threshold
+                    and self._calibrated):
+                self.logger.warning(
+                    "Tracking quality degraded to %.0f%%, triggering re-calibration",
+                    avg_quality
+                )
+                self._tracking_quality_history.clear()
+                self.start_calibration()
 
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
                 self._calibration_distances.append(
@@ -1857,11 +2192,17 @@ class Worker(QObject):
             avg_frame = sum(self._recent_frame_times) / len(self._recent_frame_times)
             if avg_frame > 40:
                 self._dynamic_combination_budget = max(250, self._dynamic_combination_budget - 100)
+                # Adaptive frame skipping: start skipping detection if way behind
+                if avg_frame > 60:
+                    self._skip_frame_interval = min(self._skip_frame_interval + 1, 3)
             elif avg_frame < 25:
                 self._dynamic_combination_budget = min(
                     self.max_combinations_to_check,
                     self._dynamic_combination_budget + 50,
                 )
+                # Reduce/remove frame skipping when we have headroom
+                if self._skip_frame_interval > 0:
+                    self._skip_frame_interval -= 1
 
             fps_counter += 1
             elapsed = time.perf_counter() - fps_window_start
