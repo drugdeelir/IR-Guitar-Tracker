@@ -46,7 +46,7 @@ from worker import Worker
 
 try:
     import mido
-except Exception:
+except ImportError:
     mido = None
 
 SETTINGS_PATH = Path("settings.json")
@@ -63,8 +63,8 @@ def configure_opencv_logging():
     except AttributeError:
         try:
             cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
-        except Exception:
-            pass
+        except AttributeError:
+            pass  # OpenCV build does not expose logging API; silently skip
 
 
 class StartupWizardDialog(QDialog):
@@ -112,11 +112,13 @@ class StartupWizardDialog(QDialog):
         layout.addWidget(buttons)
 
 def _get_camera_backends(include_fallback_any=False):
+    """Return backends for one-shot camera index probing.
+    Uses DSHOW on Windows to reduce noisy backend warnings during probing.
+    Worker._camera_backends() handles sustained capture and prefers MSMF."""
     is_windows = platform.system().lower() == "windows"
     if not is_windows:
         return [cv2.CAP_ANY]
 
-    # Prefer DirectShow while probing to reduce noisy backend warnings.
     preferred = ["CAP_DSHOW"]
     if include_fallback_any:
         preferred.append("CAP_ANY")
@@ -238,7 +240,8 @@ class ProjectionMappingApp(QMainWindow):
         if SETTINGS_PATH.exists():
             try:
                 return json.loads(SETTINGS_PATH.read_text())
-            except Exception:
+            except (OSError, json.JSONDecodeError) as exc:
+                logging.getLogger("MainWindow").warning("Could not load settings: %s", exc)
                 return {}
         return {}
 
@@ -258,8 +261,8 @@ class ProjectionMappingApp(QMainWindow):
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
-        except Exception:
-            pass
+        except OSError as exc:
+            self.logger.error("Could not save settings: %s", exc)
 
     def apply_loaded_settings(self):
         ir_threshold = self.settings.get("ir_threshold", 200)
@@ -704,7 +707,7 @@ class ProjectionMappingApp(QMainWindow):
         loop.exec_()
         try:
             self.worker.still_frame_ready.disconnect(on_frame)
-        except Exception:
+        except RuntimeError:
             pass
 
         if result["image"] is None:
@@ -1517,8 +1520,8 @@ class ProjectionMappingApp(QMainWindow):
         if self.midi_inport is not None:
             try:
                 self.midi_inport.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.warning("MIDI port close error: %s", exc)
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()
