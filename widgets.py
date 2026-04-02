@@ -226,7 +226,6 @@ class MarkerSelectionDialog(QDialog):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._render_preview()
-        self._render_preview()
 
 
 class VideoDisplay(QWidget):
@@ -544,6 +543,18 @@ class PolygonMaskDialog(QDialog):
             painter.drawLine(self.points[-1], self.points[0])
         painter.end()
         self.image_label.setPixmap(preview.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def accept(self):
+        """Validate minimum point count before closing (#38)."""
+        if len(self.points) < 3:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Not Enough Points",
+                "A mask needs at least 3 points to form a valid polygon.\n"
+                "Click on the image to add more points."
+            )
+            return  # keep dialog open
+        super().accept()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

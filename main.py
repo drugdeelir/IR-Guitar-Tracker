@@ -11,7 +11,7 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QEventLoop, QPoint, QThread, Qt, QTimer
+from PyQt5.QtCore import QByteArray, QEventLoop, QPoint, QThread, Qt, QTimer, pyqtSlot
 from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -27,7 +27,9 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
+    QShortcut,
     QSlider,
     QSplitter,
     QScrollArea,
@@ -53,11 +55,23 @@ SETTINGS_PATH = Path("settings.json")
 
 
 def configure_opencv_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    from logging.handlers import RotatingFileHandler
+    _fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+                             datefmt="%H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Console handler
+    _ch = logging.StreamHandler()
+    _ch.setFormatter(_fmt)
+    root.addHandler(_ch)
+
+    # Rotating file handler — survives show days without filling disk
+    _fh = RotatingFileHandler("ir_tracker.log", maxBytes=2_000_000, backupCount=3,
+                               encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    root.addHandler(_fh)
+
     try:
         cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
     except AttributeError:
@@ -180,6 +194,8 @@ class ProjectionMappingApp(QMainWindow):
         self.selected_markers = []
         self.reference_markers = []
         self.latest_camera_qimage = None
+        self._is_closing = False
+        self._camera_retry_count = 0
         self.settings = self.load_settings()
         self.logger = logging.getLogger("ProjectionMappingApp")
 
@@ -220,6 +236,14 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.performance_updated.connect(self.update_performance_label)
         self.worker.camera_info_updated.connect(self.update_camera_info)
         self.worker.markers_calibrated.connect(self._on_markers_calibrated)
+        self.worker.worker_stopped.connect(self._on_worker_stopped)
+        self.worker.calibration_progress.connect(self._on_calibration_progress)
+        self.worker.performance_degraded.connect(self._on_performance_degraded)
+
+        # Screen-change recovery: repopulate projector combo when displays change
+        _app = QApplication.instance()
+        _app.screenAdded.connect(self._on_screens_changed)
+        _app.screenRemoved.connect(self._on_screens_changed)
 
         self.marker_selection_dialog = MarkerSelectionDialog(self)
         self.marker_selection_dialog.take_picture_button.clicked.connect(
@@ -236,6 +260,8 @@ class ProjectionMappingApp(QMainWindow):
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
 
+        self._setup_shortcuts()
+
     def load_settings(self):
         if SETTINGS_PATH.exists():
             try:
@@ -247,6 +273,7 @@ class ProjectionMappingApp(QMainWindow):
 
     def save_settings(self):
         settings = {
+            "version": 2,
             "ir_threshold": self.ir_threshold_slider.value(),
             "threshold_mode": self.threshold_mode_combo.currentIndex(),
             "depth_sensitivity": self.depth_sensitivity_slider.value(),
@@ -258,6 +285,9 @@ class ProjectionMappingApp(QMainWindow):
             "camera_mode": self.camera_mode_combo.currentData(),
             "show_mask_overlays": self.show_mask_overlays_checkbox.isChecked(),
             "wizard_completed": True,
+            "masks": [m.to_dict() for m in self.masks],
+            "window_geometry": self.saveGeometry().toBase64().data().decode(),
+            "splitter_sizes": self.main_splitter.sizes(),
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
@@ -294,6 +324,31 @@ class ProjectionMappingApp(QMainWindow):
         if isinstance(warp_points, list) and len(warp_points) == 4:
             self.projector_window.warp_points = self.projector_window.deserialize_warp_points(warp_points)
             self.worker.set_warp_points(self.projector_window.get_warp_points_normalized())
+
+        # Restore saved masks (version 2+)
+        saved_masks = self.settings.get("masks", [])
+        if saved_masks:
+            try:
+                from mask import Mask as _Mask
+                for d in saved_masks:
+                    m = _Mask.from_dict(d)
+                    self.masks.append(m)
+                self.worker.set_masks(self.masks)
+                self.refresh_mask_views()
+                self.logger.info("Restored %d mask(s) from settings", len(saved_masks))
+            except Exception as exc:
+                self.logger.warning("Could not restore saved masks: %s", exc)
+
+        # Restore window geometry and splitter
+        geom = self.settings.get("window_geometry")
+        if geom:
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(geom.encode()))
+            except Exception:
+                pass
+        splitter_sizes = self.settings.get("splitter_sizes")
+        if isinstance(splitter_sizes, list) and len(splitter_sizes) == 2:
+            self.main_splitter.setSizes(splitter_sizes)
 
     def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
         self.marker_selection_dialog.setWindowTitle(title)
@@ -386,8 +441,21 @@ class ProjectionMappingApp(QMainWindow):
         dialog = StartupWizardDialog(self.available_cameras, self.screens, self.settings, self)
         if dialog.exec_():
             if dialog.camera_combo.isEnabled():
-                self.camera_combo.setCurrentIndex(dialog.camera_combo.currentIndex())
-                self.change_camera(dialog.camera_combo.currentIndex())
+                cam_idx = dialog.camera_combo.currentIndex()
+                # Validate selected camera can actually deliver a frame (#40)
+                if self.available_cameras:
+                    real_idx = self.available_cameras[min(cam_idx, len(self.available_cameras) - 1)]
+                    test_cap = cv2.VideoCapture(real_idx)
+                    ok, _ = test_cap.read() if test_cap.isOpened() else (False, None)
+                    test_cap.release()
+                    if not ok:
+                        QMessageBox.warning(
+                            self, "Camera Not Ready",
+                            f"Camera {real_idx} did not return a frame.\n"
+                            "Check that it is plugged in and not in use by another application."
+                        )
+                self.camera_combo.setCurrentIndex(cam_idx)
+                self.change_camera(cam_idx)
             if self.projector_combo.count() > 0:
                 self.projector_combo.setCurrentIndex(dialog.projector_combo.currentIndex())
                 self.change_projector(dialog.projector_combo.currentIndex())
@@ -523,11 +591,24 @@ class ProjectionMappingApp(QMainWindow):
         self.render_all_cues_button = QPushButton("Render All Masks")
         self.render_all_cues_button.clicked.connect(lambda: self.worker.set_active_cue_index(-1))
 
+        # Cue preview row (#35)
+        preview_cue_layout = QHBoxLayout()
+        self.preview_cue_button = QPushButton("Preview Selected Cue")
+        self.preview_cue_button.setToolTip(
+            "Play selected cue in the preview panel only — projector output not affected."
+        )
+        self.preview_cue_button.clicked.connect(self._preview_selected_cue)
+        self.stop_preview_cue_button = QPushButton("Stop Preview")
+        self.stop_preview_cue_button.clicked.connect(self._stop_cue_preview)
+        preview_cue_layout.addWidget(self.preview_cue_button)
+        preview_cue_layout.addWidget(self.stop_preview_cue_button)
+
         cue_layout.addWidget(QLabel("Mask"))
         cue_layout.addWidget(self.cue_mask_combo)
         cue_layout.addWidget(self.mask_cue_list_widget)
         cue_layout.addWidget(self.add_cue_button)
         cue_layout.addWidget(self.remove_cue_button)
+        cue_layout.addLayout(preview_cue_layout)
         cue_layout.addWidget(self.cc_spin)
         cue_layout.addWidget(self.map_cc_button)
         cue_layout.addWidget(self.render_all_cues_button)
@@ -660,6 +741,7 @@ class ProjectionMappingApp(QMainWindow):
 
     def toggle_preview(self, checked):
         self.projector_preview_label.setVisible(checked)
+        self.worker.set_preview_enabled(checked)
 
     def update_projector_preview(self, image):
         if not self.preview_checkbox.isChecked() or not self.projector_preview_label.isVisible():
@@ -689,8 +771,10 @@ class ProjectionMappingApp(QMainWindow):
             combo.setMinimumWidth(260)
             combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+    @pyqtSlot(QImage)
     def cache_latest_frame(self, image):
         self.latest_camera_qimage = image.copy()
+        self._camera_retry_count = 0  # reset auto-reconnect counter on successful frame
 
     def capture_still_frame_sync(self, timeout_ms=5000, label="capture"):
         loop = QEventLoop(self)
@@ -701,6 +785,11 @@ class ProjectionMappingApp(QMainWindow):
             loop.quit()
 
         self.logger.debug("Requesting still frame: %s", label)
+        # Disconnect any stale connection from a previous call before re-connecting.
+        try:
+            self.worker.still_frame_ready.disconnect(on_frame)
+        except RuntimeError:
+            pass
         self.worker.still_frame_ready.connect(on_frame)
         self.worker.capture_still_frame()
         QTimer.singleShot(timeout_ms, loop.quit)
@@ -1223,8 +1312,104 @@ class ProjectionMappingApp(QMainWindow):
     def update_depth_sensitivity(self, value):
         self.worker.set_depth_sensitivity(value / 100.0)
 
+    @pyqtSlot(int)
     def show_camera_error(self, index):
-        self.statusBar().showMessage(f"Error: Could not open Camera {index}", 5000)
+        self.statusBar().showMessage(f"Camera {index} disconnected — retrying…", 5000)
+        self.logger.warning("Camera error on source %s — scheduling auto-retry", index)
+        if not hasattr(self, '_camera_retry_count'):
+            self._camera_retry_count = 0
+        self._camera_retry_count += 1
+        if self._camera_retry_count <= 5:
+            delay_ms = min(3000 * self._camera_retry_count, 15000)
+            QTimer.singleShot(delay_ms, self._auto_retry_camera)
+        else:
+            self.statusBar().showMessage(
+                f"Camera {index} failed after 5 retries. Check connection and click Retry.", 0)
+
+    def _auto_retry_camera(self):
+        self.logger.info("Auto-retrying camera connection (attempt %d)",
+                         getattr(self, '_camera_retry_count', 1))
+        self.worker.retry_camera()
+
+    @pyqtSlot()
+    def _on_worker_stopped(self):
+        """Called when the worker thread exits — expected on close, unexpected otherwise."""
+        if not self._is_closing:
+            self.logger.error("Worker thread stopped unexpectedly")
+            result = QMessageBox.critical(
+                self, "Worker Stopped",
+                "The video processing thread stopped unexpectedly.\n\n"
+                "Check ir_tracker.log for details.\n\n"
+                "Retry will attempt to restart the camera.",
+                QMessageBox.Retry | QMessageBox.Close,
+                QMessageBox.Retry,
+            )
+            if result == QMessageBox.Retry:
+                self.worker.retry_camera()
+                self.thread.start()
+
+    @pyqtSlot(str, int, int)
+    def _on_calibration_progress(self, phase, current, total):
+        if not hasattr(self, '_calib_progress_dialog') or self._calib_progress_dialog is None:
+            self._calib_progress_dialog = QProgressDialog(
+                f"Calibrating: {phase}", None, 0, total, self)
+            self._calib_progress_dialog.setWindowTitle("Calibration")
+            self._calib_progress_dialog.setWindowModality(Qt.WindowModal)
+            self._calib_progress_dialog.setMinimumDuration(0)
+            self._calib_progress_dialog.setValue(0)
+            self._calib_progress_dialog.show()
+            # Safety timeout: close dialog and notify operator if calibration stalls (#33)
+            self._calib_timeout_timer = QTimer(self)
+            self._calib_timeout_timer.setSingleShot(True)
+            self._calib_timeout_timer.timeout.connect(self._on_calibration_timeout)
+            self._calib_timeout_timer.start(90_000)
+        self._calib_progress_dialog.setLabelText(f"Calibrating: {phase}")
+        self._calib_progress_dialog.setMaximum(total)
+        self._calib_progress_dialog.setValue(current)
+        if current >= total:
+            self._close_calibration_dialog()
+
+    def _close_calibration_dialog(self):
+        """Close calibration dialog and cancel its safety timer."""
+        if hasattr(self, '_calib_timeout_timer') and self._calib_timeout_timer:
+            self._calib_timeout_timer.stop()
+            self._calib_timeout_timer = None
+        if hasattr(self, '_calib_progress_dialog') and self._calib_progress_dialog:
+            self._calib_progress_dialog.close()
+            self._calib_progress_dialog = None
+
+    def _on_calibration_timeout(self):
+        """Called when calibration dialog has been open for 90 s without completing."""
+        self._close_calibration_dialog()
+        QMessageBox.warning(
+            self, "Calibration Timed Out",
+            "Calibration did not complete within 90 seconds.\n\n"
+            "Ensure the projector is on and IR markers are visible, then try again."
+        )
+
+    @pyqtSlot()
+    def _on_screens_changed(self, _screen=None):
+        """Repopulate the projector combo when displays are connected or removed."""
+        current_idx = self.projector_combo.currentIndex()
+        self.screens = QApplication.screens()
+        self.projector_combo.blockSignals(True)
+        self.projector_combo.clear()
+        for i, s in enumerate(self.screens):
+            self.projector_combo.addItem(f"Screen {i + 1}: {s.name()} ({s.geometry().width()}×{s.geometry().height()})")
+        safe_idx = min(current_idx, self.projector_combo.count() - 1)
+        if safe_idx >= 0:
+            self.projector_combo.setCurrentIndex(safe_idx)
+        self.projector_combo.blockSignals(False)
+        self.logger.info("Screen configuration changed — %d screen(s) detected", len(self.screens))
+
+    @pyqtSlot(float)
+    def _on_performance_degraded(self, fps):
+        """Show a status-bar warning when sustained frame rate drops below 20 fps (#44)."""
+        self.statusBar().showMessage(
+            f"Warning: frame rate degraded to {fps:.0f} fps — check CPU load or camera connection",
+            10_000
+        )
+        self.logger.warning("Performance degraded: %.1f fps", fps)
 
     def update_performance_label(self, fps, frame_time_ms, detect_ms, match_ms, warp_ms, render_ms):
         self.performance_label.setText(
@@ -1409,9 +1594,49 @@ class ProjectionMappingApp(QMainWindow):
         cue_idx = self.mask_cue_list_widget.currentRow()
         if idx < 0 or idx >= len(self.masks) or cue_idx < 0:
             return
+        cue_name = Path(self.masks[idx].cues[cue_idx]).name
+        if QMessageBox.question(
+            self, "Remove Cue", f"Remove cue '{cue_name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
         self.masks[idx].remove_cue(cue_idx)
         self.worker.set_masks(self.masks)
         self.refresh_cues_for_selected_mask()
+
+    def _preview_selected_cue(self):
+        """Play the selected cue in the preview panel only — projector unaffected (#35)."""
+        idx = self.cue_mask_combo.currentIndex()
+        cue_idx = self.mask_cue_list_widget.currentRow()
+        if idx < 0 or idx >= len(self.masks):
+            return
+        mask = self.masks[idx]
+        if cue_idx < 0 or cue_idx >= len(mask.cues):
+            cue_idx = mask.active_cue
+        if not mask.cues:
+            self.statusBar().showMessage("No cue selected.", 3000)
+            return
+        cue_path = mask.cues[cue_idx]
+        # Preview: temporarily enable preview mode, disable projector output
+        prev_active_cue = self.worker.active_cue_index
+        self.worker.set_preview_enabled(True)
+        self.worker.set_active_cue_index(idx)
+        self.statusBar().showMessage(f"Previewing: {Path(cue_path).name} (click Stop Preview to end)", 0)
+        # Restore after 5 s if operator forgets to stop
+        if not hasattr(self, '_preview_restore_timer'):
+            self._preview_restore_timer = QTimer(self)
+            self._preview_restore_timer.setSingleShot(True)
+            self._preview_restore_timer.timeout.connect(self._stop_cue_preview)
+        self._preview_restore_timer.start(5000)
+        self._preview_prev_active_cue = prev_active_cue
+
+    def _stop_cue_preview(self):
+        """Stop cue preview and restore previous render state (#35)."""
+        if hasattr(self, '_preview_restore_timer'):
+            self._preview_restore_timer.stop()
+        prev = getattr(self, '_preview_prev_active_cue', -1)
+        self.worker.set_active_cue_index(prev)
+        self.statusBar().showMessage("Cue preview stopped.", 3000)
 
     def map_cc_to_selected_cue(self):
         idx = self.cue_mask_combo.currentIndex()
@@ -1478,6 +1703,12 @@ class ProjectionMappingApp(QMainWindow):
     def remove_mask(self):
         row = self.mask_list_widget.currentRow()
         if 0 <= row < len(self.masks):
+            mask_name = self.masks[row].name
+            if QMessageBox.question(
+                self, "Remove Mask", f"Remove mask '{mask_name}' and all its cues?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            ) != QMessageBox.Yes:
+                return
             del self.masks[row]
             self.worker.set_masks(self.masks)
             self.refresh_mask_views(select_index=max(0, row - 1))
@@ -1515,7 +1746,17 @@ class ProjectionMappingApp(QMainWindow):
             target_geometry,
         )
 
+    def _setup_shortcuts(self):
+        from PyQt5.QtGui import QKeySequence
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_settings)
+        QShortcut(QKeySequence("Ctrl+C"), self,
+                  activated=lambda: self.calibrate_button.click() if hasattr(self, 'calibrate_button') else None)
+        QShortcut(QKeySequence("Delete"), self, activated=self.remove_mask)
+        QShortcut(QKeySequence("Space"), self,
+                  activated=lambda: self.preview_checkbox.toggle() if hasattr(self, 'preview_checkbox') else None)
+
     def closeEvent(self, event):
+        self._is_closing = True
         self.save_settings()
         if self.midi_inport is not None:
             try:
@@ -1529,20 +1770,44 @@ class ProjectionMappingApp(QMainWindow):
 
 
 if __name__ == '__main__':
+    # Per-monitor DPI awareness must be set before QApplication is created.
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            pass
+
     configure_opencv_logging()
     app = QApplication(sys.argv)
+
+    _asset_dir = Path(__file__).resolve().parent
+    _icon_path = _asset_dir / 'icon.ico'
+    if _icon_path.exists():
+        from PyQt5.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(_icon_path)))
 
     splash = SplashScreen()
     splash.show()
     app.processEvents()
 
+    _qss_path = _asset_dir / 'style.qss'
     try:
-        with open('style.qss', 'r') as f:
-            app.setStyleSheet(f.read())
-    except FileNotFoundError:
-        print("Stylesheet not found. Using default style.")
+        app.setStyleSheet(_qss_path.read_text(encoding='utf-8'))
+    except OSError:
+        logging.getLogger(__name__).warning("Stylesheet not found: %s", _qss_path)
 
-    main_win = ProjectionMappingApp()
-    main_win.showFullScreen()
-    splash.finish(main_win)
-    sys.exit(app.exec_())
+    try:
+        main_win = ProjectionMappingApp()
+        main_win.showFullScreen()
+        splash.finish(main_win)
+        sys.exit(app.exec_())
+    except Exception:
+        logging.getLogger(__name__).exception("Unhandled exception in main loop")
+        QMessageBox.critical(
+            None, "Fatal Error",
+            "IR Guitar Tracker encountered an unrecoverable error.\n\n"
+            "Check ir_tracker.log for details.\n\n"
+            f"{sys.exc_info()[1]}"
+        )
+        sys.exit(1)
