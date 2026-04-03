@@ -1,20 +1,23 @@
 
+from pathlib import Path
 import cv2
 from PyQt5.QtWidgets import QSplashScreen, QLabel, QVBoxLayout
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 
+_ASSET_DIR = Path(__file__).resolve().parent
+
 class SplashScreen(QSplashScreen):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.SplashScreen | Qt.FramelessWindowHint)
-        
+
         self.video_label = QLabel(self)
         layout = QVBoxLayout()
         layout.addWidget(self.video_label)
         self.setLayout(layout)
-        
-        self.cap = cv2.VideoCapture('logo.mkv')
+
+        self.cap = cv2.VideoCapture(str(_ASSET_DIR / 'logo.mkv'))
         if not self.cap.isOpened():
             self._set_fallback_logo()
             return
@@ -34,7 +37,7 @@ class SplashScreen(QSplashScreen):
         self.timer.start(33) # ~30 FPS
 
     def _set_fallback_logo(self):
-        pixmap = QPixmap('logo.png')
+        pixmap = QPixmap(str(_ASSET_DIR / 'logo.png'))
         if not pixmap.isNull():
             self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
@@ -42,7 +45,7 @@ class SplashScreen(QSplashScreen):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         bytes_per_line = ch * w
-        qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        qt_image = QImage(frame_rgb.tobytes(), w, h, bytes_per_line, QImage.Format_RGB888)
 
         pixmap = QPixmap.fromImage(qt_image)
         self.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
