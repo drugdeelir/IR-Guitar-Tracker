@@ -1,7 +1,14 @@
 import collections
+import operator
+import queue
+import hashlib
+import json
 import time
 import threading
 from itertools import combinations
+from enum import Enum, auto
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict
 import os
 import logging
 import platform
@@ -24,7 +31,7 @@ _BLOB_MAX_AGE = 15          # frames a blob survives without a new match
 _BLOB_HISTORY_RADIUS = 40   # px radius for associating blobs across frames
 _MARKER_NMS_RADIUS = 28     # px minimum separation between candidate markers
 _MIN_BLOB_BRIGHTNESS = 40   # absolute brightness floor for blob candidates
-_DIFF_BRIGHTNESS_FLOOR = 10 # minimum differential brightness (post-calibration mode)
+_DIFF_BRIGHTNESS_FLOOR = 18 # minimum differential brightness (post-calibration mode) — raised from 10 for ambient IR in LED venues
 _SCORE_DIFF_WEIGHT = 5.0    # weight for brightness difference in scoring
 _SCORE_SIZE_WEIGHT = 3.0    # weight for blob size in scoring
 _SAT_PENALTY_THRESHOLD = 60 # saturation level above which a colour penalty applies
@@ -33,6 +40,37 @@ _CALIBRATION_FRAMES = 30    # default frames per calibration phase
 _WARMUP_FRAMES_REQUIRED = 90  # good frames needed before auto-calibration fires (~3 s at 30 fps)
 _LOCAL_MIN_BRIGHTNESS = 80  # brightness floor in local search (stricter than global _MIN_BLOB_BRIGHTNESS)
 # ---------------------------------------------------------------------------
+
+
+class CalibPhase(Enum):
+    IDLE = auto()
+    DARK = auto()
+    ILLUMINATE = auto()
+    DETECT = auto()
+    PROJ_SCAN = auto()
+    DONE = auto()
+
+
+@dataclass
+class DetectionParams:
+    """All tunable detection constants in one place. Pass to Worker for scene-preset switching."""
+    blob_min_hits: int = 8
+    blob_max_age: int = 15
+    blob_history_radius: int = 40
+    marker_nms_radius: int = 28
+    min_blob_brightness: int = 40
+    diff_brightness_floor: int = 18   # raised from 10 — ambient IR in LED venues
+    score_diff_weight: float = 5.0
+    score_size_weight: float = 3.0
+    sat_penalty_threshold: int = 60
+    sat_penalty_scale: float = 0.2
+    calibration_frames: int = 30
+    warmup_frames_required: int = 90
+    local_min_brightness: int = 80
+    kalman_static_pn: float = 0.005
+    kalman_motion_pn: float = 1.0
+    kalman_motion_threshold: float = 5.0  # px/frame above which motion pn is used
+    fog_contrast_threshold: float = 18.0
 
 
 class Worker(QObject):
@@ -58,6 +96,8 @@ class Worker(QObject):
         self.ir_threshold = 215
         self.threshold_mode = "auto"
         self._camera_changed = True
+        self._camera_changed_event = threading.Event()
+        self._camera_changed_event.set()  # trigger on startup
         self.baseline_distance = 0
         self.depth_sensitivity = 1.0
         self._calibrate_depth_flag = False
@@ -85,9 +125,12 @@ class Worker(QObject):
         self._kalman_filters = []  # list of cv2.KalmanFilter objects
         self._kalman_initialized = False
 
+        self._detection_params = DetectionParams()
+        self._dp = self._detection_params
+
         # Temporal blob tracking: keep history of blob positions across frames
         # Only report blobs that are consistently present
-        self._blob_history = []       # list of (cx, cy, peak, age, hit_count)
+        self._blob_history = []       # list of (cx, cy, peak, age, hit_count, vx, vy)
         self._blob_history_radius = _BLOB_HISTORY_RADIUS
         self._blob_min_hits = _BLOB_MIN_HITS
         self._blob_max_age = _BLOB_MAX_AGE
@@ -100,12 +143,14 @@ class Worker(QObject):
         self._warmup_required = _WARMUP_FRAMES_REQUIRED
 
         # Three-phase calibration: dark reference → illuminate → detect in diff image
-        self._calib_phase = "idle"       # "idle" (waiting) → "dark" → "illuminate" → "detect" → "proj_scan"
+        self._calib_phase = CalibPhase.IDLE       # IDLE (waiting) → DARK → ILLUMINATE → DETECT → PROJ_SCAN
         self._calib_frame_count = 0      # frames in current phase
-        self._calib_dark_frames = []     # accumulate dark frames for reference
         self._calib_dark_ref = None      # averaged dark reference (grayscale)
-        self._calib_illum_frames = []    # accumulate illuminated frames
+        self._calib_dark_sum = None      # Welford accumulator for dark phase
+        self._calib_dark_count = 0
         self._calib_illum_ref = None     # averaged illuminated reference (grayscale)
+        self._calib_illum_sum = None     # Welford accumulator for illuminate phase
+        self._calib_illum_count = 0
         self._exposure_locked = False    # True during calibration to prevent auto-exposure shifts
 
         # Inter-marker distance constraint: learned after calibration
@@ -139,7 +184,7 @@ class Worker(QObject):
 
         self._target_fps = 30.0
         self._detection_scale = 0.5
-        self._recent_frame_times = []
+        self._recent_frame_times = collections.deque(maxlen=20)
         self._calibration_distances = []
 
         self._camera_width = 1280
@@ -157,6 +202,27 @@ class Worker(QObject):
         self._low_fps_since = None   # timestamp when FPS first dropped below threshold
         self._low_fps_threshold = 20.0
         self._low_fps_duration = 3.0  # seconds below threshold before emitting
+
+        # Threading locks
+        self._state_lock = threading.RLock()          # protects smoothed_points, kalman filters
+        self._video_captures_lock = threading.Lock()  # protects video_captures dict
+
+        # Kalman measurement pre-allocation
+        self._kf_meas_buf = np.zeros((2, 1), dtype=np.float32)  # reused every frame
+
+        # Mask compositing caches
+        self._mask_last_dst_pts: Dict[int, np.ndarray] = {}  # id(mask) → last dst_pts
+        self._mask_filled_buffer: Dict[int, np.ndarray] = {}  # id(mask) → cached fill
+
+        # Detection diagnostic deque
+        self._detect_diag = collections.deque(maxlen=10)  # (frame_n, n_blobs, n_stable, n_final)
+        self._debug_frame_counter = 0
+
+        # Persistent camera read thread support
+        self._cam_read_request_q: queue.Queue = queue.Queue(maxsize=1)
+        self._cam_read_result_q: queue.Queue = queue.Queue(maxsize=1)
+        self._cam_read_thread: Optional[threading.Thread] = None
+        self._cam_read_active = False
 
         if self._is_windows:
             self._target_fps = 30.0
@@ -213,25 +279,28 @@ class Worker(QObject):
     def set_depth_sensitivity(self, value):
         self.depth_sensitivity = value
 
-    def set_ir_threshold(self, value):
+    def set_ir_threshold(self, value: int) -> None:
         self.ir_threshold = value
 
-    def set_threshold_mode(self, mode):
+    def set_threshold_mode(self, mode: str) -> None:
         self.threshold_mode = mode if mode in {"manual", "auto"} else "manual"
 
-    def set_video_source(self, source):
+    def set_video_source(self, source: int) -> None:
         self.video_source = source
         self._camera_changed = True
+        self._camera_changed_event.set()
 
     def retry_camera(self):
         self._camera_changed = True
+        self._camera_changed_event.set()
 
     def set_active_cue_index(self, index):
         self.active_cue_index = index
 
-    def set_camera_mode(self, mode):
+    def set_camera_mode(self, mode: str) -> None:
         self.camera_mode = mode if mode in {"native", "performance", "hd"} else "native"
         self._camera_changed = True
+        self._camera_changed_event.set()
 
     def set_show_mask_overlays(self, enabled):
         self.show_mask_overlays = bool(enabled)
@@ -239,16 +308,18 @@ class Worker(QObject):
     def set_preview_enabled(self, enabled):
         self._preview_enabled = bool(enabled)
 
-    def start_calibration(self):
+    def start_calibration(self) -> None:
         """Trigger the calibration sequence: dark → illuminate → detect → proj_scan."""
         self.logger.info("Calibration triggered by user")
         self._calibrated = False
-        self._calib_phase = "dark"
+        self._calib_phase = CalibPhase.DARK
         self._calib_frame_count = 0
-        self._calib_dark_frames = []
         self._calib_dark_ref = None
-        self._calib_illum_frames = []
+        self._calib_dark_sum = None
+        self._calib_dark_count = 0
         self._calib_illum_ref = None
+        self._calib_illum_sum = None
+        self._calib_illum_count = 0
         self._cam_to_proj_H = None
         self._guitar_polygon = None
         self._pending_markers = None
@@ -287,6 +358,8 @@ class Worker(QObject):
             return
         self._projector_output_buffer = np.zeros((h, w, 3), dtype=np.uint8)
         self._mask_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+        self._warp_dst_buffer = np.zeros((h, w, 3), dtype=np.uint8)  # reuse for warpPerspective
+        self._rgb_buffer = np.zeros((h, w, 3), dtype=np.uint8)       # reuse for BGR->RGB
         self._buffer_shape = (h, w)
 
     @staticmethod
@@ -318,7 +391,7 @@ class Worker(QObject):
 
     def _nms_points(self, scored_points, min_distance=_MARKER_NMS_RADIUS, limit=20):
         selected = []
-        for score, point in sorted(scored_points, key=lambda item: item[0], reverse=True):
+        for score, point in sorted(scored_points, key=operator.itemgetter(0), reverse=True):
             if all((point[0] - p[0]) ** 2 + (point[1] - p[1]) ** 2 >= min_distance ** 2 for _, p in selected):
                 selected.append((score, point))
             if len(selected) >= limit:
@@ -340,7 +413,10 @@ class Worker(QObject):
         # Weight by (pixel - threshold)^2 to strongly favor brightest pixels
         thresh = peak * 0.65
         weights = np.maximum(roi - thresh, 0) ** 2
-        total_w = weights.sum()
+        total_weight = np.sum(weights)
+        if total_weight < 1e-6:
+            return cx, cy, 0.0  # degenerate case — no bright pixels
+        total_w = total_weight
         if total_w > 0:
             ys, xs = np.mgrid[0:roi.shape[0], 0:roi.shape[1]]
             wcx = float((xs * weights).sum() / total_w) + x1
@@ -361,7 +437,7 @@ class Worker(QObject):
         for ni, (ncx, ncy, nscore) in enumerate(new_blobs):
             best_hi = -1
             best_dist = radius
-            for hi, (hcx, hcy, hpeak, hage, hhits) in enumerate(self._blob_history):
+            for hi, (hcx, hcy, hpeak, hage, hhits, hvx, hvy) in enumerate(self._blob_history):
                 if matched_history[hi]:
                     continue
                 d = ((ncx - hcx) ** 2 + (ncy - hcy) ** 2) ** 0.5
@@ -369,12 +445,14 @@ class Worker(QObject):
                     best_dist = d
                     best_hi = hi
             if best_hi >= 0:
-                # Update existing history entry with smoothed position
-                hcx, hcy, hpeak, hage, hhits = self._blob_history[best_hi]
+                # Update existing history entry with smoothed position and velocity
+                hcx, hcy, hpeak, hage, hhits, hvx, hvy = self._blob_history[best_hi]
                 alpha = 0.15  # moderate smoothing on history — Kalman handles the rest
                 new_hcx = hcx * (1 - alpha) + ncx * alpha
                 new_hcy = hcy * (1 - alpha) + ncy * alpha
-                self._blob_history[best_hi] = (new_hcx, new_hcy, nscore, 0, hhits + 1)
+                new_vx = hvx * 0.8 + (ncx - hcx) * 0.2
+                new_vy = hvy * 0.8 + (ncy - hcy) * 0.2
+                self._blob_history[best_hi] = (new_hcx, new_hcy, nscore, 0, hhits + 1, new_vx, new_vy)
                 matched_history[best_hi] = True
                 matched_new[ni] = True
 
@@ -382,24 +460,24 @@ class Worker(QObject):
         original_len = len(matched_history)
         updated = []
         for hi in range(original_len):
-            hcx, hcy, hpeak, hage, hhits = self._blob_history[hi]
+            hcx, hcy, hpeak, hage, hhits, hvx, hvy = self._blob_history[hi]
             if not matched_history[hi]:
                 hage += 1
                 if hage > self._blob_max_age:
                     continue  # remove stale blob
-                self._blob_history[hi] = (hcx, hcy, hpeak, hage, hhits)
+                self._blob_history[hi] = (hcx, hcy, hpeak, hage, hhits, hvx, hvy)
             updated.append(self._blob_history[hi])
 
         # Add unmatched new blobs to history
         for ni, (ncx, ncy, nscore) in enumerate(new_blobs):
             if not matched_new[ni]:
-                updated.append((ncx, ncy, nscore, 0, 1))
+                updated.append((ncx, ncy, nscore, 0, 1, 0.0, 0.0))
 
         self._blob_history = updated
 
         # Return stable blobs sorted by score
         stable = []
-        for hcx, hcy, hpeak, hage, hhits in self._blob_history:
+        for hcx, hcy, hpeak, hage, hhits, hvx, hvy in self._blob_history:
             if hhits >= self._blob_min_hits:
                 stable.append((hpeak, hcx, hcy))
         stable.sort(key=lambda x: -x[0])
@@ -494,7 +572,7 @@ class Worker(QObject):
                 result.append((cx, cy))
                 continue
 
-            result.append((int(round(wcx)), int(round(wcy))))
+            result.append((wcx, wcy))  # sub-pixel accuracy; caller rounds for drawing only
 
         self._auto_thresh_info = f"local_search r={radius} found={len(result)}"
         return result
@@ -516,7 +594,8 @@ class Worker(QObject):
         frame_h, frame_w = gray_full.shape[:2]
 
         # Light blur to reduce sensor noise but preserve blob peaks
-        blurred = cv2.GaussianBlur(gray_full, (5, 5), 0)
+        _blur_k = max(3, (frame_w // 256) * 2 + 1)  # 3@480p, 5@720p, 7@1080p
+        blurred = cv2.GaussianBlur(gray_full, (_blur_k, _blur_k), 0)
 
         edge_margin = max(3, int(min(frame_w, frame_h) * 0.005))
 
@@ -575,18 +654,24 @@ class Worker(QObject):
             if peak < _MIN_BLOB_BRIGHTNESS:
                 continue
 
+            # Dynamic sat threshold: if projector output is colored, relax saturation check
+            _effective_sat_thresh = _SAT_PENALTY_THRESHOLD
+
             if has_dark_ref:
                 # DIFFERENTIAL MODE: score based on how much blob responds to projector
                 # Static sources (monitors, lamps) have diff≈0, markers have high diff
                 if diff_brightness < _DIFF_BRIGHTNESS_FLOOR:
                     continue  # static source, not a projector-responsive marker
-                # Score: differential response is primary, size and whiteness are secondary
-                sat_penalty = max(0, avg_sat - _SAT_PENALTY_THRESHOLD) * _SAT_PENALTY_SCALE
-                score = diff_brightness * _SCORE_DIFF_WEIGHT + kp.size * _SCORE_SIZE_WEIGHT - sat_penalty
+                # Score: normalized differential response is primary, size and whiteness are secondary
+                _max_blob_size = max(20.0, frame_w * 0.04)  # expected max blob size at this resolution
+                score = (diff_brightness / 255.0) * _SCORE_DIFF_WEIGHT \
+                      + (kp.size / _max_blob_size) * _SCORE_SIZE_WEIGHT \
+                      - (avg_sat / 255.0) * _SAT_PENALTY_SCALE
             else:
-                # NO REFERENCE: fall back to absolute scoring
+                # NO REFERENCE: fall back to absolute scoring (normalized)
+                _max_blob_size = max(20.0, frame_w * 0.04)
                 sat_penalty = max(0, avg_sat - 40) * 0.3 + max(0, avg_sat - 120) * 1.0
-                score = kp.size * 10.0 + peak * 2.0 - sat_penalty
+                score = (kp.size / _max_blob_size) * 10.0 + (peak / 255.0) * 2.0 - (sat_penalty / 255.0)
 
             frame_blobs.append((wcx, wcy, score))
 
@@ -641,7 +726,10 @@ class Worker(QObject):
         _base = _os.path.dirname(_os.path.abspath(__file__))
 
         # --- Step 1: Compute diff to find projector coverage area ---
-        diff = np.clip(illum.astype(np.float32) - dark.astype(np.float32), 0, 255).astype(np.uint8)
+        if not hasattr(self, '_diff_buf') or self._diff_buf.shape != self._calib_dark_ref.shape:
+            self._diff_buf = np.empty_like(self._calib_dark_ref, dtype=np.uint8)
+        cv2.subtract(self._calib_illum_ref, self._calib_dark_ref, dst=self._diff_buf)
+        diff = self._diff_buf
         diff_blurred = cv2.GaussianBlur(diff, (15, 15), 0)
         if self._debug_mode:
             cv2.imwrite(_os.path.join(_base, "diff_image.png"), diff)
@@ -1032,7 +1120,7 @@ class Worker(QObject):
             and len(marker_config) > 1
             and len(detected_points) >= len(marker_config)
         ):
-            return detected_points
+            return []
 
         points_to_check = detected_points[: self.max_points_to_check]
         num_markers = len(marker_config)
@@ -1054,15 +1142,18 @@ class Worker(QObject):
             if len(current_fingerprint) != len(marker_fingerprint):
                 continue
 
-            if not all(
-                np.isclose(value, marker_fingerprint[i], rtol=0.15)
-                for i, value in enumerate(current_fingerprint)
-            ):
+            fingerprint_ok = True
+            for i, value in enumerate(current_fingerprint):
+                abs_tol = max(10.0, marker_fingerprint[i] * 0.10)
+                if abs(value - marker_fingerprint[i]) > abs_tol:
+                    fingerprint_ok = False
+                    break
+            if not fingerprint_ok:
                 continue
 
             dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
             matrix, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if matrix is None:
+            if matrix is None or not np.all(np.isfinite(matrix)) or abs(np.linalg.det(matrix[:2,:2])) < 1e-4:
                 continue
 
             transformed_src = cv2.perspectiveTransform(src_pts, matrix)
@@ -1094,47 +1185,45 @@ class Worker(QObject):
         return best_ordered_points
 
     def _match_points_to_previous(self, new_points):
-        """Match new detections to previous smoothed points via nearest-neighbor
-        to prevent point identity swapping between frames."""
+        """Optimal marker assignment using Hungarian algorithm to prevent identity swaps."""
         if not self.smoothed_points or len(self.smoothed_points) != len(new_points):
-            return new_points
-
-        n = len(new_points)
-        # Build cost matrix: distance from each previous point to each new point
-        used_new = [False] * n
-        ordered = [None] * n
-
-        # Greedy nearest-neighbor assignment
-        prev_arr = np.array(self.smoothed_points, dtype=np.float32)
-        new_arr = np.array(new_points, dtype=np.float32)
-
-        for _ in range(n):
-            best_dist = float('inf')
-            best_prev = -1
-            best_new = -1
+            return list(new_points)
+        n = len(self.smoothed_points)
+        prev_arr = np.array(self.smoothed_points, dtype=np.float64)
+        new_arr = np.array(new_points, dtype=np.float64)
+        # Cost matrix: pairwise squared distances
+        cost = np.sum((prev_arr[:, None, :] - new_arr[None, :, :]) ** 2, axis=2)
+        try:
+            from scipy.optimize import linear_sum_assignment
+            row_ind, col_ind = linear_sum_assignment(cost)
+            ordered = [None] * n
+            for r, c in zip(row_ind, col_ind):
+                ordered[r] = new_points[c]
+            # Fill any None (shouldn't happen with square matrix)
+            for i in range(n):
+                if ordered[i] is None:
+                    ordered[i] = new_points[i]
+            return ordered
+        except ImportError:
+            # Fallback: greedy nearest-neighbor if scipy not available
+            ordered = [None] * n
+            used = [False] * n
             for pi in range(n):
-                if ordered[pi] is not None:
-                    continue
+                best_dist, best_ni = float('inf'), -1
                 for ni in range(n):
-                    if used_new[ni]:
-                        continue
-                    d = float(np.sum((prev_arr[pi] - new_arr[ni]) ** 2))
-                    if d < best_dist:
-                        best_dist = d
-                        best_prev = pi
-                        best_new = ni
-            if best_prev >= 0:
-                ordered[best_prev] = new_points[best_new]
-                used_new[best_new] = True
+                    if not used[ni]:
+                        d = float(cost[pi, ni])
+                        if d < best_dist:
+                            best_dist, best_ni = d, ni
+                if best_ni >= 0:
+                    ordered[pi] = new_points[best_ni]
+                    used[best_ni] = True
+            for i in range(n):
+                if ordered[i] is None:
+                    ordered[i] = new_points[i]
+            return ordered
 
-        # Fill any remaining (shouldn't happen, but safety)
-        for i in range(n):
-            if ordered[i] is None:
-                ordered[i] = new_points[i]
-
-        return ordered
-
-    def _init_kalman_filter(self, x, y):
+    def _init_kalman_filter(self, x, y, motion: bool = False):
         """Create a Kalman filter for one marker point.
         State: [x, y, vx, vy] — position + velocity.
         Measurement: [x, y] — position only."""
@@ -1156,7 +1245,7 @@ class Worker(QObject):
 
         # Process noise: very low = trust the model, resist jitter
         # Markers are mostly stationary, so keep this very small
-        pn = 0.005  # process noise magnitude
+        pn = self._detection_params.kalman_motion_pn if motion else self._detection_params.kalman_static_pn
         kf.processNoiseCov = np.array([
             [pn, 0,  0,  0],
             [0,  pn, 0,  0],
@@ -1186,9 +1275,10 @@ class Worker(QObject):
             self.tracking_lost_frames += 1
             if self.smoothed_points and self.tracking_lost_frames <= self.max_lost_tracking_frames:
                 # Predict without measurement to maintain positions
-                if self._kalman_initialized:
-                    for kf in self._kalman_filters:
-                        kf.predict()
+                if self._kalman_initialized and len(self._kalman_filters) == len(self.smoothed_points) > 0:
+                    with self._state_lock:
+                        for kf in self._kalman_filters:
+                            kf.predict()
                 return self.smoothed_points
             self.smoothed_points = []
             self._kalman_filters = []
@@ -1221,6 +1311,15 @@ class Worker(QObject):
             dist = ((prev[0] - curr[0]) ** 2 + (prev[1] - curr[1]) ** 2) ** 0.5
             if dist > 60:
                 kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 80.0
+
+            # Detect motion from velocity state and adapt process noise
+            vx = float(kf.statePost[2, 0])
+            vy = float(kf.statePost[3, 0])
+            vel = (vx**2 + vy**2) ** 0.5
+            if vel > self._detection_params.kalman_motion_threshold:
+                kf.processNoiseCov = np.eye(4, dtype=np.float32) * self._detection_params.kalman_motion_pn
+            else:
+                kf.processNoiseCov = np.eye(4, dtype=np.float32) * self._detection_params.kalman_static_pn
 
             # Predict next state
             kf.predict()
@@ -1263,14 +1362,15 @@ class Worker(QObject):
 
     def _get_cached_source_points(self, mask):
         key = id(mask)
-        signature = tuple(tuple(p) for p in mask.source_points)
         if key in self._transform_cache:
             entry = self._transform_cache[key]
-            if entry["signature"] == signature:
-                # Move to end (most recently used)
+            # Fast pre-check: length match before full tuple comparison
+            if (len(entry["signature"]) == len(mask.source_points) and
+                    entry["signature"] == tuple(tuple(p) for p in mask.source_points)):
                 self._transform_cache.move_to_end(key)
                 return entry["src_pts"]
 
+        signature = tuple(tuple(p) for p in mask.source_points)
         src_pts = np.float32(mask.source_points)
         self._transform_cache[key] = {"signature": signature, "src_pts": src_pts}
         # Evict oldest entry if over limit
@@ -1295,7 +1395,6 @@ class Worker(QObject):
     def _save_calibration(self):
         """Persist calibration arrays to disk so recalibration is not needed after a crash."""
         try:
-            import json as _json
             cache_dir = self._calibration_cache_path()
             if self._calib_dark_ref is not None:
                 np.save(os.path.join(cache_dir, "dark_ref.npy"), self._calib_dark_ref)
@@ -1305,12 +1404,20 @@ class Worker(QObject):
                 np.save(os.path.join(cache_dir, "cam_proj_H.npy"), self._cam_to_proj_H)
             if self._calibrated_positions:
                 with open(os.path.join(cache_dir, "markers.json"), "w") as f:
-                    _json.dump({"markers": self._calibrated_positions,
-                                "distances": self._marker_distances or []}, f)
+                    json.dump({"markers": self._calibrated_positions,
+                               "distances": self._marker_distances or []}, f)
             # Write timestamp
-            import time as _time
             with open(os.path.join(cache_dir, "timestamp.txt"), "w") as f:
-                f.write(str(_time.time()))
+                f.write(str(time.time()))
+            # Write checksums for integrity verification
+            checksums = {}
+            for fname in ["dark_ref.npy", "illum_ref.npy", "cam_proj_H.npy", "markers.json"]:
+                fpath = os.path.join(cache_dir, fname)
+                if os.path.exists(fpath):
+                    with open(fpath, 'rb') as f:
+                        checksums[fname] = hashlib.sha256(f.read()).hexdigest()
+            with open(os.path.join(cache_dir, "checksums.json"), "w") as f:
+                json.dump(checksums, f)
             self.logger.info("Calibration saved to %s", cache_dir)
         except Exception:
             self.logger.warning("Failed to save calibration cache", exc_info=True)
@@ -1318,17 +1425,29 @@ class Worker(QObject):
     def _load_calibration(self):
         """Restore calibration from disk if saved within the last 24 hours."""
         try:
-            import json as _json
-            import time as _time
             cache_dir = self._calibration_cache_path()
             ts_path = os.path.join(cache_dir, "timestamp.txt")
             if not os.path.exists(ts_path):
                 return False
             with open(ts_path) as f:
                 saved_ts = float(f.read().strip())
-            if _time.time() - saved_ts > 86400:  # older than 24 h
+            if time.time() - saved_ts > 86400:  # older than 24 h
                 self.logger.info("Calibration cache is older than 24 h — skipping restore")
                 return False
+
+            # Verify checksums before loading
+            checksum_path = os.path.join(cache_dir, "checksums.json")
+            if os.path.exists(checksum_path):
+                with open(checksum_path) as f:
+                    expected = json.load(f)
+                for fname, expected_hash in expected.items():
+                    fpath = os.path.join(cache_dir, fname)
+                    if os.path.exists(fpath):
+                        with open(fpath, 'rb') as f:
+                            actual = hashlib.sha256(f.read()).hexdigest()
+                        if actual != expected_hash:
+                            self.logger.error("Calibration cache corrupt (%s checksum mismatch) — recalibration required", fname)
+                            return False
 
             dark_path = os.path.join(cache_dir, "dark_ref.npy")
             illum_path = os.path.join(cache_dir, "illum_ref.npy")
@@ -1345,7 +1464,7 @@ class Worker(QObject):
                 self._cam_to_proj_H = np.load(H_path)
 
             with open(markers_path) as f:
-                data = _json.load(f)
+                data = json.load(f)
             markers = [tuple(p) for p in data.get("markers", [])]
             distances = data.get("distances", [])
 
@@ -1355,7 +1474,7 @@ class Worker(QObject):
             self._calibrated_positions = markers
             self._marker_distances = distances if distances else None
             self._calibrated = True
-            self._calib_phase = "idle"
+            self._calib_phase = CalibPhase.IDLE
             self.markers_calibrated.emit(markers)
             self.logger.info("Calibration restored from cache (%d markers)", len(markers))
             return True
@@ -1411,6 +1530,33 @@ class Worker(QObject):
 
         return None
 
+    def _start_camera_read_thread(self, cap):
+        """Start a persistent background thread for camera reads to avoid per-frame thread overhead."""
+        self._cam_read_active = True
+        def _reader_loop():
+            while self._cam_read_active:
+                try:
+                    self._cam_read_request_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                try:
+                    ret, frame = cap.read()
+                    self._cam_read_result_q.put((ret, frame), timeout=0.1)
+                except Exception:
+                    self._cam_read_result_q.put((False, None), timeout=0.1)
+        self._cam_read_thread = threading.Thread(target=_reader_loop, daemon=True)
+        self._cam_read_thread.start()
+
+    def _stop_camera_read_thread(self):
+        self._cam_read_active = False
+        # Drain queues
+        while not self._cam_read_request_q.empty():
+            try: self._cam_read_request_q.get_nowait()
+            except: pass
+        while not self._cam_read_result_q.empty():
+            try: self._cam_read_result_q.get_nowait()
+            except: pass
+
     def process_video(self):
         try:
             self._process_video_inner()
@@ -1431,33 +1577,38 @@ class Worker(QObject):
             frame_start = time.perf_counter()
 
             if self._camera_changed:
+                self._stop_camera_read_thread()
                 if main_cap:
                     main_cap.release()
                 main_cap = self._open_camera()
                 if main_cap is None:
                     self.camera_error.emit(self.video_source)
+                else:
+                    self._start_camera_read_thread(main_cap)
                 self._camera_changed = False
+                self._camera_changed_event.clear()
 
             if main_cap is None:
                 QThread.msleep(100)
                 continue
 
             t0 = time.perf_counter()
-            # Timed camera read — prevents blocking forever on USB freeze (#29)
-            _result = [False, None]
-            def _do_read():
-                _result[0], _result[1] = main_cap.read()
-            _read_thread = threading.Thread(target=_do_read, daemon=True)
-            _read_thread.start()
-            _read_thread.join(timeout=3.0)
-            if _read_thread.is_alive():
-                self.logger.warning("Camera read timed out — triggering reconnect")
-                self._camera_changed = True
-                capture_ms = 3000.0
+            try:
+                self._cam_read_request_q.put_nowait(True)
+                try:
+                    ret, main_frame = self._cam_read_result_q.get(timeout=3.0)
+                except queue.Empty:
+                    self.logger.warning("Camera read timed out — triggering reconnect")
+                    self._stop_camera_read_thread()
+                    self._camera_changed = True
+                    capture_ms = 3000.0
+                    continue
+            except queue.Full:
+                # Previous read not consumed — skip frame
+                QThread.msleep(5)
                 continue
-            ret, main_frame = _result[0], _result[1]
             capture_ms = (time.perf_counter() - t0) * 1000.0
-            if not ret:
+            if not ret or main_frame is None:
                 self.camera_error.emit(self.video_source)
                 QThread.msleep(200)
                 continue
@@ -1472,7 +1623,7 @@ class Worker(QObject):
 
             # ---- Calibration state machine ----
             # If idle (not calibrating and not calibrated), just show camera feed
-            if not self._calibrated and self._calib_phase == "idle":
+            if not self._calibrated and self._calib_phase == CalibPhase.IDLE:
                 # Show status overlay prompting user to calibrate
                 cv2.putText(main_frame, "Press 'Calibrate' to start",
                             (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
@@ -1490,84 +1641,92 @@ class Worker(QObject):
                 continue
 
             # Phase 1: DARK - projector OFF, collect dark reference
-            if not self._calibrated and self._calib_phase == "dark":
+            if not self._calibrated and self._calib_phase == CalibPhase.DARK:
                 self._calib_frame_count += 1
                 # No exposure lock — let auto-exposure handle each phase naturally
                 gray_frame = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
                 if self._calib_frame_count > 10:  # skip first 10 (camera settling)
-                    self._calib_dark_frames.append(gray_frame.astype(np.float32))
+                    # Welford online mean accumulation
+                    gray_f64 = gray_frame.astype(np.float64)
+                    if self._calib_dark_sum is None:
+                        self._calib_dark_sum = gray_f64.copy()
+                        self._calib_dark_count = 1
+                    else:
+                        self._calib_dark_sum += gray_f64
+                        self._calib_dark_count += 1
                 if self._calib_frame_count >= 25:
-                    if self._calib_dark_frames:
-                        self._calib_dark_ref = np.mean(
-                            self._calib_dark_frames, axis=0
-                        ).astype(np.uint8)
+                    if self._calib_dark_count > 0:
+                        self._calib_dark_ref = (self._calib_dark_sum / self._calib_dark_count).astype(np.uint8)
                         if self._debug_mode:
                             import os as _os
                             _base = _os.path.dirname(_os.path.abspath(__file__))
                             cv2.imwrite(_os.path.join(_base, "dark_ref.png"), self._calib_dark_ref)
-                    self._calib_dark_frames = []  # free memory
-                    self._calib_phase = "illuminate"
+                    self._calib_dark_sum = None
+                    self._calib_dark_count = 0
+                    self._calib_phase = CalibPhase.ILLUMINATE
                     self._calib_frame_count = 0
                     self.logger.info("Calibration: dark reference captured, switching to illuminate phase")
                 # Show status, emit frames, skip detection
-                self.calibration_progress.emit("Dark Reference", self._calib_frame_count, 25)
+                self.calibration_progress.emit(CalibPhase.DARK.name, self._calib_frame_count, 25)
                 cv2.putText(main_frame, f"CALIBRATING - Dark ref {self._calib_frame_count}/25",
                             (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                qt_main = QImage(
-                    cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB).tobytes(),
-                    w, h, w * 3, QImage.Format_RGB888)
+                cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                qt_main = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
                 self.frame_ready.emit(qt_main)
-                qt_proj = QImage(
-                    cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB).tobytes(),
-                    w, h, w * 3, QImage.Format_RGB888)
+                cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                qt_proj = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
                 self.projector_frame_ready.emit(qt_proj)
                 self.trackers_detected.emit(0)
                 continue
 
             # Phase 2: ILLUMINATE - projector FULL WHITE, collect illuminated reference
-            if not self._calibrated and self._calib_phase == "illuminate":
+            if not self._calibrated and self._calib_phase == CalibPhase.ILLUMINATE:
                 projector_output[:] = 200  # bright white for retroreflective response (not 255 to avoid camera auto-exposure saturation)
                 self._calib_frame_count += 1
                 gray_frame = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
                 if self._calib_frame_count > 30:  # skip first 30 (projector on + auto-exposure settle)
-                    self._calib_illum_frames.append(gray_frame.astype(np.float32))
+                    # Welford online mean accumulation
+                    gray_f64 = gray_frame.astype(np.float64)
+                    if self._calib_illum_sum is None:
+                        self._calib_illum_sum = gray_f64.copy()
+                        self._calib_illum_count = 1
+                    else:
+                        self._calib_illum_sum += gray_f64
+                        self._calib_illum_count += 1
                 if self._calib_frame_count >= 45:
-                    if self._calib_illum_frames:
-                        self._calib_illum_ref = np.mean(
-                            self._calib_illum_frames, axis=0
-                        ).astype(np.uint8)
+                    if self._calib_illum_count > 0:
+                        self._calib_illum_ref = (self._calib_illum_sum / self._calib_illum_count).astype(np.uint8)
                         if self._debug_mode:
                             import os as _os
                             _base = _os.path.dirname(_os.path.abspath(__file__))
                             cv2.imwrite(_os.path.join(_base, "illum_ref.png"), self._calib_illum_ref)
-                    self._calib_illum_frames = []  # free memory
-                    self._calib_phase = "detect"
+                    self._calib_illum_sum = None
+                    self._calib_illum_count = 0
+                    self._calib_phase = CalibPhase.DETECT
                     self._calib_frame_count = 0
                     self.logger.info("Calibration: illuminate reference captured, switching to detect phase")
                 # Show status, emit frames
-                self.calibration_progress.emit("Projector On", self._calib_frame_count, 45)
+                self.calibration_progress.emit(CalibPhase.ILLUMINATE.name, self._calib_frame_count, 45)
                 cv2.putText(main_frame, f"CALIBRATING - Illuminate {self._calib_frame_count}/45",
                             (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                qt_main = QImage(
-                    cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB).tobytes(),
-                    w, h, w * 3, QImage.Format_RGB888)
+                cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                qt_main = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
                 self.frame_ready.emit(qt_main)
-                qt_proj = QImage(
-                    cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB).tobytes(),
-                    w, h, w * 3, QImage.Format_RGB888)
+                cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                qt_proj = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
                 self.projector_frame_ready.emit(qt_proj)
                 self.trackers_detected.emit(0)
                 continue
 
             # Phase 3: DETECT - one-shot difference-based marker detection
-            if not self._calibrated and self._calib_phase == "detect":
-                self._calib_phase = "done"  # only run once
+            if not self._calibrated and self._calib_phase == CalibPhase.DETECT:
+                self._calib_phase = CalibPhase.DONE  # only run once
                 # Guard: both references must exist before diff computation (#27)
                 if self._calib_dark_ref is None or self._calib_illum_ref is None:
                     self.logger.warning(
                         "Calibration: missing dark or illuminate reference — restarting"
                     )
-                    self._calib_phase = "dark"
+                    self._calib_phase = CalibPhase.DARK
                     self._calib_frame_count = 0
                     self._calib_dark_ref = None
                     self._calib_illum_ref = None
@@ -2060,13 +2219,13 @@ class Worker(QObject):
         for cap in self.video_captures.values():
             cap.release()
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
 
     def set_warp_points(self, points):
         self.warp_points = points
 
-    def set_masks(self, masks):
+    def set_masks(self, masks: list) -> None:
         self.masks = masks
         current_cues = set()
         for mask in self.masks:
@@ -2080,7 +2239,8 @@ class Worker(QObject):
             if cache_id not in valid_mask_ids:
                 del self._transform_cache[cache_id]
 
-        for cue in list(self.video_captures.keys()):
-            if cue not in current_cues:
-                self.video_captures[cue].release()
-                del self.video_captures[cue]
+        with self._video_captures_lock:
+            for cue in list(self.video_captures.keys()):
+                if cue not in current_cues:
+                    self.video_captures[cue].release()
+                    del self.video_captures[cue]

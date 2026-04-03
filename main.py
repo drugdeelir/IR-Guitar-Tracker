@@ -11,7 +11,8 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QByteArray, QEventLoop, QPoint, QThread, Qt, QTimer, pyqtSlot
+from PyQt5 import QtCore
+from PyQt5.QtCore import QByteArray, QEventLoop, QPoint, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -53,6 +54,9 @@ except ImportError:
 
 SETTINGS_PATH = Path("settings.json")
 
+__version__ = "1.0.0"
+_SETTINGS_VERSION = 3
+
 
 def configure_opencv_logging():
     from logging.handlers import RotatingFileHandler
@@ -79,6 +83,25 @@ def configure_opencv_logging():
             cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
         except AttributeError:
             pass  # OpenCV build does not expose logging API; silently skip
+
+
+def _migrate_settings(d: dict) -> dict:
+    """Migrate settings dict to current version."""
+    version = d.get("version", 1)
+    if version < 2:
+        # v1→v2: masks moved from flat list to structured dicts
+        d["version"] = 2
+    if version < 3:
+        # v2→v3: added render_order and locked fields to masks
+        for mask_dict in d.get("masks", []):
+            mask_dict.setdefault("render_order", 0)
+            mask_dict.setdefault("locked", False)
+        d["version"] = 3
+    return d
+
+
+# Alias so CameraScanThread can import without circular issues
+_scan_cameras = None  # will be set after get_available_cameras is defined
 
 
 class StartupWizardDialog(QDialog):
@@ -185,10 +208,30 @@ def get_available_cameras(max_probe=8):
     return arr
 
 
+_scan_cameras = get_available_cameras
+
+
+class CameraScanThread(QThread):
+    cameras_found = pyqtSignal(list)
+
+    def run(self):
+        cameras = _scan_cameras()
+        self.cameras_found.emit(cameras)
+
+
 class ProjectionMappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Projection Mapping Tool")
+        self.logger = logging.getLogger("ProjectionMappingApp")
+        self.logger.info(
+            "IR Guitar Tracker v%s | OpenCV %s | Qt %s | NumPy %s | Python %s",
+            __version__,
+            cv2.__version__,
+            QtCore.PYQT_VERSION_STR if hasattr(QtCore, 'PYQT_VERSION_STR') else '?',
+            np.__version__,
+            sys.version.split()[0],
+        )
+        self.setWindowTitle(f"IR Guitar Tracker v{__version__}")
         self.setGeometry(100, 100, 1200, 800)
         self.masks = []
         self.selected_markers = []
@@ -197,7 +240,6 @@ class ProjectionMappingApp(QMainWindow):
         self._is_closing = False
         self._camera_retry_count = 0
         self.settings = self.load_settings()
-        self.logger = logging.getLogger("ProjectionMappingApp")
 
         self.setStatusBar(QStatusBar(self))
 
@@ -226,19 +268,19 @@ class ProjectionMappingApp(QMainWindow):
         self.video_display.mask_point_added.connect(self.add_mask_point_to_list)
         self.projector_window.show()
 
-        self.worker.frame_ready.connect(self.video_display.set_image)
-        self.worker.frame_ready.connect(self.cache_latest_frame)
-        self.worker.projector_frame_ready.connect(self.projector_window.set_image)
-        self.worker.projector_frame_ready.connect(self.update_projector_preview)
+        self.worker.frame_ready.connect(self.video_display.set_image, Qt.QueuedConnection)
+        self.worker.frame_ready.connect(self.cache_latest_frame, Qt.QueuedConnection)
+        self.worker.projector_frame_ready.connect(self.projector_window.set_image, Qt.QueuedConnection)
+        self.worker.projector_frame_ready.connect(self.update_projector_preview, Qt.QueuedConnection)
         self.projector_window.warp_points_changed.connect(self.worker.set_warp_points)
-        self.worker.trackers_detected.connect(self.update_tracker_label)
-        self.worker.camera_error.connect(self.show_camera_error)
-        self.worker.performance_updated.connect(self.update_performance_label)
-        self.worker.camera_info_updated.connect(self.update_camera_info)
-        self.worker.markers_calibrated.connect(self._on_markers_calibrated)
-        self.worker.worker_stopped.connect(self._on_worker_stopped)
-        self.worker.calibration_progress.connect(self._on_calibration_progress)
-        self.worker.performance_degraded.connect(self._on_performance_degraded)
+        self.worker.trackers_detected.connect(self.update_tracker_label, Qt.QueuedConnection)
+        self.worker.camera_error.connect(self.show_camera_error, Qt.QueuedConnection)
+        self.worker.performance_updated.connect(self.update_performance_label, Qt.QueuedConnection)
+        self.worker.camera_info_updated.connect(self.update_camera_info, Qt.QueuedConnection)
+        self.worker.markers_calibrated.connect(self._on_markers_calibrated, Qt.QueuedConnection)
+        self.worker.worker_stopped.connect(self._on_worker_stopped, Qt.QueuedConnection)
+        self.worker.calibration_progress.connect(self._on_calibration_progress, Qt.QueuedConnection)
+        self.worker.performance_degraded.connect(self._on_performance_degraded, Qt.QueuedConnection)
 
         # Screen-change recovery: repopulate projector combo when displays change
         _app = QApplication.instance()
@@ -251,11 +293,31 @@ class ProjectionMappingApp(QMainWindow):
         )
         self.worker.still_frame_ready.connect(self.set_marker_selection_image)
 
+        self._save_settings_timer = QTimer(self)
+        self._save_settings_timer.setSingleShot(True)
+        self._save_settings_timer.setInterval(2000)
+        self._save_settings_timer.timeout.connect(self._do_save_settings)
+
         self.apply_loaded_settings()
         self.refresh_mask_views()
         self.change_projector(self.projector_combo.currentIndex())
         self.maybe_show_startup_wizard()
         self._auto_create_test_masks()
+
+        self._midi_port_names = []
+        self._midi_hotplug_timer = QTimer(self)
+        self._midi_hotplug_timer.setInterval(2000)
+        self._midi_hotplug_timer.timeout.connect(self._check_midi_hotplug)
+        self._midi_hotplug_timer.start()
+
+        import os as _os
+        if _os.environ.get('IRTK_PROFILE_MEMORY'):
+            import tracemalloc
+            tracemalloc.start()
+            self._memory_check_timer = QTimer(self)
+            self._memory_check_timer.setInterval(300_000)  # every 5 minutes
+            self._memory_check_timer.timeout.connect(self._check_memory)
+            self._memory_check_timer.start()
 
         self.thread.started.connect(self.worker.process_video)
         self.thread.start()
@@ -265,11 +327,48 @@ class ProjectionMappingApp(QMainWindow):
     def load_settings(self):
         if SETTINGS_PATH.exists():
             try:
-                return json.loads(SETTINGS_PATH.read_text())
+                data = json.loads(SETTINGS_PATH.read_text())
+                data = _migrate_settings(data)
+                return self._validate_settings(data)
             except (OSError, json.JSONDecodeError) as exc:
-                logging.getLogger("MainWindow").warning("Could not load settings: %s", exc)
-                return {}
+                self.logger.warning("Could not load settings: %s", exc)
+                # Try backup file
+                backup = SETTINGS_PATH.with_name('settings_backup.json')
+                if backup.exists():
+                    try:
+                        data = json.loads(backup.read_text())
+                        data = _migrate_settings(data)
+                        self.logger.info("Restored settings from backup")
+                        return self._validate_settings(data)
+                    except Exception:
+                        pass
+                return {"_corrupted": True}
         return {}
+
+    def _validate_settings(self, d: dict) -> dict:
+        """Coerce and clamp all settings fields to valid types and ranges."""
+        def _int(key, default, lo, hi):
+            try: return max(lo, min(hi, int(d.get(key, default))))
+            except (TypeError, ValueError): return default
+        def _bool(key, default):
+            v = d.get(key, default)
+            return bool(v) if isinstance(v, bool) else default
+        def _str(key, default, allowed=None):
+            v = str(d.get(key, default))
+            return v if (allowed is None or v in allowed) else default
+
+        return {
+            **d,  # preserve unknown keys
+            "ir_threshold": _int("ir_threshold", 200, 0, 255),
+            "depth_sensitivity": _int("depth_sensitivity", 100, 1, 500),
+            "camera_index": _int("camera_index", 0, 0, 99),
+            "projector_index": _int("projector_index", 0, 0, 20),
+            "threshold_mode": _int("threshold_mode", 0, 0, 1),
+            "auto_sync_enabled": _bool("auto_sync_enabled", True),
+            "show_preview_enabled": _bool("show_preview_enabled", True),
+            "show_mask_overlays": _bool("show_mask_overlays", True),
+            "camera_mode": _str("camera_mode", "native", {"native", "performance", "hd"}),
+        }
 
     def save_settings(self):
         settings = {
@@ -290,11 +389,36 @@ class ProjectionMappingApp(QMainWindow):
             "splitter_sizes": self.main_splitter.sizes(),
         }
         try:
-            SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+            # Rotate backup files
+            if SETTINGS_PATH.exists():
+                _backup = SETTINGS_PATH.with_name('settings_backup.json')
+                try:
+                    import shutil
+                    shutil.copy2(str(SETTINGS_PATH), str(_backup))
+                except Exception:
+                    pass
+            _tmp = SETTINGS_PATH.with_suffix('.tmp')
+            _tmp.write_text(json.dumps(settings, indent=2))
+            _tmp.replace(SETTINGS_PATH)
         except OSError as exc:
             self.logger.error("Could not save settings: %s", exc)
 
+    def _do_save_settings(self):
+        """Debounced settings save — called 2s after last change."""
+        self.save_settings()
+
+    def request_save_settings(self):
+        """Trigger a debounced settings save."""
+        self._save_settings_timer.start()
+
     def apply_loaded_settings(self):
+        assert not self.thread.isRunning(), "apply_loaded_settings must be called before thread start"
+        if self.settings.get("_corrupted"):
+            QMessageBox.warning(
+                self, "Settings Corrupted",
+                "Your settings file was corrupted and could not be loaded.\n"
+                "Default settings have been applied. Your show configuration may need to be reconfigured."
+            )
         ir_threshold = self.settings.get("ir_threshold", 200)
         self.ir_threshold_slider.setValue(ir_threshold)
         threshold_mode = self.settings.get("threshold_mode", 0)
@@ -1352,22 +1476,46 @@ class ProjectionMappingApp(QMainWindow):
     def _on_calibration_progress(self, phase, current, total):
         if not hasattr(self, '_calib_progress_dialog') or self._calib_progress_dialog is None:
             self._calib_progress_dialog = QProgressDialog(
-                f"Calibrating: {phase}", None, 0, total, self)
+                f"Calibrating: {phase}", "Cancel", 0, total, self)
             self._calib_progress_dialog.setWindowTitle("Calibration")
             self._calib_progress_dialog.setWindowModality(Qt.WindowModal)
             self._calib_progress_dialog.setMinimumDuration(0)
             self._calib_progress_dialog.setValue(0)
             self._calib_progress_dialog.show()
+            self._calib_progress_dialog.canceled.connect(self._cancel_calibration)
             # Safety timeout: close dialog and notify operator if calibration stalls (#33)
             self._calib_timeout_timer = QTimer(self)
             self._calib_timeout_timer.setSingleShot(True)
             self._calib_timeout_timer.timeout.connect(self._on_calibration_timeout)
             self._calib_timeout_timer.start(90_000)
-        self._calib_progress_dialog.setLabelText(f"Calibrating: {phase}")
+        _phase_instructions = {
+            "DARK": "Turn OFF all stage lights — projector must be OFF",
+            "ILLUMINATE": "Turn projector to FULL WHITE — keep markers in frame",
+            "DETECT": "Hold still — detecting IR marker positions...",
+            "PROJ_SCAN": "Do not block camera — computing projector mapping...",
+            "Error — restarting": "Calibration restarting — check camera and lighting",
+        }
+        instruction = _phase_instructions.get(phase, f"Calibrating: {phase}")
+        self._calib_progress_dialog.setLabelText(instruction)
         self._calib_progress_dialog.setMaximum(total)
         self._calib_progress_dialog.setValue(current)
         if current >= total:
             self._close_calibration_dialog()
+
+    def _cancel_calibration(self):
+        """Operator cancels calibration mid-run."""
+        self.worker.start_calibration()  # This resets the calibration state
+        self._close_calibration_dialog()
+        self.statusBar().showMessage("Calibration cancelled.", 3000)
+
+    def _status_message(self, msg: str, level: str = "info", timeout_ms: int = 5000):
+        """Show a status bar message with color coding by level."""
+        colors = {"info": "", "warning": "color: orange", "error": "color: red", "success": "color: #00cc44"}
+        self.statusBar().setStyleSheet(f"QStatusBar {{ {colors.get(level, '')} }}")
+        self.statusBar().showMessage(msg, timeout_ms)
+        if level == "info":
+            # Reset color after timeout
+            QTimer.singleShot(timeout_ms + 100, lambda: self.statusBar().setStyleSheet(""))
 
     def _close_calibration_dialog(self):
         """Close calibration dialog and cancel its safety timer."""
@@ -1380,6 +1528,10 @@ class ProjectionMappingApp(QMainWindow):
 
     def _on_calibration_timeout(self):
         """Called when calibration dialog has been open for 90 s without completing."""
+        if self._is_closing:
+            return
+        if not hasattr(self, '_calib_progress_dialog'):
+            return
         self._close_calibration_dialog()
         QMessageBox.warning(
             self, "Calibration Timed Out",
@@ -1672,12 +1824,19 @@ class ProjectionMappingApp(QMainWindow):
             self.midi_inport.close()
             self.midi_inport = None
         name = self.midi_input_combo.currentText()
+        self.midi_inport = None
         try:
             self.midi_inport = mido.open_input(name)
             self.statusBar().showMessage(f"Connected MIDI input: {name}", 3000)
         except Exception as exc:
-            self.logger.exception("Failed to open MIDI input")
-            self.statusBar().showMessage(f"MIDI connect failed: {exc}", 5000)
+            self.logger.exception("Failed to open MIDI input '%s'", name)
+            if self.midi_inport is not None:
+                try:
+                    self.midi_inport.close()
+                except Exception:
+                    pass
+                self.midi_inport = None
+            QMessageBox.critical(self, "MIDI Error", f"Could not open MIDI port '{name}'.\n\nError: {exc}")
 
     def poll_midi_messages(self):
         if self.midi_inport is None:
@@ -1687,7 +1846,14 @@ class ProjectionMappingApp(QMainWindow):
                 if msg.type == "control_change":
                     self.route_midi_cc(int(msg.control), int(msg.value))
         except Exception:
-            self.logger.exception("MIDI polling error")
+            self.logger.exception("MIDI polling error — closing port")
+            try:
+                if self.midi_inport:
+                    self.midi_inport.close()
+            except Exception:
+                pass
+            self.midi_inport = None
+            self.statusBar().showMessage("MIDI port disconnected — reconnect in MIDI panel", 10_000)
 
     def route_midi_cc(self, cc, value):
         if value <= 0:
@@ -1763,6 +1929,36 @@ class ProjectionMappingApp(QMainWindow):
                 self.midi_inport.close()
             except Exception as exc:
                 self.logger.warning("MIDI port close error: %s", exc)
+        # Stop all timers first to prevent callbacks on destroyed objects
+        if hasattr(self, 'midi_poll_timer') and self.midi_poll_timer:
+            self.midi_poll_timer.stop()
+        if hasattr(self, '_save_settings_timer') and self._save_settings_timer:
+            self._save_settings_timer.stop()
+        if hasattr(self, '_calib_timeout_timer') and self._calib_timeout_timer:
+            self._calib_timeout_timer.stop()
+            self._calib_timeout_timer = None
+        if hasattr(self, '_midi_hotplug_timer') and self._midi_hotplug_timer:
+            self._midi_hotplug_timer.stop()
+        # Disconnect all worker signals before stopping thread
+        try:
+            self.worker.frame_ready.disconnect()
+            self.worker.projector_frame_ready.disconnect()
+            self.worker.trackers_detected.disconnect()
+            self.worker.camera_error.disconnect()
+            self.worker.performance_updated.disconnect()
+            self.worker.camera_info_updated.disconnect()
+            self.worker.markers_calibrated.disconnect()
+            self.worker.worker_stopped.disconnect()
+            self.worker.calibration_progress.disconnect()
+            self.worker.performance_degraded.disconnect()
+        except RuntimeError:
+            pass
+        # Save calibration state before exit
+        if self.worker._calibrated:
+            try:
+                self.worker._save_calibration()
+            except Exception:
+                pass
         self.worker.stop()
         self.thread.quit()
         self.thread.wait()
