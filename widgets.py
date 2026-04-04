@@ -1,8 +1,11 @@
-from PyQt5.QtCore import QPoint, QPointF, Qt, pyqtSignal
+from PyQt5.QtCore import QPoint, QPointF, QTimer, Qt, pyqtSignal
 import cv2
 import numpy as np
 from PyQt5.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
-from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout, QPushButton, QWidget
+from PyQt5.QtWidgets import (
+    QDialog, QHBoxLayout, QLabel, QMessageBox, QSizePolicy,
+    QVBoxLayout, QPushButton, QWidget,
+)
 
 
 class MarkerSelectionDialog(QDialog):
@@ -23,16 +26,30 @@ class MarkerSelectionDialog(QDialog):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.mousePressEvent = self.image_clicked
         self.take_picture_button = QPushButton("Take Picture")
+        self.take_picture_button.setToolTip("Capture a still frame from the live camera feed.")
         self.auto_select_button = QPushButton("Auto-Select Best 4")
+        self.auto_select_button.setToolTip("Automatically pick the 4 brightest IR candidates.")
         self.auto_select_button.clicked.connect(self.auto_select_markers)
 
+        # Improvement: marker count badge label
+        self.count_label = QLabel("Markers selected: 0 / 4")
+
+        btn_row = QHBoxLayout()
         self.confirm_button = QPushButton("Confirm Markers")
+        self.confirm_button.setToolTip("Accept the selected marker positions.")
         self.confirm_button.clicked.connect(self.accept)
+        # Improvement: clear all button
+        self.clear_all_button = QPushButton("Clear All")
+        self.clear_all_button.setToolTip("Remove all selected marker points.")
+        self.clear_all_button.clicked.connect(self.clear_selection)
+        btn_row.addWidget(self.confirm_button)
+        btn_row.addWidget(self.clear_all_button)
 
         self.layout.addWidget(self.image_label)
+        self.layout.addWidget(self.count_label)
         self.layout.addWidget(self.take_picture_button)
         self.layout.addWidget(self.auto_select_button)
-        self.layout.addWidget(self.confirm_button)
+        self.layout.addLayout(btn_row)
 
     def set_ir_assist_enabled(self, enabled):
         self.ir_assist_enabled = bool(enabled)
@@ -184,13 +201,22 @@ class MarkerSelectionDialog(QDialog):
 
         preview = self.original_pixmap.copy()
         painter = QPainter(preview)
-        painter.setPen(QPen(Qt.red, 5))
-        for point in self.detected_ir_points:
-            painter.drawEllipse(point, 7, 7)
-        painter.setPen(QPen(Qt.green, 10))
+
+        # Draw detected IR candidates in red with small candidate numbers
+        painter.setPen(QPen(Qt.red, 2))
+        for i, point in enumerate(self.detected_ir_points, start=1):
+            painter.drawEllipse(point, 8, 8)
+            painter.setPen(QPen(Qt.yellow, 1))
+            painter.drawText(point.x() + 10, point.y() - 2, str(i))
+            painter.setPen(QPen(Qt.red, 2))
+
+        # Draw selected markers in green with large numbered labels
+        painter.setPen(QPen(Qt.green, 3))
         for i, point in enumerate(self.selected_points, start=1):
-            painter.drawPoint(point)
-            painter.drawText(point.x() + 6, point.y() - 6, str(i))
+            painter.drawEllipse(point, 12, 12)
+            painter.setPen(QPen(Qt.white, 1))
+            painter.drawText(point.x() + 14, point.y() - 8, str(i))
+            painter.setPen(QPen(Qt.green, 3))
         painter.end()
 
         scaled_preview = preview.scaled(
@@ -198,7 +224,19 @@ class MarkerSelectionDialog(QDialog):
         )
         self.image_label.setPixmap(scaled_preview)
 
+        # Update count badge
+        if hasattr(self, 'count_label'):
+            n = len(self.selected_points)
+            self.count_label.setText(f"Markers selected: {n} / {self.max_markers}")
+
     def image_clicked(self, event):
+        # Improvement: right-click removes the last selected marker
+        if event.button() == Qt.RightButton:
+            if self.selected_points:
+                self.selected_points.pop()
+                self._render_preview()
+            return
+
         if len(self.selected_points) >= self.max_markers:
             return
         point = self._label_to_image(event.pos())
@@ -230,12 +268,26 @@ class MarkerSelectionDialog(QDialog):
 
 class VideoDisplay(QWidget):
     mask_point_added = pyqtSignal(QPoint)
+    mask_point_removed = pyqtSignal()  # Improvement: right-click undo
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mask_creation_mode = False
         self.mask_points = []
         self.current_pixmap = None
+        # Improvement: grid overlay for alignment
+        self.grid_overlay_enabled = False
+        self._grid_divisions = 10
+        # Improvement: tracking state indicator dot
+        self._tracking_state = "idle"  # "idle" | "tracking" | "lost" | "error"
+
+    def set_grid_overlay(self, enabled: bool) -> None:
+        self.grid_overlay_enabled = bool(enabled)
+        self.update()
+
+    def set_tracking_state(self, state: str) -> None:
+        self._tracking_state = state
+        self.update()
 
     def set_image(self, image):
         self.current_pixmap = QPixmap.fromImage(image)
@@ -287,15 +339,53 @@ class VideoDisplay(QWidget):
             scaled = self.current_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawPixmap(x, y, scaled)
 
+            # Improvement: grid overlay
+            if self.grid_overlay_enabled and draw_w > 0 and draw_h > 0:
+                grid_pen = QPen(QColor(200, 200, 200, 80), 1)
+                painter.setPen(grid_pen)
+                n = self._grid_divisions
+                for i in range(1, n):
+                    gx = x + i * draw_w // n
+                    gy = y + i * draw_h // n
+                    painter.drawLine(gx, y, gx, y + draw_h)
+                    painter.drawLine(x, gy, x + draw_w, gy)
+
             if self.mask_creation_mode and self.mask_points:
                 painter.setPen(QPen(Qt.green, 2))
                 widget_points = [self._image_to_widget_point(p) for p in self.mask_points]
-                widget_points = [p for p in widget_points if p is not None]
+                widget_points = [wp for wp in widget_points if wp is not None]
                 if len(widget_points) >= 2:
                     painter.drawPolyline(QPolygonF(widget_points))
+                # Close polygon when ≥3 points
+                if len(widget_points) >= 3:
+                    painter.setPen(QPen(QColor(0, 255, 0, 120), 1))
+                    painter.drawLine(widget_points[-1], widget_points[0])
+
+            # Improvement: tracking state dot in top-right corner of video area
+            if rect:
+                _state_colors = {
+                    "tracking": QColor(0, 220, 80),
+                    "lost":     QColor(255, 170, 0),
+                    "error":    QColor(220, 40, 40),
+                    "idle":     QColor(100, 100, 100),
+                }
+                dot_color = _state_colors.get(self._tracking_state, QColor(100, 100, 100))
+                dot_r = 7
+                dot_x = x + draw_w - dot_r - 6
+                dot_y = y + dot_r + 6
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(dot_color))
+                painter.drawEllipse(dot_x - dot_r, dot_y - dot_r, dot_r * 2, dot_r * 2)
 
     def mousePressEvent(self, event):
         if self.mask_creation_mode:
+            # Improvement: right-click removes last mask point
+            if event.button() == Qt.RightButton:
+                if self.mask_points:
+                    self.mask_points.pop()
+                    self.mask_point_removed.emit()
+                    self.update()
+                return
             point = self._widget_to_image_point(event.pos())
             if point is None:
                 return
@@ -339,16 +429,25 @@ class ProjectorWindow(QWidget):
         self.pattern_margin_ratio = 0.08
         self.warp_points = [QPointF(0.0, 0.0), QPointF(1.0, 0.0), QPointF(1.0, 1.0), QPointF(0.0, 1.0)]
         self.dragging_point_index = -1
+        # Improvement: blackout flag
+        self._blackout = False
         self.show()
 
     def set_image(self, image):
-        if self.pattern_mode:
+        if self.pattern_mode or self._blackout:
             return
         pixmap = QPixmap.fromImage(image)
         size = self.label.size()
         if size.width() > 1 and size.height() > 1:
             pixmap = pixmap.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         self.label.setPixmap(pixmap)
+
+    def set_blackout(self, enabled: bool) -> None:
+        """Improvement: instantly blackout projector window."""
+        self._blackout = bool(enabled)
+        if self._blackout:
+            self.label.clear()
+        self.repaint()
 
     def set_pattern_mode(self, enabled, brightness=255):
         self.pattern_mode = bool(enabled)
@@ -384,7 +483,9 @@ class ProjectorWindow(QWidget):
         self.label.setPixmap(QPixmap.fromImage(image))
 
     def set_calibration_mode(self, enabled):
-        self.calibration_mode = enabled
+        self.calibration_mode = bool(enabled)
+        # Improvement: change cursor in calibration mode for clear affordance
+        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         self.update()
 
     def reset_warp_points(self):
@@ -396,15 +497,33 @@ class ProjectorWindow(QWidget):
         super().paintEvent(event)
         if self.calibration_mode:
             painter = QPainter(self)
-            painter.setPen(QPen(Qt.red, 10))
+            w, h = self.width(), self.height()
 
-            denormalized_points = [
-                QPoint(int(p.x() * self.width()), int(p.y() * self.height()))
+            denorm = [
+                QPoint(int(p.x() * w), int(p.y() * h))
                 for p in self.warp_points
             ]
 
-            for point in denormalized_points:
-                painter.drawPoint(point)
+            # Improvement: draw semi-transparent warp quad
+            if len(denorm) == 4:
+                painter.setPen(QPen(QColor(255, 100, 0, 180), 1))
+                painter.setBrush(QBrush(QColor(255, 100, 0, 30)))
+                painter.drawPolygon(QPolygonF([QPointF(p) for p in denorm]))
+
+            # Improvement: draw corner handles as circles + center dot
+            corner_labels = ["TL", "TR", "BR", "BL"]
+            for i, pt in enumerate(denorm):
+                # Outer ring
+                painter.setPen(QPen(QColor(255, 80, 0), 2))
+                painter.setBrush(QBrush(QColor(255, 80, 0, 60)))
+                painter.drawEllipse(pt, 14, 14)
+                # Inner filled dot
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(255, 200, 0)))
+                painter.drawEllipse(pt, 5, 5)
+                # Corner label
+                painter.setPen(QPen(Qt.white, 1))
+                painter.drawText(pt.x() + 16, pt.y() - 10, corner_labels[i])
 
     def mousePressEvent(self, event):
         if self.calibration_mode:
@@ -421,12 +540,13 @@ class ProjectorWindow(QWidget):
             self.dragging_point_index = -1
 
     def get_point_at(self, pos):
+        # Improvement: larger 25px hit radius for easier dragging
         denormalized_points = [
             QPoint(int(p.x() * self.width()), int(p.y() * self.height()))
             for p in self.warp_points
         ]
         for i, point in enumerate(denormalized_points):
-            if (pos - point).manhattanLength() < 20:
+            if (pos - point).manhattanLength() < 25:
                 return i
         return -1
 
@@ -510,11 +630,24 @@ class PolygonMaskDialog(QDialog):
         return QPoint(img_x, img_y)
 
     def image_clicked(self, event):
+        # Improvement: right-click removes last point (undo)
+        if event.button() == Qt.RightButton:
+            self.undo_last_point()
+            return
         point = self._label_to_image(event.pos())
         if point is None:
             return
         self.points.append(point)
+        # Update title with point count
+        self.setWindowTitle(f"{self.windowTitle().split(' (')[0]} ({len(self.points)} pts)")
         self._render_preview()
+
+    def undo_last_point(self) -> None:
+        """Improvement: remove the last added polygon point."""
+        if self.points:
+            self.points.pop()
+            self.setWindowTitle(f"{self.windowTitle().split(' (')[0]} ({len(self.points)} pts)")
+            self._render_preview()
 
     def clear_points(self):
         self.points = []
@@ -532,17 +665,33 @@ class PolygonMaskDialog(QDialog):
             return
         preview = self.original_pixmap.copy()
         painter = QPainter(preview)
-        painter.setPen(QPen(Qt.yellow, 8))
-        for p in self.points:
-            painter.drawPoint(p)
+
+        # Improvement: semi-transparent green fill for closed polygon
+        if len(self.points) >= 3:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 255, 0, 50)))
+            painter.drawPolygon(QPolygonF([QPointF(p) for p in self.points]))
+
+        # Draw polygon outline
         if len(self.points) >= 2:
             painter.setPen(QPen(Qt.green, 3))
             painter.drawPolyline(QPolygonF([QPointF(p) for p in self.points]))
         if len(self.points) >= 3:
-            painter.setPen(QPen(Qt.green, 3))
+            painter.setPen(QPen(Qt.green, 2))
             painter.drawLine(self.points[-1], self.points[0])
+
+        # Improvement: numbered point markers
+        for i, p in enumerate(self.points, start=1):
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(Qt.yellow))
+            painter.drawEllipse(p, 6, 6)
+            painter.setPen(QPen(Qt.black, 1))
+            painter.drawText(p.x() + 8, p.y() - 4, str(i))
+
         painter.end()
-        self.image_label.setPixmap(preview.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.image_label.setPixmap(
+            preview.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
 
     def accept(self):
         """Validate minimum point count before closing (#38)."""

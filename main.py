@@ -281,6 +281,10 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.worker_stopped.connect(self._on_worker_stopped, Qt.QueuedConnection)
         self.worker.calibration_progress.connect(self._on_calibration_progress, Qt.QueuedConnection)
         self.worker.performance_degraded.connect(self._on_performance_degraded, Qt.QueuedConnection)
+        # Improvement 49: connect new worker signals
+        self.worker.tracking_state_changed.connect(self._on_tracking_state_changed, Qt.QueuedConnection)
+        self.worker.calibration_restored.connect(self._on_calibration_restored, Qt.QueuedConnection)
+        self.worker.diagnostic_info.connect(self._on_diagnostic_info, Qt.QueuedConnection)
 
         # Screen-change recovery: repopulate projector combo when displays change
         _app = QApplication.instance()
@@ -309,6 +313,22 @@ class ProjectionMappingApp(QMainWindow):
         self._midi_hotplug_timer.setInterval(2000)
         self._midi_hotplug_timer.timeout.connect(self._check_midi_hotplug)
         self._midi_hotplug_timer.start()
+
+        # Improvement 50: auto-save every 5 minutes so show config is preserved
+        self._auto_save_timer = QTimer(self)
+        self._auto_save_timer.setInterval(300_000)  # 5 minutes
+        self._auto_save_timer.timeout.connect(self._auto_save)
+        self._auto_save_timer.start()
+
+        # Improvement 51: track calibration time for "last calibrated" display
+        self._calibration_timestamp = None
+        self._calibration_age_timer = QTimer(self)
+        self._calibration_age_timer.setInterval(60_000)  # update every minute
+        self._calibration_age_timer.timeout.connect(self._update_calibration_age_label)
+        self._calibration_age_timer.start()
+
+        # Improvement 52: lock mode — prevents accidental edits during show
+        self._lock_mode = False
 
         import os as _os
         if _os.environ.get('IRTK_PROFILE_MEMORY'):
@@ -372,7 +392,8 @@ class ProjectionMappingApp(QMainWindow):
 
     def save_settings(self):
         settings = {
-            "version": 2,
+            # Improvement 46: save correct settings version (was incorrectly saving version 2)
+            "version": _SETTINGS_VERSION,
             "ir_threshold": self.ir_threshold_slider.value(),
             "threshold_mode": self.threshold_mode_combo.currentIndex(),
             "depth_sensitivity": self.depth_sensitivity_slider.value(),
@@ -385,6 +406,11 @@ class ProjectionMappingApp(QMainWindow):
             "show_mask_overlays": self.show_mask_overlays_checkbox.isChecked(),
             "wizard_completed": True,
             "masks": [m.to_dict() for m in self.masks],
+            # Improvement 47: save operator notes
+            "operator_notes": getattr(self, '_operator_notes', ''),
+            # Improvement 48: save expected marker count
+            "expected_marker_count": getattr(self, 'marker_count_spin', None) and
+                self.marker_count_spin.value() or 4,
             "window_geometry": self.saveGeometry().toBase64().data().decode(),
             "splitter_sizes": self.main_splitter.sizes(),
         }
@@ -473,6 +499,18 @@ class ProjectionMappingApp(QMainWindow):
         splitter_sizes = self.settings.get("splitter_sizes")
         if isinstance(splitter_sizes, list) and len(splitter_sizes) == 2:
             self.main_splitter.setSizes(splitter_sizes)
+
+        # Improvement: restore operator notes
+        notes = self.settings.get("operator_notes", "")
+        if notes and hasattr(self, 'operator_notes_edit'):
+            self.operator_notes_edit.setPlainText(notes)
+        self._operator_notes = notes
+
+        # Improvement: restore expected marker count
+        marker_count = self.settings.get("expected_marker_count", 4)
+        if hasattr(self, 'marker_count_spin'):
+            self.marker_count_spin.setValue(int(marker_count))
+            self.worker.set_expected_marker_count(int(marker_count))
 
     def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
         self.marker_selection_dialog.setWindowTitle(title)
@@ -602,14 +640,22 @@ class ProjectionMappingApp(QMainWindow):
         camera_group = QGroupBox("Camera")
         camera_layout = QVBoxLayout()
         self.camera_combo = QComboBox()
+        self.camera_combo.setToolTip("Select the IR camera to use for tracking.")
         self.camera_mode_combo = QComboBox()
         self.camera_mode_combo.addItem("Native / Driver Default", "native")
         self.camera_mode_combo.addItem("Performance (960x540 @ 30)", "performance")
         self.camera_mode_combo.addItem("High Detail (1280x720 @ 30)", "hd")
+        self.camera_mode_combo.setToolTip(
+            "Native: camera's own default.\n"
+            "Performance: lower resolution for speed.\n"
+            "High Detail: 720p for more precise detection."
+        )
         self.camera_mode_combo.currentIndexChanged.connect(self.update_camera_mode)
         self.refresh_camera_button = QPushButton("Refresh Cameras")
+        self.refresh_camera_button.setToolTip("Re-scan for connected cameras.")
         self.refresh_camera_button.clicked.connect(self.refresh_cameras)
         self.retry_camera_button = QPushButton("Retry Camera")
+        self.retry_camera_button.setToolTip("Attempt to reconnect to the currently selected camera.")
         self.retry_camera_button.clicked.connect(self.retry_camera)
 
         self.available_cameras = []
@@ -626,25 +672,74 @@ class ProjectionMappingApp(QMainWindow):
         projector_group = QGroupBox("Projector Display")
         projector_layout = QVBoxLayout()
         self.projector_combo = QComboBox()
+        self.projector_combo.setToolTip("Select which display is the projector output.")
         self.screens = QApplication.screens()
         self.projector_combo.addItems(
             [screen.name() or f"Screen {i + 1}" for i, screen in enumerate(self.screens)]
         )
-
         self.projector_combo.currentIndexChanged.connect(self.change_projector)
         self.logger.info("Detected displays: %s", [f"{i}:{s.name()} {s.geometry()}" for i, s in enumerate(self.screens)])
         projector_layout.addWidget(self.projector_combo)
+
+        # Improvement 74: reconnect projector button in case display goes missing
+        proj_btn_row = QHBoxLayout()
+        self.reconnect_projector_button = QPushButton("Reconnect Projector")
+        self.reconnect_projector_button.setToolTip(
+            "Re-detect displays and move projector window to the selected screen."
+        )
+        self.reconnect_projector_button.clicked.connect(self._reconnect_projector)
+        # Improvement 75: show/hide projector window button
+        self.toggle_projector_button = QPushButton("Hide Projector")
+        self.toggle_projector_button.setCheckable(True)
+        self.toggle_projector_button.setToolTip("Show or hide the projector output window.")
+        self.toggle_projector_button.toggled.connect(self._toggle_projector_visibility)
+        proj_btn_row.addWidget(self.reconnect_projector_button)
+        proj_btn_row.addWidget(self.toggle_projector_button)
+        projector_layout.addLayout(proj_btn_row)
         projector_group.setLayout(projector_layout)
         self.control_layout.addWidget(projector_group)
 
         self.setup_wizard_button = QPushButton("Run Full Calibration Wizard")
         self.setup_wizard_button.clicked.connect(self.run_full_calibration_wizard_safe)
+        self.setup_wizard_button.setToolTip("Step-by-step wizard: detect projector bounds, set background/guitar/amp masks, and calibrate depth.")
         self.control_layout.addWidget(self.setup_wizard_button)
 
         self.calibrate_button = QPushButton("Calibrate Guitar + Homography")
         self.calibrate_button.setStyleSheet("QPushButton { background-color: #2a5; color: white; font-weight: bold; padding: 8px; }")
         self.calibrate_button.clicked.connect(self._start_calibration)
+        self.calibrate_button.setToolTip("Run 3-phase calibration: dark → illuminate → detect markers (Ctrl+C)")
         self.control_layout.addWidget(self.calibrate_button)
+
+        # Improvement 58: Stage-control row — Blackout + Lock Mode
+        stage_row = QHBoxLayout()
+        self.blackout_button = QPushButton("BLACKOUT")
+        self.blackout_button.setCheckable(True)
+        self.blackout_button.setStyleSheet(
+            "QPushButton { background-color: #8b0000; color: white; font-weight: bold; padding: 8px; border-radius: 5px; }"
+            "QPushButton:checked { background-color: #cc0000; color: white; }"
+        )
+        self.blackout_button.setToolTip("Emergency: send solid black to projector (Esc). Tracking continues.")
+        self.blackout_button.toggled.connect(self._toggle_blackout)
+        stage_row.addWidget(self.blackout_button)
+
+        self.lock_mode_button = QPushButton("Lock UI")
+        self.lock_mode_button.setCheckable(True)
+        self.lock_mode_button.setToolTip("Lock all editing controls to prevent accidental changes during a show.")
+        self.lock_mode_button.toggled.connect(self._toggle_lock_mode)
+        stage_row.addWidget(self.lock_mode_button)
+        self.control_layout.addLayout(stage_row)
+
+        # Improvement 59: Screenshot button
+        self.screenshot_button = QPushButton("Save Screenshot")
+        self.screenshot_button.setToolTip("Save the current projector output frame as a PNG file.")
+        self.screenshot_button.clicked.connect(self._save_screenshot)
+        self.control_layout.addWidget(self.screenshot_button)
+
+        # Improvement 60: pre-show checklist button
+        self.checklist_button = QPushButton("Pre-Show Checklist")
+        self.checklist_button.setToolTip("Run a quick check of camera, calibration, MIDI, and cues before going live.")
+        self.checklist_button.clicked.connect(self._run_preshow_checklist)
+        self.control_layout.addWidget(self.checklist_button)
 
         self.mapping_tabs = QTabWidget()
 
@@ -656,10 +751,51 @@ class ProjectionMappingApp(QMainWindow):
         mask_list_layout = QVBoxLayout()
         self.mask_list_widget = QListWidget()
         self.mask_list_widget.currentRowChanged.connect(self.on_mask_selection_changed)
-        self.remove_mask_button = QPushButton("Remove Selected Mask")
-        self.remove_mask_button.clicked.connect(self.remove_mask)
+        # Improvement 61: double-click to rename mask
+        self.mask_list_widget.itemDoubleClicked.connect(self._rename_mask_inline)
         mask_list_layout.addWidget(self.mask_list_widget)
-        mask_list_layout.addWidget(self.remove_mask_button)
+
+        mask_action_row = QHBoxLayout()
+        self.remove_mask_button = QPushButton("Remove")
+        self.remove_mask_button.setToolTip("Remove the selected mask and all its cues.")
+        self.remove_mask_button.clicked.connect(self.remove_mask)
+        # Improvement 62: enable/disable mask toggle
+        self.toggle_mask_button = QPushButton("Enable/Disable")
+        self.toggle_mask_button.setToolTip("Toggle the selected mask on or off without deleting it.")
+        self.toggle_mask_button.clicked.connect(self._toggle_mask_enabled)
+        # Improvement 63: rename mask button
+        self.rename_mask_button = QPushButton("Rename")
+        self.rename_mask_button.setToolTip("Rename the selected mask (F2).")
+        self.rename_mask_button.clicked.connect(self._rename_mask_inline)
+        mask_action_row.addWidget(self.remove_mask_button)
+        mask_action_row.addWidget(self.toggle_mask_button)
+        mask_action_row.addWidget(self.rename_mask_button)
+        mask_list_layout.addLayout(mask_action_row)
+
+        # Improvement 64: move mask up/down for render order
+        mask_order_row = QHBoxLayout()
+        self.move_mask_up_button = QPushButton("▲ Up")
+        self.move_mask_up_button.setToolTip("Move selected mask up in render order.")
+        self.move_mask_up_button.clicked.connect(self._move_mask_up)
+        self.move_mask_down_button = QPushButton("▼ Down")
+        self.move_mask_down_button.setToolTip("Move selected mask down in render order.")
+        self.move_mask_down_button.clicked.connect(self._move_mask_down)
+        mask_order_row.addWidget(self.move_mask_up_button)
+        mask_order_row.addWidget(self.move_mask_down_button)
+        mask_list_layout.addLayout(mask_order_row)
+
+        # Improvement 65: export / import mask configs
+        mask_io_row = QHBoxLayout()
+        self.export_masks_button = QPushButton("Export Masks…")
+        self.export_masks_button.setToolTip("Save all masks and cue paths to a JSON file.")
+        self.export_masks_button.clicked.connect(self._export_masks)
+        self.import_masks_button = QPushButton("Import Masks…")
+        self.import_masks_button.setToolTip("Load masks from a previously exported JSON file.")
+        self.import_masks_button.clicked.connect(self._import_masks)
+        mask_io_row.addWidget(self.export_masks_button)
+        mask_io_row.addWidget(self.import_masks_button)
+        mask_list_layout.addLayout(mask_io_row)
+
         mask_list_group.setLayout(mask_list_layout)
         masks_layout.addWidget(mask_list_group)
 
@@ -733,6 +869,23 @@ class ProjectionMappingApp(QMainWindow):
         cue_layout.addWidget(self.add_cue_button)
         cue_layout.addWidget(self.remove_cue_button)
         cue_layout.addLayout(preview_cue_layout)
+
+        # Improvement 66: cue advance button (manual next cue)
+        cue_advance_row = QHBoxLayout()
+        self.advance_cue_button = QPushButton("▶ Next Cue")
+        self.advance_cue_button.setToolTip("Manually advance to the next cue on the selected mask.")
+        self.advance_cue_button.clicked.connect(self._advance_cue)
+        cue_advance_row.addWidget(self.advance_cue_button)
+
+        # Improvement 67: cue loop mode toggle
+        self.cue_loop_combo = QComboBox()
+        self.cue_loop_combo.addItem("Loop", "loop")
+        self.cue_loop_combo.addItem("One-shot", "oneshot")
+        self.cue_loop_combo.setToolTip("Loop: video restarts. One-shot: holds on last frame.")
+        self.cue_loop_combo.currentIndexChanged.connect(self._update_cue_loop_mode)
+        cue_advance_row.addWidget(self.cue_loop_combo)
+        cue_layout.addLayout(cue_advance_row)
+
         cue_layout.addWidget(self.cc_spin)
         cue_layout.addWidget(self.map_cc_button)
         cue_layout.addWidget(self.render_all_cues_button)
@@ -746,14 +899,41 @@ class ProjectionMappingApp(QMainWindow):
         self.refresh_midi_button.clicked.connect(self.refresh_midi_inputs)
         self.connect_midi_button = QPushButton("Connect MIDI")
         self.connect_midi_button.clicked.connect(self.connect_midi_input)
+
+        # Improvement 68: MIDI activity indicator
+        midi_status_row = QHBoxLayout()
+        self.midi_status_label = QLabel("MIDI: Disconnected")
+        self.midi_status_label.setProperty("class", "status-idle")
+        self.midi_activity_label = QLabel("●")
+        self.midi_activity_label.setFixedWidth(16)
+        self.midi_activity_label.setStyleSheet("color: #444; font-size: 16px;")
+        midi_status_row.addWidget(self.midi_activity_label)
+        midi_status_row.addWidget(self.midi_status_label)
+        midi_status_row.addStretch()
+        midi_layout.addLayout(midi_status_row)
+
         midi_layout.addWidget(self.midi_input_combo)
         midi_layout.addWidget(self.refresh_midi_button)
         midi_layout.addWidget(self.connect_midi_button)
         midi_group.setLayout(midi_layout)
         cues_layout.addWidget(midi_group)
 
+        # Improvement 69: Operator Notes tab for show-day notes
+        notes_page = QWidget()
+        notes_layout = QVBoxLayout(notes_page)
+        notes_layout.addWidget(QLabel("Show notes (saved with settings):"))
+        from PyQt5.QtWidgets import QTextEdit
+        self.operator_notes_edit = QTextEdit()
+        self.operator_notes_edit.setPlaceholderText(
+            "Enter pre-show notes, cue call times, tech notes…"
+        )
+        self.operator_notes_edit.setToolTip("Notes are saved automatically with settings.")
+        self.operator_notes_edit.textChanged.connect(self._notes_changed)
+        notes_layout.addWidget(self.operator_notes_edit)
+
         self.mapping_tabs.addTab(masks_page, "Masks")
         self.mapping_tabs.addTab(cues_page, "Cues")
+        self.mapping_tabs.addTab(notes_page, "Notes")
         self.control_layout.addWidget(self.mapping_tabs)
 
         self.midi_inport = None
@@ -786,18 +966,56 @@ class ProjectionMappingApp(QMainWindow):
         self.threshold_mode_combo.addItems(["Manual", "Auto (Otsu)"])
         self.threshold_mode_combo.currentIndexChanged.connect(self.update_threshold_mode)
 
-        ir_layout.addWidget(QLabel("IR Threshold:"))
+        # Improvement 53: slider label row (label + value readout)
+        ir_thresh_row = QHBoxLayout()
+        ir_thresh_row.addWidget(QLabel("IR Threshold:"))
+        self.ir_threshold_value_label = QLabel("200")
+        self.ir_threshold_value_label.setMinimumWidth(32)
+        ir_thresh_row.addWidget(self.ir_threshold_value_label)
+        ir_layout.addLayout(ir_thresh_row)
+        self.ir_threshold_slider.valueChanged.connect(
+            lambda v: self.ir_threshold_value_label.setText(str(v))
+        )
         ir_layout.addWidget(self.ir_threshold_slider)
         ir_layout.addWidget(QLabel("Threshold Mode:"))
         ir_layout.addWidget(self.threshold_mode_combo)
         ir_layout.addWidget(self.ir_trackers_label)
 
+        # Improvement 54: configurable expected marker count
+        marker_count_row = QHBoxLayout()
+        marker_count_row.addWidget(QLabel("Expected Markers:"))
+        self.marker_count_spin = QSpinBox()
+        self.marker_count_spin.setRange(1, 8)
+        self.marker_count_spin.setValue(4)
+        self.marker_count_spin.setToolTip(
+            "Number of IR markers on the guitar. Change only if using more/fewer markers."
+        )
+        self.marker_count_spin.valueChanged.connect(self.worker.set_expected_marker_count)
+        marker_count_row.addWidget(self.marker_count_spin)
+        ir_layout.addLayout(marker_count_row)
+
+        # Improvement 55: calibration state indicator label
+        self.calib_state_label = QLabel("State: Not calibrated")
+        self.calib_state_label.setProperty("class", "status-error")
+        ir_layout.addWidget(self.calib_state_label)
+
         self.select_markers_button = QPushButton("Select Guitar Markers")
         self.select_markers_button.clicked.connect(self.open_marker_selection_dialog)
+        self.select_markers_button.setToolTip("Open camera view to manually identify and select IR marker positions.")
         self.clear_markers_button = QPushButton("Clear Marker Selection")
         self.clear_markers_button.clicked.connect(self.clear_marker_selection)
+        self.clear_markers_button.setToolTip("Clear all marker point selections.")
+
+        # Improvement 56: reset calibration without full re-run
+        self.reset_calibration_button = QPushButton("Reset Calibration")
+        self.reset_calibration_button.setToolTip(
+            "Clear the calibration cache and return to uncalibrated mode. "
+            "Tracking continues using global blob search until you recalibrate."
+        )
+        self.reset_calibration_button.clicked.connect(self._reset_calibration)
         ir_layout.addWidget(self.select_markers_button)
         ir_layout.addWidget(self.clear_markers_button)
+        ir_layout.addWidget(self.reset_calibration_button)
         ir_group.setLayout(ir_layout)
         self.control_layout.addWidget(ir_group)
 
@@ -811,7 +1029,16 @@ class ProjectionMappingApp(QMainWindow):
         self.depth_sensitivity_slider.valueChanged.connect(self.update_depth_sensitivity)
         self.depth_calibration_label = QLabel("Not calibrated")
         depth_layout.addWidget(self.calibrate_depth_button)
-        depth_layout.addWidget(QLabel("Sensitivity:"))
+        # Improvement 57: depth slider label with value readout
+        depth_row = QHBoxLayout()
+        depth_row.addWidget(QLabel("Sensitivity:"))
+        self.depth_sensitivity_value_label = QLabel("100")
+        self.depth_sensitivity_value_label.setMinimumWidth(32)
+        depth_row.addWidget(self.depth_sensitivity_value_label)
+        depth_layout.addLayout(depth_row)
+        self.depth_sensitivity_slider.valueChanged.connect(
+            lambda v: self.depth_sensitivity_value_label.setText(str(v))
+        )
         depth_layout.addWidget(self.depth_sensitivity_slider)
         depth_layout.addWidget(self.depth_calibration_label)
         depth_group.setLayout(depth_layout)
@@ -821,8 +1048,23 @@ class ProjectionMappingApp(QMainWindow):
         diagnostics_layout = QVBoxLayout()
         self.performance_label = QLabel("FPS: -- | Frame: -- | D: -- M: -- W: -- R: --")
         self.camera_info_label = QLabel("Camera: waiting for stream...")
+        # Improvement 70: FPS history - show min/avg over last 60 readings
+        self.fps_history_label = QLabel("FPS avg/min: --/-- (last 60s)")
+        self._fps_history = []
+        # Improvement 71: tracking state display in diagnostics
+        self.tracking_state_diag_label = QLabel("Tracking: idle")
+        self.tracking_state_diag_label.setProperty("class", "status-idle")
+        # Improvement 72: blob count diagnostic
+        self.blob_count_label = QLabel("Blobs: --  Tracked: --")
         diagnostics_layout.addWidget(self.performance_label)
+        diagnostics_layout.addWidget(self.fps_history_label)
         diagnostics_layout.addWidget(self.camera_info_label)
+        diagnostics_layout.addWidget(self.tracking_state_diag_label)
+        diagnostics_layout.addWidget(self.blob_count_label)
+        # Improvement 73: About button in diagnostics for easy access
+        self.about_button = QPushButton("About IR Guitar Tracker")
+        self.about_button.clicked.connect(self._show_about_dialog)
+        diagnostics_layout.addWidget(self.about_button)
         diagnostics_group.setLayout(diagnostics_layout)
         self.control_layout.addWidget(diagnostics_group)
 
@@ -1121,6 +1363,17 @@ class ProjectionMappingApp(QMainWindow):
         if hasattr(self, 'calibrate_button'):
             self.calibrate_button.setEnabled(True)
             self.calibrate_button.setText("Calibrate Guitar + Homography")
+
+        # Improvement: update calibration state UI
+        self._calibration_timestamp = time.time()
+        if hasattr(self, 'calib_state_label'):
+            self.calib_state_label.setText(f"State: Calibrated ({len(marker_positions)} markers)")
+            self.calib_state_label.setProperty("class", "status-ok")
+            self.calib_state_label.style().unpolish(self.calib_state_label)
+            self.calib_state_label.style().polish(self.calib_state_label)
+        self._status_message(
+            f"Calibration complete — {len(marker_positions)} markers detected.", "success", 6000
+        )
 
         if not hasattr(self, '_guitar_video_path') or not self._guitar_video_path:
             return
@@ -1686,8 +1939,17 @@ class ProjectionMappingApp(QMainWindow):
         self.mask_list_widget.clear()
         self.cue_mask_combo.clear()
         for mask in self.masks:
-            self.mask_list_widget.addItem(mask.name)
-            self.cue_mask_combo.addItem(mask.name)
+            # Improvement: show disabled masks greyed out with suffix
+            enabled = getattr(mask, 'enabled', True)
+            display_name = mask.name if enabled else f"{mask.name} [OFF]"
+            item = self.mask_list_widget.addItem(display_name)
+            if not enabled:
+                # Grey out disabled masks in the list
+                from PyQt5.QtGui import QColor
+                it = self.mask_list_widget.item(self.mask_list_widget.count() - 1)
+                if it:
+                    it.setForeground(QColor("#666666"))
+            self.cue_mask_combo.addItem(display_name)
         self.mask_list_widget.blockSignals(False)
         self.cue_mask_combo.blockSignals(False)
 
@@ -1716,9 +1978,20 @@ class ProjectionMappingApp(QMainWindow):
             cc_list = [str(cc) for cc, cue_index in mask.midi_cc_map.items() if cue_index == i]
             cc_suffix = f" [CC: {', '.join(cc_list)}]" if cc_list else ""
             active = "* " if i == mask.active_cue else ""
-            self.mask_cue_list_widget.addItem(f"{active}{Path(cue).name}{cc_suffix}")
+            # Show a warning icon if the cue file is missing
+            exists = Path(cue).exists() if cue else True
+            missing_flag = " ⚠" if not exists else ""
+            self.mask_cue_list_widget.addItem(f"{active}{Path(cue).name}{cc_suffix}{missing_flag}")
         if mask.cues:
             self.mask_cue_list_widget.setCurrentRow(mask.active_cue)
+        # Sync loop mode combo
+        if hasattr(self, 'cue_loop_combo'):
+            loop_mode = getattr(mask, 'loop_mode', 'loop')
+            combo_idx = self.cue_loop_combo.findData(loop_mode)
+            if combo_idx >= 0:
+                self.cue_loop_combo.blockSignals(True)
+                self.cue_loop_combo.setCurrentIndex(combo_idx)
+                self.cue_loop_combo.blockSignals(False)
 
     def on_mask_cue_selected(self, row):
         idx = self.cue_mask_combo.currentIndex()
@@ -1828,6 +2101,14 @@ class ProjectionMappingApp(QMainWindow):
         try:
             self.midi_inport = mido.open_input(name)
             self.statusBar().showMessage(f"Connected MIDI input: {name}", 3000)
+            # Improvement: update MIDI status label
+            if hasattr(self, 'midi_status_label'):
+                self.midi_status_label.setText(f"MIDI: {name}")
+                self.midi_status_label.setProperty("class", "status-ok")
+                self.midi_status_label.style().unpolish(self.midi_status_label)
+                self.midi_status_label.style().polish(self.midi_status_label)
+            if hasattr(self, 'midi_activity_label'):
+                self.midi_activity_label.setStyleSheet("color: #00cc44; font-size: 16px;")
         except Exception as exc:
             self.logger.exception("Failed to open MIDI input '%s'", name)
             if self.midi_inport is not None:
@@ -1836,6 +2117,11 @@ class ProjectionMappingApp(QMainWindow):
                 except Exception:
                     pass
                 self.midi_inport = None
+            if hasattr(self, 'midi_status_label'):
+                self.midi_status_label.setText("MIDI: Error")
+                self.midi_status_label.setProperty("class", "status-error")
+                self.midi_status_label.style().unpolish(self.midi_status_label)
+                self.midi_status_label.style().polish(self.midi_status_label)
             QMessageBox.critical(self, "MIDI Error", f"Could not open MIDI port '{name}'.\n\nError: {exc}")
 
     def poll_midi_messages(self):
@@ -1865,6 +2151,12 @@ class ProjectionMappingApp(QMainWindow):
                     mask.active_cue = cue_idx
         self.worker.set_masks(self.masks)
         self.refresh_cues_for_selected_mask()
+        # Improvement: flash MIDI activity LED
+        if hasattr(self, 'midi_activity_label'):
+            self.midi_activity_label.setStyleSheet("color: #00cc44; font-size: 16px;")
+            QTimer.singleShot(200, lambda: self.midi_activity_label.setStyleSheet(
+                "color: #444; font-size: 16px;" if self.midi_inport else "color: #444; font-size: 16px;"
+            ))
 
     def remove_mask(self):
         row = self.mask_list_widget.currentRow()
@@ -1912,6 +2204,360 @@ class ProjectionMappingApp(QMainWindow):
             target_geometry,
         )
 
+    # ─── New slot implementations ───────────────────────────────────────────
+
+    def _toggle_blackout(self, checked: bool) -> None:
+        """Improvement 76: toggle projector blackout."""
+        self.worker.set_blackout(checked)
+        self.blackout_button.setText("BLACKOUT (ON)" if checked else "BLACKOUT")
+        self._status_message(
+            "Projector BLACKED OUT" if checked else "Blackout cleared",
+            "error" if checked else "success", 4000
+        )
+
+    def _toggle_lock_mode(self, checked: bool) -> None:
+        """Improvement 77: lock/unlock editing controls."""
+        self._lock_mode = checked
+        self.lock_mode_button.setText("Unlock UI" if checked else "Lock UI")
+        editable_widgets = [
+            self.create_mask_button, self.remove_mask_button, self.rename_mask_button,
+            self.toggle_mask_button, self.move_mask_up_button, self.move_mask_down_button,
+            self.export_masks_button, self.import_masks_button,
+            self.add_cue_button, self.remove_cue_button, self.map_cc_button,
+            self.link_mask_button, self.auto_sync_checkbox,
+            self.select_markers_button, self.clear_markers_button,
+            self.reset_calibration_button, self.calibrate_button,
+            self.setup_wizard_button,
+        ]
+        for w in editable_widgets:
+            if hasattr(w, 'setEnabled'):
+                w.setEnabled(not checked)
+        self._status_message(
+            "UI LOCKED — editing disabled" if checked else "UI unlocked",
+            "warning" if checked else "success", 4000
+        )
+
+    def _save_screenshot(self) -> None:
+        """Improvement 78: save current projector frame as PNG."""
+        if self.latest_camera_qimage is None:
+            self._status_message("No frame available yet.", "warning", 3000)
+            return
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Screenshot", "screenshot.png", "PNG Images (*.png)"
+        )
+        if path:
+            if self.latest_camera_qimage.save(path):
+                self._status_message(f"Screenshot saved: {Path(path).name}", "success", 4000)
+            else:
+                self._status_message("Failed to save screenshot.", "error", 4000)
+
+    def _run_preshow_checklist(self) -> None:
+        """Improvement 79: pre-show readiness check."""
+        lines = []
+        ok = lambda s: f"✓  {s}"
+        fail = lambda s: f"✗  {s}"
+        warn = lambda s: f"⚠  {s}"
+
+        # Camera
+        if self.available_cameras:
+            lines.append(ok(f"Camera detected (index {self.camera_combo.currentIndex()})"))
+        else:
+            lines.append(fail("No camera detected — check USB connection"))
+
+        # Calibration
+        info = self.worker.get_calibration_info()
+        if info["calibrated"]:
+            lines.append(ok(f"Calibrated ({info['marker_count']} markers)"))
+        else:
+            lines.append(fail("Not calibrated — run calibration before show"))
+
+        # Masks
+        if self.masks:
+            enabled = [m for m in self.masks if getattr(m, 'enabled', True)]
+            lines.append(ok(f"{len(enabled)}/{len(self.masks)} mask(s) enabled"))
+        else:
+            lines.append(warn("No masks defined"))
+
+        # Cue validation
+        missing_cues = []
+        for mask in self.masks:
+            missing_cues.extend(mask.validate_cues())
+        if missing_cues:
+            lines.append(fail(f"{len(missing_cues)} cue file(s) missing:"))
+            for c in missing_cues[:3]:
+                lines.append(f"    {Path(c).name}")
+        else:
+            lines.append(ok("All cue files present"))
+
+        # MIDI
+        if self.midi_inport is not None:
+            lines.append(ok(f"MIDI connected: {self.midi_input_combo.currentText()}"))
+        else:
+            lines.append(warn("MIDI not connected (optional)"))
+
+        # Projector
+        lines.append(ok(f"Projector on: {self.projector_combo.currentText()}"))
+
+        # Homography
+        if info["has_homography"]:
+            lines.append(ok("Camera→projector homography computed"))
+        else:
+            lines.append(warn("No homography — run full calibration wizard for best results"))
+
+        all_ok = not any(l.startswith("✗") for l in lines)
+        icon = QMessageBox.Information if all_ok else QMessageBox.Warning
+        QMessageBox.information(
+            self, "Pre-Show Checklist",
+            "\n".join(lines)
+        ) if all_ok else QMessageBox.warning(
+            self, "Pre-Show Checklist — Issues Found",
+            "\n".join(lines)
+        )
+
+    def _reset_calibration(self) -> None:
+        """Improvement 80: reset calibration without triggering a new run."""
+        if QMessageBox.question(
+            self, "Reset Calibration",
+            "Clear the calibration cache?\n\nTracking will continue in uncalibrated global-search mode "
+            "until you run calibration again.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        self.worker.reset_calibration()
+        self._calibration_timestamp = None
+        self._update_calibration_age_label()
+        self.calib_state_label.setText("State: Not calibrated")
+        self.calib_state_label.setProperty("class", "status-error")
+        self.calib_state_label.style().unpolish(self.calib_state_label)
+        self.calib_state_label.style().polish(self.calib_state_label)
+        self._status_message("Calibration reset.", "warning", 4000)
+
+    @pyqtSlot(str)
+    def _on_tracking_state_changed(self, state: str) -> None:
+        """Improvement 81: update UI when tracking state changes."""
+        _map = {
+            "tracking": ("Tracking: ACTIVE", "status-ok"),
+            "lost": ("Tracking: LOST", "status-warn"),
+            "calibrating": ("Calibrating…", "status-warn"),
+            "idle": ("Tracking: idle", "status-idle"),
+        }
+        text, css_class = _map.get(state, (f"State: {state}", "status-idle"))
+        self.tracking_state_diag_label.setText(text)
+        self.tracking_state_diag_label.setProperty("class", css_class)
+        self.tracking_state_diag_label.style().unpolish(self.tracking_state_diag_label)
+        self.tracking_state_diag_label.style().polish(self.tracking_state_diag_label)
+        # Improvement 82: window title reflects tracking state
+        state_icons = {"tracking": "◉", "lost": "◌", "calibrating": "◎", "idle": "○"}
+        icon = state_icons.get(state, "○")
+        self.setWindowTitle(f"{icon} IR Guitar Tracker v{__version__}  [{state.upper()}]")
+
+    @pyqtSlot()
+    def _on_calibration_restored(self) -> None:
+        """Improvement 83: update UI when calibration loads from cache."""
+        self._calibration_timestamp = time.time()
+        self._update_calibration_age_label()
+        self.calib_state_label.setText("State: Calibrated (restored)")
+        self.calib_state_label.setProperty("class", "status-ok")
+        self.calib_state_label.style().unpolish(self.calib_state_label)
+        self.calib_state_label.style().polish(self.calib_state_label)
+        self._status_message("Calibration restored from cache.", "success", 5000)
+
+    @pyqtSlot(dict)
+    def _on_diagnostic_info(self, info: dict) -> None:
+        """Improvement 84: update FPS history and blob count from worker diagnostics."""
+        fps = info.get("fps", 0.0)
+        self._fps_history.append(fps)
+        if len(self._fps_history) > 60:
+            self._fps_history.pop(0)
+        if self._fps_history:
+            avg = sum(self._fps_history) / len(self._fps_history)
+            mn = min(self._fps_history)
+            self.fps_history_label.setText(f"FPS avg/min: {avg:.1f}/{mn:.1f} (last {len(self._fps_history)}s)")
+        detected = info.get("detected", 0)
+        tracked = info.get("tracked", 0)
+        blobs = info.get("blob_history", 0)
+        self.blob_count_label.setText(f"Blobs hist: {blobs}  Det: {detected}  Trk: {tracked}")
+
+    def _update_calibration_age_label(self) -> None:
+        """Improvement 85: show how long ago the last calibration ran."""
+        if not hasattr(self, 'calib_state_label'):
+            return
+        if self._calibration_timestamp is None:
+            return
+        age_s = time.time() - self._calibration_timestamp
+        if age_s < 60:
+            age_str = f"{int(age_s)}s ago"
+        elif age_s < 3600:
+            age_str = f"{int(age_s/60)}m ago"
+        else:
+            age_str = f"{age_s/3600:.1f}h ago"
+        self.calib_state_label.setText(f"State: Calibrated ({age_str})")
+
+    def _auto_save(self) -> None:
+        """Improvement 86: periodic auto-save so show config survives a crash."""
+        self.save_settings()
+        self.logger.info("Auto-saved settings")
+
+    def _notes_changed(self) -> None:
+        """Improvement 87: track operator notes changes for saving."""
+        self._operator_notes = self.operator_notes_edit.toPlainText()
+        self.request_save_settings()
+
+    def _rename_mask_inline(self, _item=None) -> None:
+        """Improvement 88: rename selected mask via an input dialog."""
+        row = self.mask_list_widget.currentRow()
+        if not (0 <= row < len(self.masks)):
+            return
+        mask = self.masks[row]
+        from PyQt5.QtWidgets import QInputDialog
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Mask", "New name:", text=mask.name
+        )
+        if ok and new_name.strip():
+            mask.name = new_name.strip()
+            self.worker.set_masks(self.masks)
+            self.refresh_mask_views(select_index=row)
+            self.request_save_settings()
+
+    def _toggle_mask_enabled(self) -> None:
+        """Improvement 89: toggle mask enabled/disabled."""
+        row = self.mask_list_widget.currentRow()
+        if not (0 <= row < len(self.masks)):
+            return
+        mask = self.masks[row]
+        mask.enabled = not getattr(mask, 'enabled', True)
+        self.worker.set_masks(self.masks)
+        self.refresh_mask_views(select_index=row)
+        self._status_message(
+            f"Mask '{mask.name}' {'enabled' if mask.enabled else 'disabled'}.",
+            "info", 3000
+        )
+        self.request_save_settings()
+
+    def _move_mask_up(self) -> None:
+        """Improvement 90: move mask up in render order."""
+        row = self.mask_list_widget.currentRow()
+        if row <= 0 or row >= len(self.masks):
+            return
+        self.masks[row - 1], self.masks[row] = self.masks[row], self.masks[row - 1]
+        self.worker.set_masks(self.masks)
+        self.refresh_mask_views(select_index=row - 1)
+        self.request_save_settings()
+
+    def _move_mask_down(self) -> None:
+        """Improvement 91: move mask down in render order."""
+        row = self.mask_list_widget.currentRow()
+        if row < 0 or row >= len(self.masks) - 1:
+            return
+        self.masks[row], self.masks[row + 1] = self.masks[row + 1], self.masks[row]
+        self.worker.set_masks(self.masks)
+        self.refresh_mask_views(select_index=row + 1)
+        self.request_save_settings()
+
+    def _export_masks(self) -> None:
+        """Improvement 92: export all masks to a JSON file."""
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Masks", "masks_export.json", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            data = {"masks": [m.to_dict() for m in self.masks]}
+            Path(path).write_text(json.dumps(data, indent=2))
+            self._status_message(f"Exported {len(self.masks)} mask(s) to {Path(path).name}", "success", 4000)
+        except Exception as exc:
+            self.logger.exception("Export masks failed")
+            QMessageBox.critical(self, "Export Failed", str(exc))
+
+    def _import_masks(self) -> None:
+        """Improvement 93: import masks from a JSON file."""
+        from PyQt5.QtWidgets import QFileDialog
+        from mask import Mask as _Mask
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Masks", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text())
+            imported = [_Mask.from_dict(d) for d in data.get("masks", [])]
+            if not imported:
+                QMessageBox.warning(self, "Import Masks", "No masks found in the file.")
+                return
+            if QMessageBox.question(
+                self, "Import Masks",
+                f"Replace all {len(self.masks)} current mask(s) with {len(imported)} imported mask(s)?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            ) == QMessageBox.Yes:
+                self.masks = imported
+                self.worker.set_masks(self.masks)
+                self.refresh_mask_views()
+                self.request_save_settings()
+                self._status_message(f"Imported {len(imported)} mask(s).", "success", 4000)
+        except Exception as exc:
+            self.logger.exception("Import masks failed")
+            QMessageBox.critical(self, "Import Failed", str(exc))
+
+    def _advance_cue(self) -> None:
+        """Improvement 94: manually advance to next cue on selected mask."""
+        idx = self.cue_mask_combo.currentIndex()
+        if not (0 <= idx < len(self.masks)):
+            return
+        mask = self.masks[idx]
+        if not mask.cues:
+            return
+        mask.advance_cue()
+        self.worker.set_masks(self.masks)
+        self.refresh_cues_for_selected_mask()
+        self._status_message(
+            f"Mask '{mask.name}' → cue {mask.active_cue + 1}/{len(mask.cues)}",
+            "info", 2000
+        )
+
+    def _update_cue_loop_mode(self, _index: int) -> None:
+        """Improvement 95: sync loop mode combo to selected mask."""
+        idx = self.cue_mask_combo.currentIndex()
+        if not (0 <= idx < len(self.masks)):
+            return
+        mode = self.cue_loop_combo.currentData()
+        self.masks[idx].loop_mode = mode
+        self.worker.set_masks(self.masks)
+        self.request_save_settings()
+
+    def _reconnect_projector(self) -> None:
+        """Improvement 96: re-detect screens and reconnect projector window."""
+        self._on_screens_changed()
+        self.change_projector(self.projector_combo.currentIndex())
+        self._status_message("Projector reconnected.", "success", 3000)
+
+    def _toggle_projector_visibility(self, hidden: bool) -> None:
+        """Improvement 97: show or hide the projector output window."""
+        if hidden:
+            self.projector_window.hide()
+            self.toggle_projector_button.setText("Show Projector")
+        else:
+            self.projector_window.showFullScreen()
+            self.toggle_projector_button.setText("Hide Projector")
+
+    def _show_about_dialog(self) -> None:
+        """Improvement 98: show About dialog with version and dependency info."""
+        import cv2 as _cv2
+        from PyQt5 import QtCore as _QtCore
+        msg = (
+            f"<b>IR Guitar Tracker</b> v{__version__}<br><br>"
+            f"Real-time IR marker tracking and projection mapping for live stage use.<br><br>"
+            f"<b>Runtime versions:</b><br>"
+            f"OpenCV: {_cv2.__version__}<br>"
+            f"PyQt5: {_QtCore.PYQT_VERSION_STR}<br>"
+            f"NumPy: {np.__version__}<br>"
+            f"Python: {sys.version.split()[0]}<br><br>"
+            f"Settings file: {SETTINGS_PATH.resolve()}<br>"
+            f"Log file: ir_tracker.log"
+        )
+        QMessageBox.about(self, "About IR Guitar Tracker", msg)
+
     def _setup_shortcuts(self):
         from PyQt5.QtGui import QKeySequence
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_settings)
@@ -1920,6 +2566,34 @@ class ProjectionMappingApp(QMainWindow):
         QShortcut(QKeySequence("Delete"), self, activated=self.remove_mask)
         QShortcut(QKeySequence("Space"), self,
                   activated=lambda: self.preview_checkbox.toggle() if hasattr(self, 'preview_checkbox') else None)
+        # Improvement 99: Esc for instant blackout toggle
+        QShortcut(QKeySequence("Escape"), self,
+                  activated=lambda: self.blackout_button.toggle() if hasattr(self, 'blackout_button') else None)
+        # Improvement 100: F1 for help / keyboard shortcuts cheatsheet
+        QShortcut(QKeySequence("F1"), self, activated=self._show_shortcuts_help)
+        # F2 to rename selected mask
+        QShortcut(QKeySequence("F2"), self, activated=self._rename_mask_inline)
+        # Ctrl+Right / Ctrl+Left: advance / previous cue
+        QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._advance_cue)
+        # Ctrl+A: render all masks
+        QShortcut(QKeySequence("Ctrl+A"), self,
+                  activated=lambda: self.worker.set_active_cue_index(-1))
+
+    def _show_shortcuts_help(self) -> None:
+        """Show keyboard shortcut reference."""
+        shortcuts = (
+            "<b>Keyboard Shortcuts</b><br><br>"
+            "<b>Ctrl+S</b> — Save settings<br>"
+            "<b>Ctrl+C</b> — Trigger calibration<br>"
+            "<b>Esc</b> — Toggle projector BLACKOUT<br>"
+            "<b>Space</b> — Toggle preview panel<br>"
+            "<b>F1</b> — Show this help<br>"
+            "<b>F2</b> — Rename selected mask<br>"
+            "<b>Delete</b> — Remove selected mask<br>"
+            "<b>Ctrl+Right</b> — Advance cue on selected mask<br>"
+            "<b>Ctrl+A</b> — Render all masks<br>"
+        )
+        QMessageBox.information(self, "Keyboard Shortcuts", shortcuts)
 
     def closeEvent(self, event):
         self._is_closing = True
@@ -1930,15 +2604,13 @@ class ProjectionMappingApp(QMainWindow):
             except Exception as exc:
                 self.logger.warning("MIDI port close error: %s", exc)
         # Stop all timers first to prevent callbacks on destroyed objects
-        if hasattr(self, 'midi_poll_timer') and self.midi_poll_timer:
-            self.midi_poll_timer.stop()
-        if hasattr(self, '_save_settings_timer') and self._save_settings_timer:
-            self._save_settings_timer.stop()
-        if hasattr(self, '_calib_timeout_timer') and self._calib_timeout_timer:
-            self._calib_timeout_timer.stop()
-            self._calib_timeout_timer = None
-        if hasattr(self, '_midi_hotplug_timer') and self._midi_hotplug_timer:
-            self._midi_hotplug_timer.stop()
+        for attr in ('midi_poll_timer', '_save_settings_timer', '_calib_timeout_timer',
+                     '_midi_hotplug_timer', '_auto_save_timer', '_calibration_age_timer'):
+            timer = getattr(self, attr, None)
+            if timer:
+                timer.stop()
+                if attr == '_calib_timeout_timer':
+                    setattr(self, attr, None)
         # Disconnect all worker signals before stopping thread
         try:
             self.worker.frame_ready.disconnect()
@@ -1951,6 +2623,10 @@ class ProjectionMappingApp(QMainWindow):
             self.worker.worker_stopped.disconnect()
             self.worker.calibration_progress.disconnect()
             self.worker.performance_degraded.disconnect()
+            # Disconnect new signals
+            self.worker.tracking_state_changed.disconnect()
+            self.worker.calibration_restored.disconnect()
+            self.worker.diagnostic_info.disconnect()
         except RuntimeError:
             pass
         # Save calibration state before exit
