@@ -232,6 +232,8 @@ class Worker(QObject):
         # Mask compositing caches
         self._mask_last_dst_pts: Dict[int, np.ndarray] = {}  # id(mask) → last dst_pts
         self._mask_filled_buffer: Dict[int, np.ndarray] = {}  # id(mask) → cached fill
+        # Per-mask fade tracking: id(mask) → (start_time, direction) where direction is "in"|"out"
+        self._mask_fade_state: Dict[int, tuple] = {}
 
         # Detection diagnostic deque
         self._detect_diag = collections.deque(maxlen=10)  # (frame_n, n_blobs, n_stable, n_final)
@@ -329,7 +331,8 @@ class Worker(QObject):
 
     def set_blackout(self, enabled: bool) -> None:
         """Improvement 30: instantly blackout projector output without stopping tracking."""
-        self._blackout = bool(enabled)
+        with self._state_lock:
+            self._blackout = bool(enabled)
 
     def set_expected_marker_count(self, count: int) -> None:
         """Improvement 31: allow UI to change expected marker count at runtime."""
@@ -1429,11 +1432,24 @@ class Worker(QObject):
         return dst_pts_raw
 
     def _compute_transform(self, src_pts, dst_pts):
-        if len(src_pts) == 4:
-            return cv2.getPerspectiveTransform(src_pts, dst_pts)
-
-        matrix, _ = cv2.findHomography(src_pts.reshape(-1, 1, 2), dst_pts.reshape(-1, 1, 2))
-        return matrix
+        try:
+            if len(src_pts) == 4:
+                M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            else:
+                M, _ = cv2.findHomography(src_pts.reshape(-1, 1, 2), dst_pts.reshape(-1, 1, 2))
+            # Sanity-check the result: reject degenerate or non-finite matrices
+            if M is None:
+                return None
+            if not np.all(np.isfinite(M)):
+                self.logger.debug("_compute_transform: non-finite matrix rejected")
+                return None
+            if abs(np.linalg.det(M[:2, :2])) < 1e-6:
+                self.logger.debug("_compute_transform: near-singular matrix rejected (det≈0)")
+                return None
+            return M
+        except cv2.error as exc:
+            self.logger.debug("_compute_transform cv2 error: %s", exc)
+            return None
 
     def _get_cached_source_points(self, mask):
         key = id(mask)
@@ -1459,6 +1475,59 @@ class Worker(QObject):
             if abs(p[0] - d[0]) > 1e-6 or abs(p[1] - d[1]) > 1e-6:
                 return False
         return True
+
+    def _get_mask_effective_opacity(self, mask, now: float) -> float:
+        """Return the effective opacity for a mask, applying fade-in/fade-out animation.
+
+        Fade state is stored in self._mask_fade_state keyed by id(mask).
+        On first render, a fade-in is started if mask.fade_in > 0.
+        Returns a float in [0.0, 1.0] that is the product of the mask's base
+        opacity and the current fade factor."""
+        mid = id(mask)
+        base_opacity = float(getattr(mask, 'opacity', 1.0))
+        base_opacity = max(0.0, min(1.0, base_opacity))
+
+        fade_in = float(getattr(mask, 'fade_in', 0.0))
+        fade_out = float(getattr(mask, 'fade_out', 0.0))
+
+        if fade_in <= 0.0 and fade_out <= 0.0:
+            # No fading configured — clean up any stale state
+            self._mask_fade_state.pop(mid, None)
+            return base_opacity
+
+        if mid not in self._mask_fade_state:
+            # First render for this mask — start fade-in
+            if fade_in > 0.0:
+                self._mask_fade_state[mid] = (now, 'in', fade_in)
+                return 0.0  # start fully transparent
+            return base_opacity
+
+        start_time, direction, duration = self._mask_fade_state[mid]
+        elapsed = now - start_time
+        if direction == 'in':
+            if elapsed >= duration:
+                self._mask_fade_state.pop(mid, None)
+                return base_opacity
+            fade_factor = elapsed / duration
+        elif direction == 'out':
+            if elapsed >= duration:
+                self._mask_fade_state.pop(mid, None)
+                return 0.0
+            fade_factor = 1.0 - (elapsed / duration)
+        else:
+            return base_opacity
+
+        return base_opacity * max(0.0, min(1.0, fade_factor))
+
+    def trigger_mask_fade_out(self, mask_id: int) -> None:
+        """Start a fade-out animation for the mask with the given Python id()."""
+        # Find the mask object
+        for mask in self.masks:
+            if id(mask) == mask_id:
+                fade_out = float(getattr(mask, 'fade_out', 0.0))
+                if fade_out > 0.0:
+                    self._mask_fade_state[mask_id] = (time.perf_counter(), 'out', fade_out)
+                break
 
     def _calibration_cache_path(self):
         """Return the directory used to persist calibration data."""
@@ -1533,10 +1602,30 @@ class Worker(QObject):
                     and os.path.exists(markers_path)):
                 return False
 
-            self._calib_dark_ref = np.load(dark_path)
-            self._calib_illum_ref = np.load(illum_path)
+            dark = np.load(dark_path)
+            illum = np.load(illum_path)
+            # Validate loaded arrays: must be 2-D grayscale uint8
+            if dark.ndim != 2 or illum.ndim != 2:
+                self.logger.error("Calibration cache corrupt: reference arrays are not 2-D")
+                return False
+            if dark.shape != illum.shape:
+                self.logger.error("Calibration cache corrupt: dark/illum shape mismatch %s vs %s",
+                                  dark.shape, illum.shape)
+                return False
+            if dark.dtype != np.uint8 or illum.dtype != np.uint8:
+                # Coerce if possible
+                dark = dark.astype(np.uint8)
+                illum = illum.astype(np.uint8)
+            self._calib_dark_ref = dark
+            self._calib_illum_ref = illum
+
+            H = None
             if os.path.exists(H_path):
-                self._cam_to_proj_H = np.load(H_path)
+                H = np.load(H_path)
+                if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+                    self.logger.warning("Calibration cache: homography invalid, ignoring")
+                    H = None
+            self._cam_to_proj_H = H
 
             with open(markers_path) as f:
                 data = json.load(f)
@@ -1545,6 +1634,15 @@ class Worker(QObject):
 
             if not markers:
                 return False
+            # Validate marker count is sane
+            if not (1 <= len(markers) <= 16):
+                self.logger.error("Calibration cache corrupt: implausible marker count %d", len(markers))
+                return False
+            # Validate each marker is a 2-element numeric tuple
+            for m in markers:
+                if len(m) != 2 or not all(isinstance(v, (int, float)) for v in m):
+                    self.logger.error("Calibration cache corrupt: invalid marker entry %s", m)
+                    return False
 
             self._calibrated_positions = markers
             self._marker_distances = distances if distances else None
@@ -1613,26 +1711,55 @@ class Worker(QObject):
         def _reader_loop():
             while self._cam_read_active:
                 try:
-                    self._cam_read_request_q.get(timeout=1.0)
+                    req = self._cam_read_request_q.get(timeout=1.0)
                 except queue.Empty:
                     continue
+                # None is the sentinel value used by _stop_camera_read_thread to wake us up
+                if req is None:
+                    break
+                if not self._cam_read_active:
+                    break
                 try:
                     ret, frame = cap.read()
-                    self._cam_read_result_q.put((ret, frame), timeout=0.1)
-                except Exception:
-                    self._cam_read_result_q.put((False, None), timeout=0.1)
-        self._cam_read_thread = threading.Thread(target=_reader_loop, daemon=True)
+                    if frame is not None:
+                        frame = frame.copy()  # deep copy to avoid aliasing with OpenCV buffer
+                    try:
+                        self._cam_read_result_q.put((ret, frame), timeout=0.1)
+                    except queue.Full:
+                        pass  # main loop didn't consume previous result yet — discard
+                except Exception as exc:
+                    self.logger.debug("Camera read error in reader thread: %s", exc)
+                    try:
+                        self._cam_read_result_q.put((False, None), timeout=0.1)
+                    except queue.Full:
+                        pass
+        self._cam_read_thread = threading.Thread(target=_reader_loop, daemon=True, name="cam-reader")
         self._cam_read_thread.start()
 
     def _stop_camera_read_thread(self):
         self._cam_read_active = False
+        # Signal the reader thread to wake up and exit if it is blocked on get()
+        try:
+            self._cam_read_request_q.put_nowait(None)
+        except queue.Full:
+            pass
+        # Join the reader thread with a timeout to avoid hanging on shutdown
+        if self._cam_read_thread is not None and self._cam_read_thread.is_alive():
+            self._cam_read_thread.join(timeout=2.0)
+            if self._cam_read_thread.is_alive():
+                self.logger.warning("Camera read thread did not exit within 2 s")
+            self._cam_read_thread = None
         # Drain queues
         while not self._cam_read_request_q.empty():
-            try: self._cam_read_request_q.get_nowait()
-            except: pass
+            try:
+                self._cam_read_request_q.get_nowait()
+            except queue.Empty:
+                break
         while not self._cam_read_result_q.empty():
-            try: self._cam_read_result_q.get_nowait()
-            except: pass
+            try:
+                self._cam_read_result_q.get_nowait()
+            except queue.Empty:
+                break
 
     def process_video(self):
         try:
@@ -1662,6 +1789,8 @@ class Worker(QObject):
                     self.camera_error.emit(self.video_source)
                 else:
                     self._start_camera_read_thread(main_cap)
+                    # Reset FPS degradation tracking on successful reconnect
+                    self._low_fps_since = None
                 self._camera_changed = False
                 self._camera_changed_event.clear()
 
@@ -2014,6 +2143,8 @@ class Worker(QObject):
             _ir_threshold = self.ir_threshold
             _threshold_mode = self.threshold_mode
             _active_cue_index = self.active_cue_index
+            with self._state_lock:
+                _blackout = self._blackout
 
             t0 = time.perf_counter()
             all_detected_points = self._extract_detected_points(main_frame)
@@ -2212,6 +2343,8 @@ class Worker(QObject):
                 bx, by = max(0, bx), max(0, by)
                 bw = min(bw, w - bx)
                 bh = min(bh, h - by)
+                if bw <= 0 or bh <= 0:
+                    continue
 
                 warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
 
@@ -2223,10 +2356,38 @@ class Worker(QObject):
                 roi_proj = projector_output[by:by+bh, bx:bx+bw]
                 roi_warp = warped_cue[by:by+bh, bx:bx+bw]
                 roi_mask = mask_image[by:by+bh, bx:bx+bw]
-                roi_proj[:] = cv2.add(
-                    cv2.bitwise_and(roi_proj, cv2.bitwise_not(roi_mask)),
-                    cv2.bitwise_and(roi_warp, roi_mask)
-                )
+
+                # Apply per-mask opacity with fade-in/out animation support
+                opacity = self._get_mask_effective_opacity(mask, time.perf_counter())
+                opacity = max(0.0, min(1.0, opacity))
+
+                # Apply per-mask blend mode
+                blend_mode = getattr(mask, 'blend_mode', 'normal')
+
+                # Build a binary alpha channel from the mask polygon (0 or 255)
+                alpha_bin = roi_mask[:, :, 0:1]  # shape (H,W,1), values 0 or 255
+
+                if opacity >= 0.999 and blend_mode == 'normal':
+                    # Fast path: fully opaque normal blend
+                    roi_proj[:] = cv2.add(
+                        cv2.bitwise_and(roi_proj, cv2.bitwise_not(roi_mask)),
+                        cv2.bitwise_and(roi_warp, roi_mask)
+                    )
+                else:
+                    # Slow path: opacity / blend mode compositing
+                    # Work in float32 for precision
+                    bg = roi_proj.astype(np.float32)
+                    fg = roi_warp.astype(np.float32)
+                    a = (alpha_bin.astype(np.float32) / 255.0) * opacity  # (H,W,1)
+
+                    if blend_mode == 'additive':
+                        blended = bg + fg * a
+                    elif blend_mode == 'multiply':
+                        blended = bg * (1.0 - a) + (bg * fg / 255.0) * a
+                    else:  # normal
+                        blended = bg * (1.0 - a) + fg * a
+
+                    roi_proj[:] = np.clip(blended, 0, 255).astype(np.uint8)
             warp_compose_ms = (time.perf_counter() - t0) * 1000.0
 
             if self._capture_still_frame_flag:
@@ -2245,7 +2406,7 @@ class Worker(QObject):
 
             t0 = time.perf_counter()
             # Improvement 38: respect blackout flag — send all-black to projector
-            if self._blackout:
+            if _blackout:
                 projector_output.fill(0)
 
             # Apply camera→projector homography if available.
@@ -2265,7 +2426,7 @@ class Worker(QObject):
             projector_ms = (time.perf_counter() - t0) * 1000.0
 
             frame_time_ms = (time.perf_counter() - frame_start) * 1000.0
-            self._recent_frame_times.append(frame_time_ms)
+            self._recent_frame_times.append(frame_time_ms)  # deque(maxlen=20) auto-evicts oldest
 
             now = time.perf_counter()
             if now - self._last_debug_emit > 2.0:
@@ -2281,8 +2442,7 @@ class Worker(QObject):
                     thresh_info,
                 )
                 self._last_debug_emit = now
-            if len(self._recent_frame_times) > 20:
-                self._recent_frame_times.pop(0)
+            # Note: _recent_frame_times is deque(maxlen=20), auto-evicts — no manual pop needed
 
             avg_frame = sum(self._recent_frame_times) / len(self._recent_frame_times)
             if avg_frame > 40:
@@ -2328,7 +2488,7 @@ class Worker(QObject):
                     "masks": len(current_masks),
                     "calibrated": self._calibrated,
                     "tracking_state": self._tracking_state,
-                    "blackout": self._blackout,
+                    "blackout": _blackout,
                     "blob_history": len(self._blob_history),
                 })
 
@@ -2354,13 +2514,12 @@ class Worker(QObject):
         self.warp_points = points
 
     def set_masks(self, masks: list) -> None:
-        self.masks = masks
+        self.masks = list(masks)  # defensive copy so caller mutations don't affect worker
         current_cues = set()
         for mask in self.masks:
             if getattr(mask, "cues", None):
                 current_cues.update([c for c in mask.cues if c])
-            elif mask.video_path:
-                current_cues.add(mask.video_path)
+            # Note: legacy mask.video_path is not used; cues list is the canonical source
 
         valid_mask_ids = {id(mask) for mask in self.masks}
         for cache_id in list(self._transform_cache.keys()):
