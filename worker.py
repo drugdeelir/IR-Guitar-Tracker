@@ -85,6 +85,12 @@ class Worker(QObject):
     calibration_progress = pyqtSignal(str, int, int)  # phase name, current frame, total frames
     worker_stopped = pyqtSignal()  # emitted when process_video exits (normal or crash)
     performance_degraded = pyqtSignal(float)  # emitted when FPS drops below 20 for 3+ s
+    # Improvement 24: tracking state changes ("idle", "calibrating", "tracking", "lost")
+    tracking_state_changed = pyqtSignal(str)
+    # Improvement 25: emitted when calibration is successfully restored from cache
+    calibration_restored = pyqtSignal()
+    # Improvement 26: detailed diagnostic dict emitted every ~1 second
+    diagnostic_info = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -198,6 +204,19 @@ class Worker(QObject):
         self._debug_mode = False  # set True to write calibration debug images to disk
         self._preview_enabled = True  # skip frame_ready emit when preview is off
 
+        # Improvement 27: blackout flag — zero projector output without stopping worker
+        self._blackout = False
+
+        # Improvement 28: tracking state tracking for signal emission
+        self._tracking_state = "idle"
+        self._last_tracking_state = ""
+
+        # Improvement 29: enable hardware-accelerated OpenCV operations
+        try:
+            cv2.setUseOptimized(True)
+        except Exception:
+            pass
+
         # Frame-drop tracking for performance_degraded signal (#44)
         self._low_fps_since = None   # timestamp when FPS first dropped below threshold
         self._low_fps_threshold = 20.0
@@ -307,6 +326,46 @@ class Worker(QObject):
 
     def set_preview_enabled(self, enabled):
         self._preview_enabled = bool(enabled)
+
+    def set_blackout(self, enabled: bool) -> None:
+        """Improvement 30: instantly blackout projector output without stopping tracking."""
+        self._blackout = bool(enabled)
+
+    def set_expected_marker_count(self, count: int) -> None:
+        """Improvement 31: allow UI to change expected marker count at runtime."""
+        n = max(1, min(8, int(count)))
+        self.expected_marker_count = n
+        # Reset Kalman filters since count changed
+        with self._state_lock:
+            self._kalman_filters = []
+            self._kalman_initialized = False
+            self.smoothed_points = []
+
+    def reset_calibration(self) -> None:
+        """Improvement 32: clear calibrated state and cache without triggering a new calibration.
+        The tracking falls back to global blob search until start_calibration() is called."""
+        self._calibrated = False
+        self._calibrated_positions = None
+        self._marker_distances = None
+        self._calib_phase = CalibPhase.IDLE
+        self._blob_history = []
+        with self._state_lock:
+            self.smoothed_points = []
+            self._kalman_filters = []
+            self._kalman_initialized = False
+        self.logger.info("Calibration reset — tracking in global-search mode until recalibration")
+
+    def get_calibration_info(self) -> dict:
+        """Improvement 33: return current calibration status as a dict for UI display."""
+        return {
+            "calibrated": self._calibrated,
+            "phase": self._calib_phase.name if isinstance(self._calib_phase, CalibPhase) else str(self._calib_phase),
+            "marker_count": len(self._calibrated_positions) if self._calibrated_positions else 0,
+            "expected_count": self.expected_marker_count,
+            "has_homography": self._cam_to_proj_H is not None,
+            "tracking_state": self._tracking_state,
+            "tracked_positions": list(self.smoothed_points),
+        }
 
     def start_calibration(self) -> None:
         """Trigger the calibration sequence: dark → illuminate → detect → proj_scan."""
@@ -499,7 +558,23 @@ class Worker(QObject):
         if not search_centers or len(search_centers) != self.expected_marker_count:
             return self._extract_detected_points_global(main_frame, gray, sat_channel)
 
-        radius = self._local_search_radius
+        # Improvement 41: adaptive local search radius based on recent marker velocity.
+        # If markers are moving fast (inferred from Kalman velocity state), widen the
+        # search so we don't lose them on quick moves.
+        _adaptive_radius = self._local_search_radius
+        if self._kalman_initialized and self._kalman_filters:
+            max_vel = 0.0
+            for kf in self._kalman_filters:
+                vx = float(kf.statePost[2, 0])
+                vy = float(kf.statePost[3, 0])
+                max_vel = max(max_vel, (vx ** 2 + vy ** 2) ** 0.5)
+            if max_vel > 5.0:
+                # Scale up radius proportionally, cap at 3× default
+                _adaptive_radius = min(
+                    self._local_search_radius * 3,
+                    int(self._local_search_radius + max_vel * 2)
+                )
+        radius = _adaptive_radius
         result = []
 
         for cx, cy in search_centers:
@@ -1476,6 +1551,8 @@ class Worker(QObject):
             self._calibrated = True
             self._calib_phase = CalibPhase.IDLE
             self.markers_calibrated.emit(markers)
+            # Improvement 42: dedicated signal so UI can update "last calibrated" display
+            self.calibration_restored.emit()
             self.logger.info("Calibration restored from cache (%d markers)", len(markers))
             return True
         except Exception:
@@ -1764,14 +1841,16 @@ class Worker(QObject):
                         _base_d = os.path.dirname(os.path.abspath(__file__))
                         cv2.imwrite(os.path.join(_base_d, "calibration_debug.png"), debug_frame)
                     # Next phase: project 4 corner dots to compute camera→projector homography
-                    self._calib_phase = "proj_scan"
+                    # Improvement 36: use enum (was string "proj_scan")
+                    self._calib_phase = CalibPhase.PROJ_SCAN
                     self._calib_frame_count = 0
                 else:
                     self.logger.warning(
                         "Calibration failed: found %d markers (need %d). Restarting...",
                         len(markers) if markers else 0, self.expected_marker_count
                     )
-                    self._calib_phase = "dark"
+                    # Improvement 34: use enum consistently (was string "dark")
+                    self._calib_phase = CalibPhase.DARK
                     self._calib_frame_count = 0
                     self._calib_dark_ref = None
                     self._calib_illum_ref = None
@@ -1779,7 +1858,8 @@ class Worker(QObject):
                 continue
 
             # Phase 4: PROJ_SCAN - project 4 corner dots, detect in camera, compute homography
-            if not self._calibrated and self._calib_phase == "proj_scan":
+            # Improvement 35: use enum consistently (was string "proj_scan")
+            if not self._calibrated and self._calib_phase in (CalibPhase.PROJ_SCAN, "proj_scan"):
                 self._calib_frame_count += 1
                 proj_w, proj_h = self._proj_resolution
                 inset = 0.05
@@ -1929,8 +2009,8 @@ class Worker(QObject):
 
             # Post-calibration: projector outputs composited masks (handled below)
 
-            # Snapshot mutable UI-writable attributes once per frame to avoid
-            # mid-frame changes causing inconsistent behaviour (#42)
+            # Improvement 44: snapshot all mutable UI-writable attributes once per frame
+            # to avoid mid-frame changes causing inconsistent behaviour (#42)
             _ir_threshold = self.ir_threshold
             _threshold_mode = self.threshold_mode
             _active_cue_index = self.active_cue_index
@@ -1945,6 +2025,17 @@ class Worker(QObject):
             match_ms = (time.perf_counter() - t0) * 1000.0
 
             self.trackers_detected.emit(len(tracked_points))
+
+            # Improvement 37: emit tracking_state_changed when state transitions
+            if tracked_points:
+                _new_state = "tracking"
+            elif self._calibrated:
+                _new_state = "lost"
+            else:
+                _new_state = "idle"
+            if _new_state != self._tracking_state:
+                self._tracking_state = _new_state
+                self.tracking_state_changed.emit(_new_state)
 
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
                 self._calibration_distances.append(
@@ -1967,8 +2058,9 @@ class Worker(QObject):
             cv2.putText(main_frame, f"Det:{len(all_detected_points)} Trk:{len(tracked_points)}",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # Snapshot to avoid iterator invalidation if set_masks() called from UI thread
-            current_masks = list(self.masks)
+            # Improvement 45: deep-copy mask list snapshot for thread safety;
+            # only render masks that are enabled (new field from mask.py)
+            current_masks = [m for m in list(self.masks) if getattr(m, "enabled", True)]
 
             if self.show_mask_overlays:
                 for mask in current_masks:
@@ -2081,13 +2173,25 @@ class Worker(QObject):
                 ret_cue, frame_cue = cap_cue.read()
 
                 if not ret_cue:
-                    # Reopen rather than seek — faster loop on USB/network storage
-                    cap_cue.release()
-                    del self.video_captures[cue_path]
-                    cap_cue = cv2.VideoCapture(cue_path)
-                    if cap_cue.isOpened():
-                        self.video_captures[cue_path] = cap_cue
-                        ret_cue, frame_cue = cap_cue.read()
+                    # Improvement 39: respect loop_mode per mask
+                    if getattr(mask, "loop_mode", "loop") == "oneshot":
+                        # oneshot: hold on last frame — advance cue to trigger next or just hold
+                        # Try to seek back to just before the end to serve the last decoded frame
+                        total_frames = int(cap_cue.get(cv2.CAP_PROP_FRAME_COUNT))
+                        if total_frames > 1:
+                            cap_cue.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+                            ret_cue, frame_cue = cap_cue.read()
+                        if not ret_cue:
+                            continue  # truly at end and oneshot — skip
+                    else:
+                        # Loop mode: try cheap seek first, fall back to reopen
+                        if not cap_cue.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                            cap_cue.release()
+                            del self.video_captures[cue_path]
+                            cap_cue = cv2.VideoCapture(cue_path)
+                            if cap_cue.isOpened():
+                                self.video_captures[cue_path] = cap_cue
+                        ret_cue, frame_cue = cap_cue.read() if cap_cue.isOpened() else (False, None)
 
                 if not ret_cue:
                     continue
@@ -2140,6 +2244,10 @@ class Worker(QObject):
                 self.frame_ready.emit(qt_image_main)
 
             t0 = time.perf_counter()
+            # Improvement 38: respect blackout flag — send all-black to projector
+            if self._blackout:
+                projector_output.fill(0)
+
             # Apply camera→projector homography if available.
             # This warps the composited output (in camera pixel space) into
             # projector pixel space so content aligns with the physical scene.
@@ -2206,6 +2314,24 @@ class Worker(QObject):
                         self._low_fps_since = None  # reset so it can fire again after recovery
                 else:
                     self._low_fps_since = None
+
+                # Improvement 40: emit diagnostic_info for the diagnostics panel
+                self.diagnostic_info.emit({
+                    "fps": round(fps, 1),
+                    "frame_ms": round(frame_time_ms, 1),
+                    "detect_ms": round(detect_ms, 1),
+                    "match_ms": round(match_ms, 1),
+                    "warp_ms": round(warp_compose_ms, 1),
+                    "render_ms": round(projector_ms + capture_ms, 1),
+                    "tracked": len(tracked_points),
+                    "detected": len(all_detected_points),
+                    "masks": len(current_masks),
+                    "calibrated": self._calibrated,
+                    "tracking_state": self._tracking_state,
+                    "blackout": self._blackout,
+                    "blob_history": len(self._blob_history),
+                })
+
                 fps_counter = 0
                 fps_window_start = time.perf_counter()
 
@@ -2220,7 +2346,9 @@ class Worker(QObject):
             cap.release()
 
     def stop(self) -> None:
+        # Improvement 43: cleanly stop camera read thread alongside worker loop
         self._running = False
+        self._stop_camera_read_thread()
 
     def set_warp_points(self, points):
         self.warp_points = points
