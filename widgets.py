@@ -161,6 +161,8 @@ class MarkerSelectionDialog(QDialog):
     def auto_select_markers(self):
         if not self.ir_assist_enabled:
             return
+        if not self.detected_ir_points:
+            return
         self.selected_points = [QPoint(p.x(), p.y()) for p in self.detected_ir_points[: self.max_markers]]
         self._render_preview()
 
@@ -436,7 +438,11 @@ class ProjectorWindow(QWidget):
     def set_image(self, image):
         if self.pattern_mode or self._blackout:
             return
+        if image is None or image.isNull():
+            return
         pixmap = QPixmap.fromImage(image)
+        if pixmap.isNull():
+            return
         size = self.label.size()
         if size.width() > 1 and size.height() > 1:
             pixmap = pixmap.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
@@ -694,7 +700,7 @@ class PolygonMaskDialog(QDialog):
         )
 
     def accept(self):
-        """Validate minimum point count before closing (#38)."""
+        """Validate minimum and maximum point count before closing."""
         if len(self.points) < 3:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(
@@ -703,6 +709,27 @@ class PolygonMaskDialog(QDialog):
                 "Click on the image to add more points."
             )
             return  # keep dialog open
+        if len(self.points) > 64:
+            from PyQt5.QtWidgets import QMessageBox
+            result = QMessageBox.question(
+                self, "Many Points",
+                f"This mask has {len(self.points)} points which may slow rendering.\n"
+                "Continue with all points, or simplify to a convex hull?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.No
+            )
+            if result == QMessageBox.Cancel:
+                return
+            if result == QMessageBox.No:
+                import cv2 as _cv2
+                import numpy as _np
+                pts_arr = _np.array([[p.x(), p.y()] for p in self.points], dtype=_np.int32)
+                hull = _cv2.convexHull(pts_arr)
+                epsilon = _cv2.arcLength(hull, True) * 0.01
+                approx = _cv2.approxPolyDP(hull, epsilon, True)
+                from PyQt5.QtCore import QPoint as _QP
+                self.points = [_QP(int(p[0][0]), int(p[0][1])) for p in approx]
+                self._render_preview()
         super().accept()
 
     def resizeEvent(self, event):

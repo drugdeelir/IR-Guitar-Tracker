@@ -1,10 +1,19 @@
 import os
 import logging
+from typing import List, Optional
 
 _log = logging.getLogger(__name__)
 
 BLEND_MODES = ("normal", "additive", "multiply")
 LOOP_MODES = ("loop", "oneshot")
+
+
+def _clamp_float(value, lo: float, hi: float, default: float) -> float:
+    """Safely coerce *value* to a float clamped to [lo, hi], returning *default* on error."""
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 class Mask:
@@ -26,7 +35,7 @@ class Mask:
         self.enabled = True
 
         # Improvement 2: Per-mask opacity (0.0 = transparent, 1.0 = fully opaque)
-        self.opacity = 1.0
+        self.opacity: float = 1.0
 
         # Improvement 3: Blend mode for compositing against projector buffer
         self.blend_mode = "normal"  # "normal" | "additive" | "multiply"
@@ -46,6 +55,18 @@ class Mask:
         # Improvement 8: Fade-in/fade-out duration in seconds (0 = instant cut)
         self.fade_in = 0.0
         self.fade_out = 0.0
+
+    def set_opacity(self, value: float) -> None:
+        """Set opacity, clamping to [0.0, 1.0]."""
+        self.opacity = _clamp_float(value, 0.0, 1.0, 1.0)
+
+    def set_fade_in(self, seconds: float) -> None:
+        """Set fade-in duration in seconds (0 = instant cut)."""
+        self.fade_in = _clamp_float(seconds, 0.0, 300.0, 0.0)
+
+    def set_fade_out(self, seconds: float) -> None:
+        """Set fade-out duration in seconds (0 = instant cut)."""
+        self.fade_out = _clamp_float(seconds, 0.0, 300.0, 0.0)
 
     def add_cue(self, path):
         if path:
@@ -134,17 +155,22 @@ class Mask:
         m.render_order = d.get("render_order", 0)
         m.locked = d.get("locked", False)
         # New fields with safe defaults for backward compatibility
-        m.enabled = d.get("enabled", True)
-        m.opacity = float(d.get("opacity", 1.0))
-        m.blend_mode = d.get("blend_mode", "normal")
-        if m.blend_mode not in BLEND_MODES:
-            m.blend_mode = "normal"
-        m.loop_mode = d.get("loop_mode", "loop")
-        if m.loop_mode not in LOOP_MODES:
-            m.loop_mode = "loop"
-        m.label_color = d.get("label_color", None)
-        m.fade_in = float(d.get("fade_in", 0.0))
-        m.fade_out = float(d.get("fade_out", 0.0))
+        m.enabled = bool(d.get("enabled", True))
+        m.opacity = _clamp_float(d.get("opacity", 1.0), 0.0, 1.0, 1.0)
+        blend = d.get("blend_mode", "normal")
+        m.blend_mode = blend if blend in BLEND_MODES else "normal"
+        loop = d.get("loop_mode", "loop")
+        m.loop_mode = loop if loop in LOOP_MODES else "loop"
+        label_color = d.get("label_color", None)
+        # Validate label_color is a hex string or None
+        if label_color is not None and not (isinstance(label_color, str) and label_color.startswith('#')):
+            label_color = None
+        m.label_color = label_color
+        m.fade_in = _clamp_float(d.get("fade_in", 0.0), 0.0, 300.0, 0.0)
+        m.fade_out = _clamp_float(d.get("fade_out", 0.0), 0.0, 300.0, 0.0)
+        # Validate active_cue is in bounds
+        if not (0 <= m.active_cue < max(len(m.cues), 1)):
+            m.active_cue = 0
 
         # Warn about missing cue files on load
         m.validate_cues()

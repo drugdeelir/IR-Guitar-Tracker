@@ -54,8 +54,8 @@ except ImportError:
 
 SETTINGS_PATH = Path("settings.json")
 
-__version__ = "1.0.0"
-_SETTINGS_VERSION = 3
+__version__ = "1.0.1"
+_SETTINGS_VERSION = 4
 
 
 def configure_opencv_logging():
@@ -97,6 +97,17 @@ def _migrate_settings(d: dict) -> dict:
             mask_dict.setdefault("render_order", 0)
             mask_dict.setdefault("locked", False)
         d["version"] = 3
+    if version < 4:
+        # v3→v4: added opacity, blend_mode, loop_mode, fade_in, fade_out, enabled, label_color
+        for mask_dict in d.get("masks", []):
+            mask_dict.setdefault("enabled", True)
+            mask_dict.setdefault("opacity", 1.0)
+            mask_dict.setdefault("blend_mode", "normal")
+            mask_dict.setdefault("loop_mode", "loop")
+            mask_dict.setdefault("label_color", None)
+            mask_dict.setdefault("fade_in", 0.0)
+            mask_dict.setdefault("fade_out", 0.0)
+        d["version"] = 4
     return d
 
 
@@ -347,16 +358,16 @@ class ProjectionMappingApp(QMainWindow):
     def load_settings(self):
         if SETTINGS_PATH.exists():
             try:
-                data = json.loads(SETTINGS_PATH.read_text())
+                data = json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
                 data = _migrate_settings(data)
                 return self._validate_settings(data)
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.logger.warning("Could not load settings: %s", exc)
                 # Try backup file
                 backup = SETTINGS_PATH.with_name('settings_backup.json')
                 if backup.exists():
                     try:
-                        data = json.loads(backup.read_text())
+                        data = json.loads(backup.read_text(encoding='utf-8'))
                         data = _migrate_settings(data)
                         self.logger.info("Restored settings from backup")
                         return self._validate_settings(data)
@@ -368,17 +379,31 @@ class ProjectionMappingApp(QMainWindow):
     def _validate_settings(self, d: dict) -> dict:
         """Coerce and clamp all settings fields to valid types and ranges."""
         def _int(key, default, lo, hi):
-            try: return max(lo, min(hi, int(d.get(key, default))))
-            except (TypeError, ValueError): return default
+            try:
+                return max(lo, min(hi, int(d.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
+        def _float(key, default, lo, hi):
+            try:
+                return max(lo, min(hi, float(d.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
         def _bool(key, default):
             v = d.get(key, default)
-            return bool(v) if isinstance(v, bool) else default
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, int):
+                return bool(v)
+            return default
+
         def _str(key, default, allowed=None):
             v = str(d.get(key, default))
             return v if (allowed is None or v in allowed) else default
 
-        return {
-            **d,  # preserve unknown keys
+        result = dict(d)  # preserve unknown keys
+        result.update({
             "ir_threshold": _int("ir_threshold", 200, 0, 255),
             "depth_sensitivity": _int("depth_sensitivity", 100, 1, 500),
             "camera_index": _int("camera_index", 0, 0, 99),
@@ -388,7 +413,9 @@ class ProjectionMappingApp(QMainWindow):
             "show_preview_enabled": _bool("show_preview_enabled", True),
             "show_mask_overlays": _bool("show_mask_overlays", True),
             "camera_mode": _str("camera_mode", "native", {"native", "performance", "hd"}),
-        }
+            "expected_marker_count": _int("expected_marker_count", 4, 1, 8),
+        })
+        return result
 
     def save_settings(self):
         settings = {
@@ -424,7 +451,7 @@ class ProjectionMappingApp(QMainWindow):
                 except Exception:
                     pass
             _tmp = SETTINGS_PATH.with_suffix('.tmp')
-            _tmp.write_text(json.dumps(settings, indent=2))
+            _tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding='utf-8')
             _tmp.replace(SETTINGS_PATH)
         except OSError as exc:
             self.logger.error("Could not save settings: %s", exc)
@@ -523,7 +550,17 @@ class ProjectionMappingApp(QMainWindow):
         if reference_pixmap is not None:
             self.marker_selection_dialog.set_pixmap(reference_pixmap)
 
-        if self.marker_selection_dialog.exec_():
+        # Auto-close the dialog after 3 minutes to prevent it hanging open during a show
+        _timeout_ms = 180_000  # 3 minutes
+        _timeout_timer = QTimer(self.marker_selection_dialog)
+        _timeout_timer.setSingleShot(True)
+        _timeout_timer.timeout.connect(self.marker_selection_dialog.reject)
+        _timeout_timer.start(_timeout_ms)
+
+        accepted = self.marker_selection_dialog.exec_()
+        _timeout_timer.stop()
+
+        if accepted:
             markers = self.marker_selection_dialog.get_selected_points()
             if len(markers) != 4:
                 QMessageBox.warning(self, "Marker Selection", "Please select exactly 4 guitar markers.")
@@ -1679,6 +1716,7 @@ class ProjectionMappingApp(QMainWindow):
     def update_camera_mode(self, _index):
         self.worker.set_camera_mode(self.camera_mode_combo.currentData())
 
+    @pyqtSlot(str)
     def update_camera_info(self, message):
         self.camera_info_label.setText(message)
 
@@ -1722,8 +1760,13 @@ class ProjectionMappingApp(QMainWindow):
                 QMessageBox.Retry,
             )
             if result == QMessageBox.Retry:
-                self.worker.retry_camera()
-                self.thread.start()
+                # Only restart if the thread is actually finished — avoid double-start
+                if not self.thread.isRunning():
+                    self.worker._running = True  # re-arm the worker loop flag
+                    self.worker.retry_camera()
+                    self.thread.start()
+                else:
+                    self.logger.warning("Worker thread restart requested but thread is still running")
 
     @pyqtSlot(str, int, int)
     def _on_calibration_progress(self, phase, current, total):
@@ -1756,9 +1799,12 @@ class ProjectionMappingApp(QMainWindow):
             self._close_calibration_dialog()
 
     def _cancel_calibration(self):
-        """Operator cancels calibration mid-run."""
-        self.worker.start_calibration()  # This resets the calibration state
+        """Operator cancels calibration mid-run — return to idle without starting a new run."""
+        self.worker.reset_calibration()
         self._close_calibration_dialog()
+        if hasattr(self, 'calibrate_button'):
+            self.calibrate_button.setEnabled(True)
+            self.calibrate_button.setText("Calibrate Guitar + Homography")
         self.statusBar().showMessage("Calibration cancelled.", 3000)
 
     def _status_message(self, msg: str, level: str = "info", timeout_ms: int = 5000):
@@ -1816,6 +1862,7 @@ class ProjectionMappingApp(QMainWindow):
         )
         self.logger.warning("Performance degraded: %.1f fps", fps)
 
+    @pyqtSlot(float, float, float, float, float, float)
     def update_performance_label(self, fps, frame_time_ms, detect_ms, match_ms, warp_ms, render_ms):
         self.performance_label.setText(
             f"FPS: {fps:.1f} | Frame: {frame_time_ms:.1f}ms | D:{detect_ms:.1f} M:{match_ms:.1f} W:{warp_ms:.1f} R:{render_ms:.1f}"
@@ -1834,6 +1881,36 @@ class ProjectionMappingApp(QMainWindow):
         if not mask_points:
             self.logger.debug("Finish Mask clicked with no points; nothing saved.")
         else:
+            if len(mask_points) < 3:
+                QMessageBox.warning(
+                    self, "Not Enough Points",
+                    "A mask needs at least 3 points to form a valid polygon.\n"
+                    "Click 'Create Mask' and add more points."
+                )
+                self.create_mask_button.setEnabled(True)
+                self.finish_mask_button.setEnabled(False)
+                self.cancel_mask_button.setEnabled(False)
+                self.video_display.clear_mask_points()
+                self.mask_points_list.clear()
+                return
+            if len(mask_points) > 64:
+                result = QMessageBox.question(
+                    self, "Many Points",
+                    f"This mask has {len(mask_points)} points which may slow rendering.\n"
+                    "Use the simplified polygon instead (recommended)?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if result == QMessageBox.Yes:
+                    import cv2 as _cv2
+                    import numpy as _np
+                    pts_arr = _np.array([(p.x(), p.y()) for p in mask_points], dtype=_np.int32)
+                    hull = _cv2.convexHull(pts_arr)
+                    epsilon = _cv2.arcLength(hull, True) * 0.01
+                    approx = _cv2.approxPolyDP(hull, epsilon, True)
+                    from PyQt5.QtCore import QPoint as _QPoint
+                    mask_points = [_QPoint(int(p[0][0]), int(p[0][1])) for p in approx]
+                    self.logger.info("Polygon simplified from %d to %d points",
+                                     len(mask_points), len(approx))
             row = self.mask_list_widget.currentRow()
             source_points = [(p.x(), p.y()) for p in mask_points]
             if 0 <= row < len(self.masks):
@@ -1926,6 +2003,7 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.set_threshold_mode(mode)
         self.ir_threshold_slider.setEnabled(mode == "manual")
 
+    @pyqtSlot(int)
     def update_tracker_label(self, count):
         self.ir_trackers_label.setText(f"Trackers detected: {count}")
 
@@ -2144,18 +2222,23 @@ class ProjectionMappingApp(QMainWindow):
     def route_midi_cc(self, cc, value):
         if value <= 0:
             return
+        matched = False
         for mask in self.masks:
             if cc in mask.midi_cc_map:
                 cue_idx = mask.midi_cc_map[cc]
                 if 0 <= cue_idx < len(mask.cues):
                     mask.active_cue = cue_idx
-        self.worker.set_masks(self.masks)
-        self.refresh_cues_for_selected_mask()
-        # Improvement: flash MIDI activity LED
+                    matched = True
+                    self.logger.debug("MIDI CC %d value %d → mask '%s' cue %d",
+                                      cc, value, mask.name, cue_idx)
+        if matched:
+            self.worker.set_masks(self.masks)
+            self.refresh_cues_for_selected_mask()
+        # Flash MIDI activity LED regardless of match (shows MIDI is live)
         if hasattr(self, 'midi_activity_label'):
-            self.midi_activity_label.setStyleSheet("color: #00cc44; font-size: 16px;")
-            QTimer.singleShot(200, lambda: self.midi_activity_label.setStyleSheet(
-                "color: #444; font-size: 16px;" if self.midi_inport else "color: #444; font-size: 16px;"
+            self.midi_activity_label.setStyleSheet("color: #ffcc00; font-size: 16px;")
+            QTimer.singleShot(120, lambda: self.midi_activity_label.setStyleSheet(
+                "color: #00cc44; font-size: 16px;" if self.midi_inport else "color: #444; font-size: 16px;"
             ))
 
     def remove_mask(self):
@@ -2197,11 +2280,17 @@ class ProjectionMappingApp(QMainWindow):
         self.projector_window.raise_()
         self.projector_window.activateWindow()
 
+        # Sync projector resolution to worker so warpPerspective output matches
+        proj_w = max(1, target_geometry.width())
+        proj_h = max(1, target_geometry.height())
+        self.worker._proj_resolution = (proj_w, proj_h)
         self.logger.info(
-            "Projector display changed to index=%d name=%s geometry=%s",
+            "Projector display changed to index=%d name=%s geometry=%s resolution=%dx%d",
             index,
             screen.name(),
             target_geometry,
+            proj_w,
+            proj_h,
         )
 
     # ─── New slot implementations ───────────────────────────────────────────
@@ -2238,17 +2327,20 @@ class ProjectionMappingApp(QMainWindow):
         )
 
     def _save_screenshot(self) -> None:
-        """Improvement 78: save current projector frame as PNG."""
+        """Improvement 78: save current camera frame as PNG (timestamped filename)."""
         if self.latest_camera_qimage is None:
             self._status_message("No frame available yet.", "warning", 3000)
             return
-        from PyQt5.QtWidgets import QFileDialog
+        import time as _time
+        ts = _time.strftime("%Y%m%d_%H%M%S")
+        default_name = f"screenshot_{ts}.png"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Screenshot", "screenshot.png", "PNG Images (*.png)"
+            self, "Save Screenshot", default_name, "PNG Images (*.png)"
         )
         if path:
             if self.latest_camera_qimage.save(path):
                 self._status_message(f"Screenshot saved: {Path(path).name}", "success", 4000)
+                self.logger.info("Screenshot saved: %s", path)
             else:
                 self._status_message("Failed to save screenshot.", "error", 4000)
 
@@ -2399,6 +2491,75 @@ class ProjectionMappingApp(QMainWindow):
         self.save_settings()
         self.logger.info("Auto-saved settings")
 
+    def _check_midi_hotplug(self) -> None:
+        """Poll for newly connected or removed MIDI input ports every 2 seconds.
+        Updates the combo box silently; does not disconnect the active port."""
+        if mido is None:
+            return
+        try:
+            current_names = mido.get_input_names()
+        except Exception:
+            return
+        if current_names != self._midi_port_names:
+            self.logger.info(
+                "MIDI ports changed: was %s, now %s",
+                self._midi_port_names, current_names
+            )
+            self._midi_port_names = current_names
+            # Repopulate combo without disconnecting the active port
+            selected = self.midi_input_combo.currentText()
+            self.midi_input_combo.blockSignals(True)
+            self.midi_input_combo.clear()
+            if current_names:
+                self.midi_input_combo.setEnabled(True)
+                self.midi_input_combo.addItems(current_names)
+                # Restore previous selection if still available
+                idx = self.midi_input_combo.findText(selected)
+                if idx >= 0:
+                    self.midi_input_combo.setCurrentIndex(idx)
+            else:
+                self.midi_input_combo.addItem("No MIDI input ports")
+                self.midi_input_combo.setEnabled(False)
+            self.midi_input_combo.blockSignals(False)
+            # Warn if the currently connected port disappeared
+            if self.midi_inport is not None and selected not in current_names:
+                self.logger.warning("Active MIDI port '%s' disappeared", selected)
+                self.statusBar().showMessage(
+                    f"MIDI port '{selected}' disconnected — reconnect in MIDI panel", 8000
+                )
+                try:
+                    self.midi_inport.close()
+                except Exception:
+                    pass
+                self.midi_inport = None
+                if hasattr(self, 'midi_status_label'):
+                    self.midi_status_label.setText("MIDI: Disconnected")
+                if hasattr(self, 'midi_activity_label'):
+                    self.midi_activity_label.setStyleSheet("color: #444; font-size: 16px;")
+
+    def _check_memory(self) -> None:
+        """Log memory usage snapshot every 5 minutes when IRTK_PROFILE_MEMORY is set."""
+        try:
+            import tracemalloc
+            if not tracemalloc.is_tracing():
+                return
+            snapshot = tracemalloc.take_snapshot()
+            top = snapshot.statistics('lineno')[:5]
+            self.logger.info(
+                "Memory snapshot (top 5): %s",
+                [(str(s.traceback), s.size // 1024) for s in top]
+            )
+            # Also log process RSS if psutil is available
+            try:
+                import psutil, os as _os
+                proc = psutil.Process(_os.getpid())
+                rss_mb = proc.memory_info().rss / 1024 / 1024
+                self.logger.info("Process RSS: %.1f MB", rss_mb)
+            except ImportError:
+                pass
+        except Exception as exc:
+            self.logger.debug("Memory check error: %s", exc)
+
     def _notes_changed(self) -> None:
         """Improvement 87: track operator notes changes for saving."""
         self._operator_notes = self.operator_notes_edit.toPlainText()
@@ -2464,8 +2625,14 @@ class ProjectionMappingApp(QMainWindow):
         if not path:
             return
         try:
-            data = {"masks": [m.to_dict() for m in self.masks]}
-            Path(path).write_text(json.dumps(data, indent=2))
+            data = {
+                "version": _SETTINGS_VERSION,
+                "exported_from": f"IR Guitar Tracker v{__version__}",
+                "masks": [m.to_dict() for m in self.masks],
+            }
+            Path(path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8'
+            )
             self._status_message(f"Exported {len(self.masks)} mask(s) to {Path(path).name}", "success", 4000)
         except Exception as exc:
             self.logger.exception("Export masks failed")
@@ -2481,11 +2648,21 @@ class ProjectionMappingApp(QMainWindow):
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text())
-            imported = [_Mask.from_dict(d) for d in data.get("masks", [])]
-            if not imported:
+            raw = Path(path).read_text(encoding='utf-8')
+            data = json.loads(raw)
+            mask_dicts = data.get("masks", [])
+            if not mask_dicts:
                 QMessageBox.warning(self, "Import Masks", "No masks found in the file.")
                 return
+            # Migrate imported masks to latest schema
+            for md in mask_dicts:
+                md.setdefault("enabled", True)
+                md.setdefault("opacity", 1.0)
+                md.setdefault("blend_mode", "normal")
+                md.setdefault("loop_mode", "loop")
+                md.setdefault("fade_in", 0.0)
+                md.setdefault("fade_out", 0.0)
+            imported = [_Mask.from_dict(d) for d in mask_dicts]
             if QMessageBox.question(
                 self, "Import Masks",
                 f"Replace all {len(self.masks)} current mask(s) with {len(imported)} imported mask(s)?",
@@ -2496,6 +2673,9 @@ class ProjectionMappingApp(QMainWindow):
                 self.refresh_mask_views()
                 self.request_save_settings()
                 self._status_message(f"Imported {len(imported)} mask(s).", "success", 4000)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            QMessageBox.critical(self, "Import Failed",
+                                 f"Could not parse file: {exc}")
         except Exception as exc:
             self.logger.exception("Import masks failed")
             QMessageBox.critical(self, "Import Failed", str(exc))
@@ -2566,18 +2746,35 @@ class ProjectionMappingApp(QMainWindow):
         QShortcut(QKeySequence("Delete"), self, activated=self.remove_mask)
         QShortcut(QKeySequence("Space"), self,
                   activated=lambda: self.preview_checkbox.toggle() if hasattr(self, 'preview_checkbox') else None)
-        # Improvement 99: Esc for instant blackout toggle
+        # Esc for instant blackout toggle
         QShortcut(QKeySequence("Escape"), self,
                   activated=lambda: self.blackout_button.toggle() if hasattr(self, 'blackout_button') else None)
-        # Improvement 100: F1 for help / keyboard shortcuts cheatsheet
+        # F1 for help / keyboard shortcuts cheatsheet
         QShortcut(QKeySequence("F1"), self, activated=self._show_shortcuts_help)
         # F2 to rename selected mask
         QShortcut(QKeySequence("F2"), self, activated=self._rename_mask_inline)
-        # Ctrl+Right / Ctrl+Left: advance / previous cue
+        # Ctrl+Right: advance cue on selected mask
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._advance_cue)
         # Ctrl+A: render all masks
         QShortcut(QKeySequence("Ctrl+A"), self,
                   activated=lambda: self.worker.set_active_cue_index(-1))
+        # Ctrl+Z: undo last mask point during mask creation
+        QShortcut(QKeySequence("Ctrl+Z"), self,
+                  activated=self._undo_last_mask_point)
+        # Ctrl+B: toggle blackout (alternative to Esc for hardware controllers)
+        QShortcut(QKeySequence("Ctrl+B"), self,
+                  activated=lambda: self.blackout_button.toggle() if hasattr(self, 'blackout_button') else None)
+        # Ctrl+L: toggle lock mode
+        QShortcut(QKeySequence("Ctrl+L"), self,
+                  activated=lambda: self.lock_mode_button.toggle() if hasattr(self, 'lock_mode_button') else None)
+
+    def _undo_last_mask_point(self) -> None:
+        """Remove the last point added during active mask creation."""
+        if self.video_display.mask_creation_mode and self.video_display.mask_points:
+            self.video_display.mask_points.pop()
+            if self.mask_points_list.count() > 0:
+                self.mask_points_list.takeItem(self.mask_points_list.count() - 1)
+            self.video_display.update()
 
     def _show_shortcuts_help(self) -> None:
         """Show keyboard shortcut reference."""
@@ -2585,13 +2782,15 @@ class ProjectionMappingApp(QMainWindow):
             "<b>Keyboard Shortcuts</b><br><br>"
             "<b>Ctrl+S</b> — Save settings<br>"
             "<b>Ctrl+C</b> — Trigger calibration<br>"
-            "<b>Esc</b> — Toggle projector BLACKOUT<br>"
+            "<b>Esc / Ctrl+B</b> — Toggle projector BLACKOUT<br>"
             "<b>Space</b> — Toggle preview panel<br>"
             "<b>F1</b> — Show this help<br>"
             "<b>F2</b> — Rename selected mask<br>"
             "<b>Delete</b> — Remove selected mask<br>"
             "<b>Ctrl+Right</b> — Advance cue on selected mask<br>"
             "<b>Ctrl+A</b> — Render all masks<br>"
+            "<b>Ctrl+Z</b> — Undo last mask point (during mask creation)<br>"
+            "<b>Ctrl+L</b> — Toggle UI lock mode<br>"
         )
         QMessageBox.information(self, "Keyboard Shortcuts", shortcuts)
 
@@ -2612,23 +2811,27 @@ class ProjectionMappingApp(QMainWindow):
                 if attr == '_calib_timeout_timer':
                     setattr(self, attr, None)
         # Disconnect all worker signals before stopping thread
-        try:
-            self.worker.frame_ready.disconnect()
-            self.worker.projector_frame_ready.disconnect()
-            self.worker.trackers_detected.disconnect()
-            self.worker.camera_error.disconnect()
-            self.worker.performance_updated.disconnect()
-            self.worker.camera_info_updated.disconnect()
-            self.worker.markers_calibrated.disconnect()
-            self.worker.worker_stopped.disconnect()
-            self.worker.calibration_progress.disconnect()
-            self.worker.performance_degraded.disconnect()
-            # Disconnect new signals
-            self.worker.tracking_state_changed.disconnect()
-            self.worker.calibration_restored.disconnect()
-            self.worker.diagnostic_info.disconnect()
-        except RuntimeError:
-            pass
+        _signals_to_disconnect = [
+            self.worker.frame_ready,
+            self.worker.projector_frame_ready,
+            self.worker.trackers_detected,
+            self.worker.camera_error,
+            self.worker.performance_updated,
+            self.worker.camera_info_updated,
+            self.worker.markers_calibrated,
+            self.worker.still_frame_ready,
+            self.worker.worker_stopped,
+            self.worker.calibration_progress,
+            self.worker.performance_degraded,
+            self.worker.tracking_state_changed,
+            self.worker.calibration_restored,
+            self.worker.diagnostic_info,
+        ]
+        for sig in _signals_to_disconnect:
+            try:
+                sig.disconnect()
+            except RuntimeError:
+                pass
         # Save calibration state before exit
         if self.worker._calibrated:
             try:
@@ -2637,7 +2840,11 @@ class ProjectionMappingApp(QMainWindow):
                 pass
         self.worker.stop()
         self.thread.quit()
-        self.thread.wait()
+        # Wait up to 5 seconds for the worker thread to finish — don't hang forever
+        if not self.thread.wait(5000):
+            self.logger.warning("Worker thread did not stop within 5 s — forcing termination")
+            self.thread.terminate()
+            self.thread.wait(1000)
         event.accept()
 
 
@@ -2651,6 +2858,19 @@ if __name__ == '__main__':
             pass
 
     configure_opencv_logging()
+
+    # Graceful Ctrl+C (SIGINT) handler: stop the Qt event loop cleanly so
+    # closeEvent fires and settings/calibration are saved before exit.
+    import signal as _signal
+
+    def _sigint_handler(signum, frame):
+        logging.getLogger(__name__).info("SIGINT received — requesting clean shutdown")
+        _app_instance = QApplication.instance()
+        if _app_instance:
+            _app_instance.quit()
+
+    _signal.signal(_signal.SIGINT, _sigint_handler)
+
     app = QApplication(sys.argv)
 
     _asset_dir = Path(__file__).resolve().parent

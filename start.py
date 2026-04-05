@@ -16,6 +16,7 @@ def check_python_version():
         print("       Download the latest Python from https://python.org\n")
         input("Press Enter to exit.")
         sys.exit(1)
+    print(f"Python {sys.version.split()[0]} — OK")
     if sys.platform != 'win32':
         print("\nWarning: This application is designed for Windows 10/11.")
         print(f"         Running on {sys.platform}. Some features may not work.\n")
@@ -27,6 +28,12 @@ def check_camera():
         import cv2
         cap = cv2.VideoCapture(0)
         opened = cap.isOpened()
+        if opened:
+            ret, _ = cap.read()
+            if ret:
+                print("Camera 0 — OK")
+            else:
+                print("Warning: Camera 0 opened but returned no frame. Check cable.")
         cap.release()
         if not opened:
             print("\nWarning: No camera detected on index 0.")
@@ -59,9 +66,12 @@ def check_screens():
     try:
         import cv2  # noqa — ensure OpenCV env is ready before importing Qt
         from PyQt5.QtWidgets import QApplication
-        _app = QApplication.instance() or QApplication([])
-        n = len(_app.screens())
-        if n < 2:
+        _app = QApplication.instance() or QApplication(sys.argv[:1])
+        screens = _app.screens()
+        n = len(screens)
+        if n >= 2:
+            print(f"{n} displays detected — OK")
+        else:
             print(f"\nWarning: Only {n} screen detected.")
             print("         Connect the projector before starting for best results.\n")
     except Exception:
@@ -85,6 +95,20 @@ def run(cmd: list) -> int:
     return subprocess.call(cmd, cwd=ROOT)
 
 
+def check_disk_space():
+    """Warn if the current drive has less than 500 MB free (log files can grow)."""
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(ROOT)
+        free_mb = free // (1024 * 1024)
+        if free_mb < 500:
+            print(f"\nWarning: Only {free_mb} MB free on disk. Log files and calibration cache may fill it.")
+        else:
+            print(f"Disk space: {free_mb} MB free — OK")
+    except Exception:
+        pass
+
+
 def main() -> int:
     check_python_version()
 
@@ -96,9 +120,13 @@ def main() -> int:
             return 1
 
     print("Ensuring Python requirements are installed...")
-    pip_code = run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-    if pip_code != 0:
-        print("\nWarning: dependency install failed. Attempting to start anyway...\n")
+    req_path = ROOT / "requirements.txt"
+    if req_path.exists():
+        pip_code = run([sys.executable, "-m", "pip", "install", "-r", str(req_path)])
+        if pip_code != 0:
+            print("\nWarning: dependency install failed. Attempting to start anyway...\n")
+    else:
+        print("Warning: requirements.txt not found — skipping dependency install")
 
     check_code = run([sys.executable, "-m", "py_compile", *FILES_TO_VALIDATE])
     if check_code != 0:
@@ -106,11 +134,12 @@ def main() -> int:
         return 1
 
     # Run hardware pre-flight checks after dependencies are confirmed installed
+    check_disk_space()
     check_camera()
     check_codec()
     check_screens()
 
-    return run([sys.executable, "main.py"])
+    return run([sys.executable, str(ROOT / "main.py")])
 
 
 if __name__ == "__main__":
