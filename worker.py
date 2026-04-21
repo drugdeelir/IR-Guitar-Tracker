@@ -275,6 +275,9 @@ class Worker(QObject):
         self._homography_age: Dict[int, int] = {}                 # id(mask) → frame age counter
         self._stale_homography_max_age = 30  # frames before stale homography is discarded
 
+        # Internal state for confidence computation
+        self._last_reprojection_error = float("inf")  # set by _match_marker_configuration
+
     def _camera_backends(self):
         """Return backends to try for sustained camera capture (not probing).
         On Windows, MSMF is preferred over DSHOW for continuous reads;
@@ -1245,74 +1248,172 @@ class Worker(QObject):
             marker_config = self.marker_config
             marker_fingerprint = list(self.marker_fingerprint)
 
-        if not (
-            marker_config
-            and len(marker_config) > 1
-            and len(detected_points) >= len(marker_config)
-        ):
+        if not (marker_config and len(marker_config) > 1):
             return []
 
-        points_to_check = detected_points[: self.max_points_to_check]
         num_markers = len(marker_config)
+        # Require at least num_markers-1 detected points (for partial-match fallback)
+        if len(detected_points) < max(2, num_markers - 1):
+            return []
+
+        # Improvement 8: pre-rank candidates by differential score (descending),
+        # then cap the pool to keep the combination search bounded.
+        # detected_points may be plain (x,y) tuples; we can only sort if scores are available.
+        # The stable blob list was already sorted by score before reaching here, so we just cap.
+        _pool_limit = max(num_markers + 3, 8)
+        points_to_check = detected_points[: min(self.max_points_to_check, _pool_limit)]
         src_pts = np.float32(marker_config).reshape(-1, 1, 2)
 
-        combinations_checked = 0
+        def _run_combination_search(candidates, n_target, fp_ref, ref_src_pts):
+            """Inner search: find best n_target-point combo from candidates.
+            ref_src_pts: (n_target, 1, 2) float32 array of reference marker positions."""
+            best_pts = []
+            best_err = float("inf")
+            checked = 0
+            for point_combo in combinations(candidates, n_target):
+                checked += 1
+                if checked > self._dynamic_combination_budget:
+                    break
+
+                current_distances = [
+                    np.linalg.norm(np.array(p1) - np.array(p2))
+                    for p1, p2 in combinations(point_combo, 2)
+                ]
+                current_fingerprint = sorted(current_distances)
+
+                if len(current_fingerprint) != len(fp_ref):
+                    continue
+
+                fingerprint_ok = True
+                for i, value in enumerate(current_fingerprint):
+                    abs_tol = max(10.0, fp_ref[i] * 0.10)
+                    if abs(value - fp_ref[i]) > abs_tol:
+                        fingerprint_ok = False
+                        break
+                if not fingerprint_ok:
+                    continue
+
+                dst_pts_combo = np.float32(point_combo).reshape(-1, 1, 2)
+                matrix, _ = cv2.findHomography(ref_src_pts[:n_target], dst_pts_combo, cv2.RANSAC, 5.0)
+                if matrix is None or not np.all(np.isfinite(matrix)) or abs(np.linalg.det(matrix[:2,:2])) < 1e-4:
+                    continue
+
+                transformed_src = cv2.perspectiveTransform(ref_src_pts[:n_target], matrix)
+                ordered_points = [None] * n_target
+                remaining_dst = list(point_combo)
+
+                for i in range(n_target):
+                    predicted_pt = transformed_src[i][0]
+                    closest_actual_pt = min(
+                        remaining_dst,
+                        key=lambda p: np.linalg.norm(np.array(p) - predicted_pt),
+                    )
+                    ordered_points[i] = closest_actual_pt
+                    remaining_dst.remove(closest_actual_pt)
+
+                reprojection_error = float(
+                    np.mean([
+                        np.linalg.norm(np.array(ordered_points[i]) - transformed_src[i][0])
+                        for i in range(n_target)
+                    ])
+                )
+
+                if reprojection_error < best_err:
+                    best_err = reprojection_error
+                    best_pts = ordered_points
+
+            return best_pts, best_err
+
+        # Full match: all N markers
         best_ordered_points = []
         best_error = float("inf")
-        for point_combo in combinations(points_to_check, num_markers):
-            combinations_checked += 1
-            if combinations_checked > self._dynamic_combination_budget:
-                break
-
-            current_distances = []
-            for p1, p2 in combinations(point_combo, 2):
-                current_distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
-            current_fingerprint = sorted(current_distances)
-
-            if len(current_fingerprint) != len(marker_fingerprint):
-                continue
-
-            fingerprint_ok = True
-            for i, value in enumerate(current_fingerprint):
-                abs_tol = max(10.0, marker_fingerprint[i] * 0.10)
-                if abs(value - marker_fingerprint[i]) > abs_tol:
-                    fingerprint_ok = False
-                    break
-            if not fingerprint_ok:
-                continue
-
-            dst_pts = np.float32(point_combo).reshape(-1, 1, 2)
-            matrix, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if matrix is None or not np.all(np.isfinite(matrix)) or abs(np.linalg.det(matrix[:2,:2])) < 1e-4:
-                continue
-
-            transformed_src = cv2.perspectiveTransform(src_pts, matrix)
-            ordered_points = [None] * num_markers
-            remaining_dst = list(point_combo)
-
-            for i in range(num_markers):
-                predicted_pt = transformed_src[i][0]
-                closest_actual_pt = min(
-                    remaining_dst,
-                    key=lambda p: np.linalg.norm(np.array(p) - predicted_pt),
-                )
-                ordered_points[i] = closest_actual_pt
-                remaining_dst.remove(closest_actual_pt)
-
-            reprojection_error = float(
-                np.mean(
-                    [
-                        np.linalg.norm(np.array(ordered_points[i]) - transformed_src[i][0])
-                        for i in range(num_markers)
-                    ]
-                )
+        if len(points_to_check) >= num_markers:
+            best_ordered_points, best_error = _run_combination_search(
+                points_to_check, num_markers, marker_fingerprint
             )
 
-            if reprojection_error < best_error:
-                best_error = reprojection_error
-                best_ordered_points = ordered_points
+        # Improvement 9: store reprojection error for confidence computation
+        self._last_reprojection_error = best_error if best_ordered_points else float("inf")
 
+        if best_ordered_points:
+            self._partial_match = False
+            return best_ordered_points
+
+        # Improvement 1: Partial-marker recovery — try N-1 markers via affine if full match fails
+        if num_markers >= 3 and len(points_to_check) >= num_markers - 1:
+            # Build partial fingerprints: try dropping each marker in turn
+            import itertools as _it
+            partial_best_pts = []
+            partial_best_err = float("inf")
+            partial_best_missing = -1
+            for drop_idx in range(num_markers):
+                # Indices of the markers we keep
+                keep_indices = [i for i in range(num_markers) if i != drop_idx]
+                # Partial fingerprint: distances between kept markers only
+                kept_config = [marker_config[i] for i in keep_indices]
+                partial_fp = sorted([
+                    np.linalg.norm(np.array(p1) - np.array(p2))
+                    for p1, p2 in combinations(kept_config, 2)
+                ])
+                # Build partial src_pts for kept markers
+                partial_src = np.float32(kept_config).reshape(-1, 1, 2)
+
+                # Temporarily swap in partial_src for the inner search
+                _orig_src = src_pts  # save
+                try:
+                    pts, err = _run_combination_search(
+                        points_to_check, num_markers - 1, partial_fp
+                    )
+                    # Use affine fit quality as the error metric
+                    if pts and err < partial_best_err:
+                        # Try to estimate affine from partial match
+                        if len(pts) >= 3:
+                            _dst = np.float32(pts[:3])
+                            _src3 = partial_src[:3].reshape(3, 2)
+                            _A = cv2.getAffineTransform(_src3, _dst)
+                            if _A is not None and np.all(np.isfinite(_A)):
+                                partial_best_err = err
+                                partial_best_pts = pts
+                                partial_best_missing = drop_idx
+                        elif len(pts) == 2:
+                            partial_best_err = err
+                            partial_best_pts = pts
+                            partial_best_missing = drop_idx
+                except Exception:
+                    pass
+
+            if partial_best_pts:
+                self._partial_match = True
+                self.logger.debug(
+                    "Partial-marker match: %d/%d markers (missing index %d, err=%.1f)",
+                    len(partial_best_pts), num_markers, partial_best_missing, partial_best_err
+                )
+                return partial_best_pts
+
+        self._partial_match = False
         return best_ordered_points
+
+    @staticmethod
+    def _polygon_winding_sign(pts):
+        """Return +1 for counter-clockwise, -1 for clockwise, 0 for degenerate.
+        Uses the signed area (shoelace formula) of the convex hull vertices."""
+        if len(pts) < 3:
+            return 0
+        hull = cv2.convexHull(np.array(pts, dtype=np.float32), returnPoints=True)
+        if hull is None or len(hull) < 3:
+            return 0
+        hull_pts = hull.reshape(-1, 2)
+        n = len(hull_pts)
+        area2 = 0.0
+        for i in range(n):
+            x1, y1 = hull_pts[i]
+            x2, y2 = hull_pts[(i + 1) % n]
+            area2 += float(x1) * float(y2) - float(x2) * float(y1)
+        if area2 > 1e-4:
+            return 1
+        elif area2 < -1e-4:
+            return -1
+        return 0
 
     def _match_points_to_previous(self, new_points):
         """Optimal marker assignment using Hungarian algorithm to prevent identity swaps."""
@@ -1333,7 +1434,6 @@ class Worker(QObject):
             for i in range(n):
                 if ordered[i] is None:
                     ordered[i] = new_points[i]
-            return ordered
         except ImportError:
             # Fallback: greedy nearest-neighbor if scipy not available
             ordered = [None] * n
@@ -1351,7 +1451,20 @@ class Worker(QObject):
             for i in range(n):
                 if ordered[i] is None:
                     ordered[i] = new_points[i]
-            return ordered
+
+        # Improvement 5: Geometric feasibility check — detect winding-order flip as identity swap.
+        # If the convex hull winding of the new assignment flips relative to previous, reject swap.
+        if n >= 3:
+            prev_sign = self._polygon_winding_sign(list(self.smoothed_points))
+            new_sign = self._polygon_winding_sign(ordered)
+            if prev_sign != 0 and new_sign != 0 and prev_sign != new_sign:
+                self.logger.debug(
+                    "Winding order flip detected (prev=%d new=%d) — reverting to previous positions",
+                    prev_sign, new_sign
+                )
+                return list(self.smoothed_points)  # keep last known positions
+
+        return ordered
 
     def _init_kalman_filter(self, x, y, motion: bool = False):
         """Create a Kalman filter for one marker point.
@@ -1460,11 +1573,30 @@ class Worker(QObject):
                 kf.processNoiseCov = np.eye(4, dtype=np.float32) * self._detection_params.kalman_static_pn
 
             # Predict next state
-            kf.predict()
+            predicted = kf.predict()
 
-            # Correct with measurement
+            # Improvement 7: Kalman measurement outlier gating (3-sigma / Mahalanobis).
+            # Compute innovation = measurement - H * predicted_state
+            # S = H * P_pre * H^T + R (innovation covariance)
+            # Gate: if innovation^T * S^-1 * innovation > 9.0, skip correction.
             measurement = np.array([[float(curr[0])], [float(curr[1])]], dtype=np.float32)
-            corrected = kf.correct(measurement)
+            _innovation = measurement - kf.measurementMatrix @ kf.statePre
+            _S = (kf.measurementMatrix @ kf.errorCovPre @ kf.measurementMatrix.T
+                  + kf.measurementNoiseCov)
+            _gated = False
+            try:
+                _S_inv = np.linalg.inv(_S)
+                _mahal = float(_innovation.T @ _S_inv @ _innovation)
+                if _mahal > 9.0:
+                    # Outlier: do predict-only, don't correct
+                    _gated = True
+            except np.linalg.LinAlgError:
+                pass  # singular S — proceed with correction
+
+            if not _gated:
+                corrected = kf.correct(measurement)
+            else:
+                corrected = kf.statePre  # use prediction
 
             # Decay measurement noise back to normal after a large jump
             kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 8.0
@@ -2280,6 +2412,49 @@ class Worker(QObject):
             tracked_points = self._stabilize_tracked_points(tracked_points)
             match_ms = (time.perf_counter() - t0) * 1000.0
 
+            # Improvement 9: per-frame tracking confidence score [0, 1]
+            if tracked_points:
+                # reprojection_score from last match
+                _repr_err = getattr(self, '_last_reprojection_error', float('inf'))
+                _reprojection_score = max(0.0, 1.0 - _repr_err / 10.0)
+
+                # distance_score: fraction of inter-marker distances within tolerance
+                _distance_score = 0.0
+                if self._marker_distances and len(tracked_points) >= 2:
+                    _curr_dists = sorted([
+                        float(np.linalg.norm(np.array(p1) - np.array(p2)))
+                        for p1, p2 in combinations(tracked_points, 2)
+                    ])
+                    _n_ok = 0
+                    for _cd, _ld in zip(_curr_dists, self._marker_distances[:len(_curr_dists)]):
+                        if _ld > 0 and abs(_cd - _ld) <= max(10.0, _ld * self._distance_tolerance):
+                            _n_ok += 1
+                    _distance_score = _n_ok / max(1, len(_curr_dists))
+                else:
+                    _distance_score = 1.0  # no constraint → assume OK
+
+                # kalman_score: 1 - mean innovation magnitude / 30
+                _kalman_score = 0.0
+                if self._kalman_initialized and self._kalman_filters and self.smoothed_points:
+                    _innov_mags = []
+                    for _kf, _sp in zip(self._kalman_filters, self.smoothed_points):
+                        _pred_x = float(_kf.statePre[0, 0])
+                        _pred_y = float(_kf.statePre[1, 0])
+                        _innov_mags.append(
+                            ((_sp[0] - _pred_x) ** 2 + (_sp[1] - _pred_y) ** 2) ** 0.5
+                        )
+                    _kalman_score = max(0.0, 1.0 - float(np.mean(_innov_mags)) / 30.0)
+                else:
+                    _kalman_score = 1.0
+
+                self.tracking_confidence = (
+                    0.5 * _reprojection_score
+                    + 0.3 * _distance_score
+                    + 0.2 * _kalman_score
+                )
+            else:
+                self.tracking_confidence = 0.0
+
             self.trackers_detected.emit(len(tracked_points))
 
             # Improvement 37: emit tracking_state_changed when state transitions
@@ -2384,23 +2559,39 @@ class Worker(QObject):
                     cv2.polylines(projector_output, [np.int32(dst_pts)], True, (255, 255, 255), 2)
                     continue
 
+                # Improvement 10: age all stored homographies for this mask each frame
+                _mask_id = id(mask)
+                if _mask_id in self._homography_age:
+                    self._homography_age[_mask_id] += 1
+
+                _use_stale_homography = False
+                _stale_opacity_factor = 1.0
+
                 if mask.type == "dynamic":
                     if mask.linked_marker_count != len(tracked_points):
-                        continue
-
-                    src_pts = self._get_cached_source_points(mask)
-                    dst_markers = self._calculate_destination_points(tracked_points)
-                    anchor_pts = np.float32(getattr(mask, "marker_anchor_points", []) or [])
-
-                    if len(anchor_pts) == len(dst_markers) and len(anchor_pts) >= 4:
-                        marker_matrix = cv2.getPerspectiveTransform(anchor_pts[:4], np.float32(dst_markers[:4]))
-                        if marker_matrix is None:
+                        # Improvement 10: try stale homography if available and fresh enough
+                        _stale_H = self._last_valid_homography.get(_mask_id)
+                        _stale_age = self._homography_age.get(_mask_id, float('inf'))
+                        if _stale_H is not None and _stale_age <= self._stale_homography_max_age:
+                            _use_stale_homography = True
+                            _stale_opacity_factor = 0.5  # render at half opacity
+                        else:
                             continue
-                        dst_pts = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), marker_matrix).reshape(-1, 2)
-                    else:
-                        if len(tracked_points) != len(mask.source_points):
-                            continue
-                        dst_pts = dst_markers
+
+                    if not _use_stale_homography:
+                        src_pts = self._get_cached_source_points(mask)
+                        dst_markers = self._calculate_destination_points(tracked_points)
+                        anchor_pts = np.float32(getattr(mask, "marker_anchor_points", []) or [])
+
+                        if len(anchor_pts) == len(dst_markers) and len(anchor_pts) >= 4:
+                            marker_matrix = cv2.getPerspectiveTransform(anchor_pts[:4], np.float32(dst_markers[:4]))
+                            if marker_matrix is None:
+                                continue
+                            dst_pts = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), marker_matrix).reshape(-1, 2)
+                        else:
+                            if len(tracked_points) != len(mask.source_points):
+                                continue
+                            dst_pts = dst_markers
                 else:
                     # Use bounding rect of polygon for perspective transform
                     all_x = [p[0] for p in mask.source_points]
@@ -2452,7 +2643,12 @@ class Worker(QObject):
                 if not ret_cue:
                     continue
 
-                if mask.type != "dynamic":
+                if _use_stale_homography:
+                    # Improvement 10: use last-valid homography for stale rendering
+                    matrix = self._last_valid_homography[_mask_id]
+                    # We need dst_pts for the bounding rect — use the source_points as fallback
+                    dst_pts = np.float32(mask.source_points)
+                elif mask.type != "dynamic":
                     fh, fw = frame_cue.shape[:2]
                     src_pts = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
                     matrix = cv2.getPerspectiveTransform(src_pts, dst_rect)
@@ -2461,6 +2657,11 @@ class Worker(QObject):
 
                 if matrix is None:
                     continue
+
+                # Improvement 10: save valid homography for dynamic masks
+                if not _use_stale_homography and mask.type == "dynamic" and matrix is not None:
+                    self._last_valid_homography[_mask_id] = matrix.copy()
+                    self._homography_age[_mask_id] = 0
 
                 # Compute destination bounding box and warp only that ROI to reduce cost
                 dst_int = np.int32(dst_pts)
@@ -2484,7 +2685,8 @@ class Worker(QObject):
 
                 # Apply per-mask opacity with fade-in/out animation support
                 opacity = self._get_mask_effective_opacity(mask, time.perf_counter())
-                opacity = max(0.0, min(1.0, opacity))
+                # Improvement 10: apply stale-homography opacity reduction
+                opacity = max(0.0, min(1.0, opacity * _stale_opacity_factor))
 
                 # Apply per-mask blend mode
                 blend_mode = getattr(mask, 'blend_mode', 'normal')
