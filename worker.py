@@ -94,6 +94,8 @@ class Worker(QObject):
     diagnostic_info = pyqtSignal(dict)
     # Improvement 3/5: calibration quality warnings (drift, multiple projectors, etc.)
     calibration_warning = pyqtSignal(str)
+    # Improvement 10: emitted when multiple guitar-shaped candidates are found during DETECT phase
+    guitar_candidates_ready = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -179,6 +181,12 @@ class Worker(QObject):
         # composited output so only the projector-visible region is sent.
         self._proj_camera_rect = None
         self.debug_solid_colors = True  # Show solid colors instead of video for mask debugging
+        self._guitar_candidates = []  # Improvement 10: top-N guitar candidate polygons
+        self._detect_diff_frames = []  # Improvement 7: accumulated diff frames for multi-frame averaging
+        # Improvement 11: temporal silhouette smoothing via optical flow
+        self._prev_guitar_polygon = None   # previous guitar polygon for EMA smoothing
+        self._prev_gray_frame = None       # previous grayscale frame for optical flow
+        self._guitar_flow_frame_counter = 0  # frame counter for 30-frame optical flow interval
 
         # Camera→Projector homography: computed during proj_scan calibration phase.
         # Maps camera pixel coords to projector pixel coords.
@@ -852,7 +860,7 @@ class Worker(QObject):
         )
         return result
 
-    def _detect_markers_from_diff(self):
+    def _detect_markers_from_diff(self, avg_diff=None):
         """Guitar silhouette detection using differential imaging.
 
         The guitar appears as a DARK shape against the bright wall when
@@ -864,6 +872,11 @@ class Worker(QObject):
         2. Within projector area, find DARK regions (objects blocking projector light)
         3. The tallest dark region = the guitar
         4. Extract 4 feature points from the guitar contour
+
+        Args:
+            avg_diff: optional pre-averaged diff image (uint8). When provided (Improvement 7),
+                      this is used in place of the single-frame diff for projector mask
+                      computation, giving more robust silhouette detection.
         """
         if self._calib_dark_ref is None or self._calib_illum_ref is None:
             self.logger.error("Cannot detect markers: missing dark/illum references")
@@ -880,7 +893,12 @@ class Worker(QObject):
         if not hasattr(self, '_diff_buf') or self._diff_buf.shape != self._calib_dark_ref.shape:
             self._diff_buf = np.empty_like(self._calib_dark_ref, dtype=np.uint8)
         cv2.subtract(self._calib_illum_ref, self._calib_dark_ref, dst=self._diff_buf)
-        diff = self._diff_buf
+        # Improvement 7: use averaged diff image if provided (multi-frame averaging)
+        if avg_diff is not None and avg_diff.shape == self._diff_buf.shape:
+            diff = avg_diff
+            self.logger.info("Using multi-frame averaged diff image for detection")
+        else:
+            diff = self._diff_buf
         diff_blurred = cv2.GaussianBlur(diff, (15, 15), 0)
         if self._debug_mode:
             cv2.imwrite(_os.path.join(_base, "diff_image.png"), diff)
@@ -966,6 +984,7 @@ class Worker(QObject):
 
         best_candidate = None
         used_method = "edge"
+        all_scored_candidates = []  # Improvement 10: accumulate all viable candidates
 
         # Method 1: Adaptive threshold within projector area
         # This finds objects darker than their local neighborhood
@@ -1040,12 +1059,38 @@ class Worker(QObject):
                 area_factor = (area / 500.0) ** 0.5
                 score = bh * aspect_bonus * centrality * inner_mult * area_factor
 
+                # Improvement 6: Guitar-shape prior scoring
+                guitar_prior_score = 1.0
+                try:
+                    if bw >= 10 and bh >= 10:
+                        cnt_pts = cnt_i.reshape(-1, 2)
+                        # neck_width_ratio: horizontal span at top third vs full span
+                        top_third_y = y + bh // 3
+                        top_pts = cnt_pts[cnt_pts[:, 1] <= top_third_y]
+                        if len(top_pts) >= 2:
+                            neck_width_ratio = (top_pts[:, 0].max() - top_pts[:, 0].min()) / max(1, bw)
+                            if 0.06 <= neck_width_ratio <= 0.30:
+                                guitar_prior_score *= 1.5
+                        # body_aspect: aspect ratio of the lower 2/3 of the bounding box
+                        body_top_y = y + bh // 3
+                        body_pts = cnt_pts[cnt_pts[:, 1] >= body_top_y]
+                        if len(body_pts) >= 2:
+                            body_h = bh - bh // 3
+                            body_w = max(1, body_pts[:, 0].max() - body_pts[:, 0].min())
+                            body_aspect = body_h / body_w
+                            if 0.7 <= body_aspect <= 2.5:
+                                guitar_prior_score *= 1.3
+                except Exception:
+                    guitar_prior_score = 1.0
+                score *= guitar_prior_score
+
                 self.logger.info(
-                    "  %s: bbox=(%d,%d,%d,%d) area=%.0f aspect=%.1f inner=%s score=%.1f",
+                    "  %s: bbox=(%d,%d,%d,%d) area=%.0f aspect=%.1f inner=%s score=%.1f prior=%.2f",
                     method_name, x, y, bw, bh, area, aspect,
-                    "Y" if is_inner else "N", score
+                    "Y" if is_inner else "N", score, guitar_prior_score
                 )
 
+                all_scored_candidates.append(((cnt_i, area, x, y, bw, bh, aspect), score, ratio_thresh))
                 if best_candidate is None or score > best_candidate[1]:
                     best_candidate = ((cnt_i, area, x, y, bw, bh, aspect), score, ratio_thresh)
                     used_method = method_name
@@ -1058,9 +1103,116 @@ class Worker(QObject):
                     self.logger.info("  Found guitar via %s, stopping", method_name)
                     break
 
+        # Improvement 12: Projector-Reflection-Resistant Silhouette Detection
+        # Activate when primary detection finds 0 or very-low-score candidates.
+        # Detects metallic/lacquer guitar bodies that appear BRIGHT (not dark) in diff.
+        _primary_score = best_candidate[1] if best_candidate is not None else 0.0
+        if best_candidate is None or _primary_score < 50.0:
+            try:
+                # Reflection map: regions bright in both frames but brighter when illuminated
+                illum_f32 = illum_blurred.astype(np.float32)
+                dark_f32 = dark_blurred.astype(np.float32)
+                refl_map = np.zeros((frame_h, frame_w), dtype=np.uint8)
+                refl_mask_cond = (proj_mask > 0) & (illum_f32 > dark_f32 * 1.2 + 30)
+                refl_map[refl_mask_cond] = 255
+                refl_map = cv2.morphologyEx(refl_map, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+                refl_map = cv2.morphologyEx(refl_map, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+                if self._debug_mode:
+                    cv2.imwrite(_os.path.join(_base, "reflection_map.png"), refl_map)
+
+                refl_contours, _ = cv2.findContours(refl_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                self.logger.info("Reflection detection: %d contours found", len(refl_contours))
+
+                for refl_cnt in refl_contours:
+                    r_area = cv2.contourArea(refl_cnt)
+                    if r_area < 200 or r_area > frame_w * frame_h * 0.08:
+                        continue
+                    rx, ry, rbw, rbh = cv2.boundingRect(refl_cnt)
+                    if rbh < 40:
+                        continue
+                    r_aspect = rbh / max(1, rbw)
+                    if r_aspect < 1.3:
+                        continue
+                    r_cnt_cx = rx + rbw / 2
+                    r_cnt_cy = ry + rbh / 2
+                    r_is_inner = (inner_x1 <= r_cnt_cx <= inner_x2 and inner_y1 <= r_cnt_cy <= inner_y2)
+                    rdx = (r_cnt_cx - proj_cx) / max(1, prw / 2 if self._proj_camera_rect else frame_w / 2)
+                    rdy = (r_cnt_cy - proj_cy) / max(1, prh / 2 if self._proj_camera_rect else frame_h / 2)
+                    r_centrality = 1.0 / (1.0 + rdx ** 2 + rdy ** 2)
+                    r_inner_mult = 3.0 if r_is_inner else 0.3
+                    r_aspect_bonus = r_aspect ** 1.2
+                    r_area_factor = (r_area / 500.0) ** 0.5
+                    r_score = rbh * r_aspect_bonus * r_centrality * r_inner_mult * r_area_factor
+
+                    # Apply guitar prior score (same as Improvement 6)
+                    r_guitar_prior = 1.0
+                    try:
+                        refl_pts = refl_cnt.reshape(-1, 2)
+                        top_third_y = ry + rbh // 3
+                        top_pts = refl_pts[refl_pts[:, 1] <= top_third_y]
+                        if len(top_pts) >= 2:
+                            r_nwr = (top_pts[:, 0].max() - top_pts[:, 0].min()) / max(1, rbw)
+                            if 0.06 <= r_nwr <= 0.30:
+                                r_guitar_prior *= 1.5
+                        body_top_y = ry + rbh // 3
+                        body_pts_r = refl_pts[refl_pts[:, 1] >= body_top_y]
+                        if len(body_pts_r) >= 2:
+                            r_body_h = rbh - rbh // 3
+                            r_body_w = max(1, body_pts_r[:, 0].max() - body_pts_r[:, 0].min())
+                            if 0.7 <= (r_body_h / r_body_w) <= 2.5:
+                                r_guitar_prior *= 1.3
+                    except Exception:
+                        r_guitar_prior = 1.0
+                    r_score *= r_guitar_prior
+
+                    self.logger.info(
+                        "  reflection: bbox=(%d,%d,%d,%d) area=%.0f aspect=%.1f inner=%s score=%.1f",
+                        rx, ry, rbw, rbh, r_area, r_aspect,
+                        "Y" if r_is_inner else "N", r_score
+                    )
+
+                    # Merge with primary candidate if centroids overlap (within 100px)
+                    if best_candidate is not None:
+                        bc_info = best_candidate[0]
+                        bc_cx = bc_info[2] + bc_info[4] / 2
+                        bc_cy = bc_info[3] + bc_info[5] / 2
+                        centroid_dist = ((r_cnt_cx - bc_cx) ** 2 + (r_cnt_cy - bc_cy) ** 2) ** 0.5
+                        if centroid_dist <= 100:
+                            # Merge using convex hull of both contours
+                            merged_pts = np.vstack([bc_info[0].reshape(-1, 2), refl_cnt.reshape(-1, 2)])
+                            merged_hull = cv2.convexHull(merged_pts)
+                            mh_area = cv2.contourArea(merged_hull)
+                            mhx, mhy, mhw, mhh = cv2.boundingRect(merged_hull)
+                            mh_aspect = mhh / max(1, mhw)
+                            best_candidate = (
+                                (merged_hull, mh_area, mhx, mhy, mhw, mhh, mh_aspect),
+                                max(best_candidate[1], r_score),
+                                best_candidate[2]
+                            )
+                            self.logger.info("  Merged reflection contour with primary candidate (dist=%.1f)", centroid_dist)
+                            continue
+
+                    if best_candidate is None or r_score > best_candidate[1]:
+                        best_candidate = ((refl_cnt, r_area, rx, ry, rbw, rbh, r_aspect), r_score, ratio_thresh)
+                        used_method = "reflection"
+            except Exception:
+                self.logger.warning("Reflection detection failed", exc_info=True)
+
         if best_candidate is None:
             self.logger.warning("No guitar-shaped silhouettes found at any threshold")
             return None
+
+        # Improvement 10: store top-N candidates and emit guitar_candidates_ready signal
+        all_scored_candidates.sort(key=lambda c: -c[1])
+        self._guitar_candidates = all_scored_candidates[:3]
+        if len(self._guitar_candidates) > 1:
+            # Build simple bounding-box polygon for each candidate for the signal
+            cand_polys = []
+            for _cand_info, _cand_score, _ in self._guitar_candidates:
+                _cx, _cy, _cw, _ch = _cand_info[2], _cand_info[3], _cand_info[4], _cand_info[5]
+                cand_polys.append([(_cx, _cy), (_cx + _cw, _cy), (_cx + _cw, _cy + _ch), (_cx, _cy + _ch)])
+            self.guitar_candidates_ready.emit(cand_polys)
+            self.logger.debug("Multiple guitar candidates found (%d); best will auto-select", len(self._guitar_candidates))
 
         (cnt, area, gx, gy, gw, gh, aspect), score, used_thresh = best_candidate
 
@@ -1111,8 +1263,15 @@ class Worker(QObject):
 
         # Search for body contours: any contour near the bottom of the neck
         # that could be the guitar body (wider, below neck)
-        body_search_x_range = neck_w * 5  # body is wider than neck
-        body_search_y_below = neck_h * 2  # body extends below neck
+        # Improvement 9: auto-tune merge thresholds from guitar bounding box
+        _guitar_bbox_w = gw if gw > 0 else neck_w * 5
+        _guitar_bbox_h = gh if gh > 0 else neck_h * 2
+        if _guitar_bbox_w > 0 and _guitar_bbox_h > 0:
+            body_search_x_range = int(0.6 * _guitar_bbox_w)
+            body_search_y_below = int(0.8 * _guitar_bbox_h)
+        else:
+            body_search_x_range = neck_w * 5  # fallback: body is wider than neck
+            body_search_y_below = neck_h * 2  # fallback: body extends below neck
         merged_contour_pts = list(neck_pts)  # start with neck points
 
         for other_cnt, other_area, ox, oy, ow, oh, o_aspect in all_contours:
@@ -1154,16 +1313,43 @@ class Worker(QObject):
         hull_w, hull_h = hull_bbox[2], hull_bbox[3]
         if hull_h < neck_h * 1.3 or hull_w < neck_w * 1.5:
             self.logger.info("No body contours found near neck, extrapolating body (neck_w=%d)", neck_w)
-            # If the contour is narrow (pure neck, <30px), use larger body multiplier.
-            # If wider (already includes some body), use smaller multiplier.
-            if neck_w < 30:
-                body_mult = 3.0  # narrow neck → bigger body extrapolation
-            elif neck_w < 50:
-                body_mult = 2.0  # medium width → moderate body
-            else:
-                body_mult = 1.5  # wide contour already includes body
 
-            body_w = max(int(neck_w * body_mult), 60)
+            # Improvement 8: Adaptive body extrapolation using measured contour spans
+            # Compute horizontal extent at each 5% vertical slice of the bounding box
+            try:
+                all_merged_pts = np.array(merged_contour_pts, dtype=np.int32)
+                slice_count = 20  # 5% slices → 20 slices
+                x_spans = []
+                for si in range(slice_count):
+                    slice_y_min = y + int(bh * si / slice_count)
+                    slice_y_max = y + int(bh * (si + 1) / slice_count)
+                    mask_slice = (all_merged_pts[:, 1] >= slice_y_min) & (all_merged_pts[:, 1] < slice_y_max)
+                    if mask_slice.sum() >= 2:
+                        xs = all_merged_pts[mask_slice, 0]
+                        x_spans.append(int(xs.max() - xs.min()))
+                    else:
+                        x_spans.append(0)
+                max_body_span = max(x_spans) if x_spans else 0
+                # Minimum span in top 30% of contour (neck region)
+                neck_slices = x_spans[:max(1, len(x_spans) * 3 // 10)]
+                neck_span = min((s for s in neck_slices if s > 0), default=0)
+                if max_body_span >= 20:
+                    body_w = max(max_body_span, 60)
+                    self.logger.info("Adaptive body extrapolation: max_body_span=%d neck_span=%d",
+                                     max_body_span, neck_span)
+                else:
+                    raise ValueError("max_body_span too small")
+            except Exception:
+                # Fallback: use fixed multiplier heuristic
+                if neck_w < 30:
+                    body_mult = 3.0  # narrow neck → bigger body extrapolation
+                elif neck_w < 50:
+                    body_mult = 2.0  # medium width → moderate body
+                else:
+                    body_mult = 1.5  # wide contour already includes body
+                body_w = max(int(neck_w * body_mult), 60)
+                self.logger.info("Adaptive extrapolation fallback: mult-based body_w=%d", body_w)
+
             body_h = max(int(neck_h * 0.8), 60)  # body height ~80% of neck
             body_top_y = neck_bot_y
             body_bot_y = min(body_top_y + body_h, frame_h - 5)
@@ -1181,12 +1367,14 @@ class Worker(QObject):
                 (body_left, body_top_y),                      # body top-left
                 (neck_left_x - neck_pad, body_top_y),         # neck meets body (left)
             ]
-            self.logger.info("Body extrapolation: mult=%.1f, body_w=%d, body_h=%d, total=%dx%d",
-                             body_mult, body_w, body_h,
+            self.logger.info("Body extrapolation: body_w=%d, body_h=%d, total=%dx%d",
+                             body_w, body_h,
                              body_right - body_left, body_bot_y - neck_top_y)
 
         # Store the polygon for direct use as a mask
         self._guitar_polygon = guitar_poly
+        # Improvement 11: initialize previous polygon for optical flow tracking
+        self._prev_guitar_polygon = list(guitar_poly)
 
         # Also compute 4 key markers for tracking (extremes of the polygon)
         poly_arr = np.array(guitar_poly)
@@ -2202,9 +2390,9 @@ class Worker(QObject):
                 self.trackers_detected.emit(0)
                 continue
 
-            # Phase 3: DETECT - one-shot difference-based marker detection
+            # Phase 3: DETECT - multi-frame difference-based marker detection
+            # Improvement 7: collect diff frames over 5 frames, then detect on average
             if not self._calibrated and self._calib_phase == CalibPhase.DETECT:
-                self._calib_phase = CalibPhase.DONE  # only run once
                 # Guard: both references must exist before diff computation (#27)
                 if self._calib_dark_ref is None or self._calib_illum_ref is None:
                     self.logger.warning(
@@ -2214,10 +2402,51 @@ class Worker(QObject):
                     self._calib_frame_count = 0
                     self._calib_dark_ref = None
                     self._calib_illum_ref = None
+                    self._detect_diff_frames = []
                     self.calibration_progress.emit("Error — restarting", 0, 1)
                     continue
+
+                self._calib_frame_count += 1
+                _detect_total_frames = 5
+                self.calibration_progress.emit(CalibPhase.DETECT.name, self._calib_frame_count, _detect_total_frames)
+
+                # Accumulate diff frames (frames 1–5)
+                gray_detect = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                _frame_diff = np.clip(
+                    gray_detect.astype(np.float32) - self._calib_dark_ref.astype(np.float32),
+                    0, 255
+                ).astype(np.uint8)
+                self._detect_diff_frames.append(_frame_diff)
+
+                if self._calib_frame_count < _detect_total_frames:
+                    # Still collecting — show progress and continue
+                    cv2.putText(main_frame,
+                                f"CALIBRATING - Detecting {self._calib_frame_count}/{_detect_total_frames}",
+                                (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                    cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                    qt_main = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
+                    self.frame_ready.emit(qt_main)
+                    cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                    qt_proj = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
+                    self.projector_frame_ready.emit(qt_proj)
+                    self.trackers_detected.emit(0)
+                    continue
+
+                # All frames collected: compute averaged diff and run detection
+                self._calib_phase = CalibPhase.DONE  # prevent re-entry
+                self._calib_frame_count = 0
+
+                if len(self._detect_diff_frames) >= 2:
+                    _diff_stack = np.stack(self._detect_diff_frames, axis=0)
+                    avg_diff = np.mean(_diff_stack, axis=0).astype(np.uint8)
+                    self.logger.info("Calibration: running detection on %d-frame averaged diff", len(self._detect_diff_frames))
+                else:
+                    avg_diff = None
+                    self.logger.info("Calibration: running detection on single-frame diff (fallback)")
+                self._detect_diff_frames = []
+
                 self.logger.info("Calibration: running difference-based marker detection")
-                markers = self._detect_markers_from_diff()
+                markers = self._detect_markers_from_diff(avg_diff=avg_diff)
                 if markers and len(markers) == self.expected_marker_count:
                     # Store markers — don't finalize yet, proceed to proj_scan
                     self._pending_markers = markers
@@ -2663,6 +2892,43 @@ class Worker(QObject):
                     self.baseline_distance = float(np.median(self._calibration_distances))
                     self._calibrate_depth_flag = False
                     self._calibration_distances = []
+
+            # Improvement 11: Temporal silhouette smoothing via optical flow
+            # Every 30 frames, update guitar polygon using sparse optical flow.
+            _cur_gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+            if (self._calib_phase == CalibPhase.DONE and self._guitar_polygon is not None
+                    and self._prev_guitar_polygon is not None and self._prev_gray_frame is not None):
+                self._guitar_flow_frame_counter += 1
+                if self._guitar_flow_frame_counter >= 30:
+                    self._guitar_flow_frame_counter = 0
+                    try:
+                        prev_poly_arr = np.array(self._prev_guitar_polygon, dtype=np.float32)
+                        prev_pts = prev_poly_arr.reshape(-1, 1, 2)
+                        flow_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                            self._prev_gray_frame, _cur_gray, prev_pts, None,
+                            winSize=(21, 21), maxLevel=3,
+                            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)
+                        )
+                        if flow_pts is not None and status is not None:
+                            good_mask = status.ravel() == 1
+                            if good_mask.sum() > len(prev_pts) * 0.5:
+                                # Compute mean flow magnitude
+                                flow_delta = flow_pts.reshape(-1, 2) - prev_poly_arr
+                                mean_flow_mag = float(np.linalg.norm(flow_delta[good_mask], axis=1).mean())
+                                if mean_flow_mag < 5.0:
+                                    # Camera stationary: update polygon with EMA smoothing
+                                    flow_updated = flow_pts.reshape(-1, 2)
+                                    cur_poly_arr = np.array(self._guitar_polygon, dtype=np.float32)
+                                    # EMA: 90% previous + 10% flow-updated
+                                    if flow_updated.shape == cur_poly_arr.shape:
+                                        smoothed_arr = 0.9 * cur_poly_arr + 0.1 * flow_updated
+                                        self._prev_guitar_polygon = self._guitar_polygon.copy()
+                                        self._guitar_polygon = [(int(p[0]), int(p[1])) for p in smoothed_arr]
+                    except Exception:
+                        pass  # optical flow is best-effort; don't break tracking on failure
+            self._prev_gray_frame = _cur_gray
+            if self._guitar_polygon is not None and self._prev_guitar_polygon is None:
+                self._prev_guitar_polygon = list(self._guitar_polygon)
 
             # Draw all raw detections as small green circles for debug
             for point in all_detected_points:

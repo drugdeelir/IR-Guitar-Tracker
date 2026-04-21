@@ -296,6 +296,8 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.tracking_state_changed.connect(self._on_tracking_state_changed, Qt.QueuedConnection)
         self.worker.calibration_restored.connect(self._on_calibration_restored, Qt.QueuedConnection)
         self.worker.diagnostic_info.connect(self._on_diagnostic_info, Qt.QueuedConnection)
+        # Improvement 10: connect guitar multi-candidate signal
+        self.worker.guitar_candidates_ready.connect(self._on_guitar_candidates_ready, Qt.QueuedConnection)
 
         # Screen-change recovery: repopulate projector combo when displays change
         _app = QApplication.instance()
@@ -2486,6 +2488,25 @@ class ProjectionMappingApp(QMainWindow):
         self.setWindowTitle(f"{icon} IR Guitar Tracker v{__version__}  [{state.upper()}]")
 
     @pyqtSlot()
+    @pyqtSlot(list)
+    def _on_guitar_candidates_ready(self, candidates: list) -> None:
+        """Improvement 10: handle multiple guitar-shaped candidates detected during calibration.
+
+        If only 1 candidate is present, this slot is not called (best candidate is used directly).
+        If >1 candidates: log a message, update the status bar, and after 5 seconds auto-confirm
+        the best candidate (which the worker has already stored as self._guitar_polygon).
+        """
+        n = len(candidates)
+        self.logger.info("Multiple guitar candidates detected: %d — auto-selecting best in 5s", n)
+        if n <= 1:
+            return  # nothing to do
+        msg = f"Multiple guitar shapes detected ({n}). Auto-selecting best match in 5 seconds..."
+        self._status_message(msg, "info", 6000)
+        # After 5 seconds, log confirmation (the worker already selected the best candidate)
+        QTimer.singleShot(5000, lambda: self.logger.info(
+            "Guitar candidate auto-selection confirmed (best of %d candidates).", n
+        ))
+
     def _on_calibration_restored(self) -> None:
         """Improvement 83: update UI when calibration loads from cache."""
         self._calibration_timestamp = time.time()
