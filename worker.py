@@ -249,6 +249,32 @@ class Worker(QObject):
             self._target_fps = 30.0
             self._detection_scale = 0.45
 
+        # Improvement 1: Partial-marker recovery flag
+        self._partial_match = False  # True when tracking with N-1 markers
+
+        # Improvement 2: Adaptive detection thresholds (set during calibration DETECT phase)
+        self._adaptive_diff_floor = None   # learned from calibration; None → use hardcoded default
+        self._adaptive_sat_threshold = None  # learned from calibration; None → use hardcoded default
+
+        # Improvement 3: Fog detection
+        self._fog_detected = False
+        self._fog_consecutive_frames = 0   # consecutive low-contrast frames
+        self._fog_frame_threshold = 3      # frames below fog_contrast_threshold before flag set
+
+        # Improvement 4: Guitar bounds for Kalman clamping during dropout
+        self._guitar_bounds = None  # (min_x, min_y, max_x, max_y) with padding
+
+        # Improvement 6: Resolution-adaptive spatial scale factor
+        self._spatial_scale = 1.0  # computed from first frame dimensions
+
+        # Improvement 9: Per-frame tracking confidence
+        self.tracking_confidence = 0.0  # [0.0, 1.0] composite confidence score
+
+        # Improvement 10: Last-valid homography per mask for graceful degradation
+        self._last_valid_homography: Dict[int, np.ndarray] = {}   # id(mask) → matrix
+        self._homography_age: Dict[int, int] = {}                 # id(mask) → frame age counter
+        self._stale_homography_max_age = 30  # frames before stale homography is discarded
+
     def _camera_backends(self):
         """Return backends to try for sustained camera capture (not probing).
         On Windows, MSMF is preferred over DSHOW for continuous reads;
@@ -450,6 +476,22 @@ class Worker(QObject):
         if (frame_w, frame_h) != getattr(self, '_blob_detector_shape', None):
             self._blob_detector = self._create_blob_detector(frame_w, frame_h)
             self._blob_detector_shape = (frame_w, frame_h)
+            # Improvement 6: update resolution-adaptive spatial constants
+            self._update_spatial_scale(frame_w, frame_h)
+
+    def _update_spatial_scale(self, frame_w, frame_h):
+        """Improvement 6: Compute resolution-adaptive scale factor and update spatial constants.
+        Reference resolution is 1280x720. All spatial constants scale by sqrt(area ratio)."""
+        ref_area = 1280 * 720
+        frame_area = max(1, frame_w * frame_h)
+        self._spatial_scale = float(np.sqrt(frame_area / ref_area))
+        self._blob_history_radius = int(round(_BLOB_HISTORY_RADIUS * self._spatial_scale))
+        self._blob_min_hits = _BLOB_MIN_HITS
+        self._blob_max_age = _BLOB_MAX_AGE
+        self.logger.debug(
+            "Spatial scale updated: %.3f (frame %dx%d) → history_radius=%d",
+            self._spatial_scale, frame_w, frame_h, self._blob_history_radius
+        )
 
     def _nms_points(self, scored_points, min_distance=_MARKER_NMS_RADIUS, limit=20):
         selected = []
@@ -645,7 +687,11 @@ class Worker(QObject):
             sat_roi = sat_channel[sy1:sy2, sx1:sx2]
             avg_sat = float(sat_roi.mean()) if sat_roi.size else 128
 
-            if avg_sat > 80:
+            # Improvement 2: use adaptive sat threshold if available, else 80
+            _eff_sat_thresh = (self._adaptive_sat_threshold
+                               if self._adaptive_sat_threshold is not None
+                               else 80)
+            if avg_sat > _eff_sat_thresh:
                 # Likely a projector reflection, not IR marker — hold position
                 result.append((cx, cy))
                 continue
@@ -738,7 +784,11 @@ class Worker(QObject):
             if has_dark_ref:
                 # DIFFERENTIAL MODE: score based on how much blob responds to projector
                 # Static sources (monitors, lamps) have diff≈0, markers have high diff
-                if diff_brightness < _DIFF_BRIGHTNESS_FLOOR:
+                # Improvement 2: use adaptive threshold if calibrated, else hardcoded default
+                _eff_diff_floor = (self._adaptive_diff_floor
+                                   if self._adaptive_diff_floor is not None
+                                   else _DIFF_BRIGHTNESS_FLOOR)
+                if diff_brightness < _eff_diff_floor:
                     continue  # static source, not a projector-responsive marker
                 # Score: normalized differential response is primary, size and whiteness are secondary
                 _max_blob_size = max(20.0, frame_w * 0.04)  # expected max blob size at this resolution
@@ -765,7 +815,9 @@ class Worker(QObject):
         # IR markers are the biggest, brightest, whitest blobs in the scene
         target_n = self.expected_marker_count
         scored = [(s, (int(round(cx)), int(round(cy)))) for s, cx, cy in stable]
-        all_candidates = self._nms_points(scored, min_distance=15, limit=target_n * 3)
+        # Improvement 6: scale NMS min-distance by resolution scale factor
+        _nms_dist = max(10, int(round(15 * self._spatial_scale)))
+        all_candidates = self._nms_points(scored, min_distance=_nms_dist, limit=target_n * 3)
         result = all_candidates[:target_n]
 
         # Log top candidate sizes for debugging
@@ -1356,7 +1408,15 @@ class Worker(QObject):
                 if self._kalman_initialized and len(self._kalman_filters) == len(self.smoothed_points) > 0:
                     with self._state_lock:
                         for kf in self._kalman_filters:
-                            kf.predict()
+                            pred = kf.predict()
+                            # Improvement 4: velocity damping during dropout to prevent drift
+                            kf.statePost[2, 0] *= 0.85  # dampen vx
+                            kf.statePost[3, 0] *= 0.85  # dampen vy
+                            # Improvement 4: clamp predicted position to guitar bounds
+                            if self._guitar_bounds is not None:
+                                bx1, by1, bx2, by2 = self._guitar_bounds
+                                kf.statePost[0, 0] = float(np.clip(kf.statePost[0, 0], bx1, bx2))
+                                kf.statePost[1, 0] = float(np.clip(kf.statePost[1, 0], by1, by2))
                 return self.smoothed_points
             self.smoothed_points = []
             self._kalman_filters = []
@@ -1955,6 +2015,54 @@ class Worker(QObject):
                         "Markers found: %s, distances: %s — proceeding to projector scan",
                         markers, [f"{d:.1f}" for d in self._marker_distances]
                     )
+                    # Improvement 2: compute adaptive detection thresholds from the diff image.
+                    # Sample differential brightness at marker positions (signal) and random
+                    # background positions (noise) to set a data-driven floor.
+                    if (self._calib_dark_ref is not None and self._calib_illum_ref is not None
+                            and self._calib_dark_ref.shape == self._calib_illum_ref.shape):
+                        try:
+                            _diff_img = np.clip(
+                                self._calib_illum_ref.astype(np.float32)
+                                - self._calib_dark_ref.astype(np.float32),
+                                0, 255
+                            )
+                            # Collect marker diff values
+                            _marker_diffs = []
+                            _fh, _fw = _diff_img.shape[:2]
+                            for _mx, _my in markers:
+                                _r = 6
+                                _roi = _diff_img[
+                                    max(0, _my-_r):min(_fh, _my+_r),
+                                    max(0, _mx-_r):min(_fw, _mx+_r)
+                                ]
+                                if _roi.size > 0:
+                                    _marker_diffs.append(float(_roi.max()))
+                            # Background mean + 1 sigma as the new floor
+                            _bg_diff_mean = float(_diff_img.mean())
+                            _bg_diff_std = float(_diff_img.std())
+                            if _marker_diffs and _bg_diff_std > 0:
+                                _new_floor = _bg_diff_mean + _bg_diff_std * 1.5
+                                # Cap: must be at least 8 and at most half the weakest marker
+                                _min_marker = min(_marker_diffs)
+                                _new_floor = max(8.0, min(_new_floor, _min_marker * 0.5))
+                                self._adaptive_diff_floor = float(_new_floor)
+                                self.logger.info(
+                                    "Adaptive diff floor: %.1f (bg_mean=%.1f, bg_std=%.1f, min_marker=%.1f)",
+                                    _new_floor, _bg_diff_mean, _bg_diff_std, _min_marker
+                                )
+                        except Exception:
+                            self.logger.warning("Adaptive threshold computation failed", exc_info=True)
+                    # Improvement 4: store guitar bounds from calibrated marker positions
+                    _all_x = [mx for mx, _ in markers]
+                    _all_y = [my for _, my in markers]
+                    _pad = 80
+                    self._guitar_bounds = (
+                        max(0, min(_all_x) - _pad),
+                        max(0, min(_all_y) - _pad),
+                        min(w, max(_all_x) + _pad),
+                        min(h, max(_all_y) + _pad),
+                    )
+                    self.logger.info("Guitar bounds: %s", self._guitar_bounds)
                     # Save debug image
                     debug_frame = main_frame.copy()
                     for mi, (mx, my) in enumerate(markers):
@@ -2145,6 +2253,23 @@ class Worker(QObject):
             _active_cue_index = self.active_cue_index
             with self._state_lock:
                 _blackout = self._blackout
+
+            # Improvement 3: fog/low-contrast detection
+            # Measure frame contrast as std-dev of grayscale; flag if below threshold for N frames.
+            _gray_for_fog = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+            _frame_contrast = float(_gray_for_fog.std())
+            if _frame_contrast < self._dp.fog_contrast_threshold:
+                self._fog_consecutive_frames += 1
+                if self._fog_consecutive_frames >= self._fog_frame_threshold:
+                    if not self._fog_detected:
+                        self._fog_detected = True
+                        self.logger.warning(
+                            "Low contrast detected (%.1f < %.1f) — possible fog/obstruction",
+                            _frame_contrast, self._dp.fog_contrast_threshold
+                        )
+            else:
+                self._fog_consecutive_frames = 0
+                self._fog_detected = False
 
             t0 = time.perf_counter()
             all_detected_points = self._extract_detected_points(main_frame)
@@ -2490,6 +2615,12 @@ class Worker(QObject):
                     "tracking_state": self._tracking_state,
                     "blackout": _blackout,
                     "blob_history": len(self._blob_history),
+                    # Improvement 3: fog warning
+                    "fog_detected": self._fog_detected,
+                    # Improvement 9: tracking confidence
+                    "tracking_confidence": round(self.tracking_confidence, 3),
+                    # Improvement 1: partial match flag
+                    "partial_match": self._partial_match,
                 })
 
                 fps_counter = 0
