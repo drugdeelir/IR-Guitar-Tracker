@@ -1329,7 +1329,7 @@ class Worker(QObject):
         best_error = float("inf")
         if len(points_to_check) >= num_markers:
             best_ordered_points, best_error = _run_combination_search(
-                points_to_check, num_markers, marker_fingerprint
+                points_to_check, num_markers, marker_fingerprint, src_pts
             )
 
         # Improvement 9: store reprojection error for confidence computation
@@ -1342,7 +1342,6 @@ class Worker(QObject):
         # Improvement 1: Partial-marker recovery — try N-1 markers via affine if full match fails
         if num_markers >= 3 and len(points_to_check) >= num_markers - 1:
             # Build partial fingerprints: try dropping each marker in turn
-            import itertools as _it
             partial_best_pts = []
             partial_best_err = float("inf")
             partial_best_missing = -1
@@ -1358,15 +1357,13 @@ class Worker(QObject):
                 # Build partial src_pts for kept markers
                 partial_src = np.float32(kept_config).reshape(-1, 1, 2)
 
-                # Temporarily swap in partial_src for the inner search
-                _orig_src = src_pts  # save
                 try:
                     pts, err = _run_combination_search(
-                        points_to_check, num_markers - 1, partial_fp
+                        points_to_check, num_markers - 1, partial_fp, partial_src
                     )
                     # Use affine fit quality as the error metric
                     if pts and err < partial_best_err:
-                        # Try to estimate affine from partial match
+                        # Validate partial match via affine transform
                         if len(pts) >= 3:
                             _dst = np.float32(pts[:3])
                             _src3 = partial_src[:3].reshape(3, 2)
