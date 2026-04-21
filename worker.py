@@ -71,6 +71,7 @@ class DetectionParams:
     kalman_motion_pn: float = 1.0
     kalman_motion_threshold: float = 5.0  # px/frame above which motion pn is used
     fog_contrast_threshold: float = 18.0
+    dark_room_free: bool = False
 
 
 class Worker(QObject):
@@ -91,6 +92,8 @@ class Worker(QObject):
     calibration_restored = pyqtSignal()
     # Improvement 26: detailed diagnostic dict emitted every ~1 second
     diagnostic_info = pyqtSignal(dict)
+    # Improvement 3/5: calibration quality warnings (drift, multiple projectors, etc.)
+    calibration_warning = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -206,6 +209,17 @@ class Worker(QObject):
 
         # Improvement 27: blackout flag — zero projector output without stopping worker
         self._blackout = False
+
+        # Improvement 3: projector drift detection state
+        self._saved_proj_dot_positions = None  # loaded from proj_dot_positions.npy
+        self._projector_moved = False
+
+        # Improvement 4: PROJ_SCAN subphase state (4-corner → 3×3 grid)
+        self._proj_scan_subphase = 0
+        self._proj_grid_positions = None  # grid dot projector positions for refinement pass
+
+        # Improvement 5: dark-room-free calibration
+        self.dark_room_free = False  # set via config; skips DARK phase when True
 
         # Improvement 28: tracking state tracking for signal emission
         self._tracking_state = "idle"
@@ -415,6 +429,10 @@ class Worker(QObject):
         self._guitar_polygon = None
         self._pending_markers = None
         self._blob_history = []
+        # Reset PROJ_SCAN subphase state for fresh calibration run
+        self._proj_scan_subphase = 0
+        self._proj_grid_positions = None
+        self._projector_moved = False
 
     def _lock_camera_exposure(self, cap):
         """Lock camera exposure at a moderate level for calibration.
@@ -1725,6 +1743,25 @@ class Worker(QObject):
         os.makedirs(path, exist_ok=True)
         return path
 
+    def _display_proj_grid_dots(self, output_buffer, grid_size, proj_w, proj_h, cam_w, cam_h):
+        """Improvement 4: draw a grid_size×grid_size grid of white circles on the projector output.
+        Dots are evenly spaced with a 10% margin inset. Returns list of (proj_x, proj_y) positions."""
+        margin = 0.10
+        output_buffer.fill(0)
+        positions = []
+        for row in range(grid_size):
+            for col in range(grid_size):
+                frac_x = margin + col * (1.0 - 2 * margin) / max(grid_size - 1, 1)
+                frac_y = margin + row * (1.0 - 2 * margin) / max(grid_size - 1, 1)
+                px = int(proj_w * frac_x)
+                py = int(proj_h * frac_y)
+                positions.append((px, py))
+                # Scale to camera buffer dimensions for rendering
+                bx = int(px * cam_w / proj_w)
+                by = int(py * cam_h / proj_h)
+                cv2.circle(output_buffer, (bx, by), 20, (255, 255, 255), -1)
+        return positions
+
     def _save_calibration(self):
         """Persist calibration arrays to disk so recalibration is not needed after a crash."""
         try:
@@ -1739,6 +1776,10 @@ class Worker(QObject):
                 with open(os.path.join(cache_dir, "markers.json"), "w") as f:
                     json.dump({"markers": self._calibrated_positions,
                                "distances": self._marker_distances or []}, f)
+            # Improvement 3: save projector dot camera positions for drift detection
+            if hasattr(self, "_last_proj_dot_cam_pts") and self._last_proj_dot_cam_pts is not None:
+                np.save(os.path.join(cache_dir, "proj_dot_positions.npy"),
+                        np.array(self._last_proj_dot_cam_pts, dtype=np.float32))
             # Write timestamp
             with open(os.path.join(cache_dir, "timestamp.txt"), "w") as f:
                 f.write(str(time.time()))
@@ -1837,6 +1878,15 @@ class Worker(QObject):
             self._marker_distances = distances if distances else None
             self._calibrated = True
             self._calib_phase = CalibPhase.IDLE
+            # Improvement 3: load saved projector dot positions for drift detection
+            dot_path = os.path.join(cache_dir, "proj_dot_positions.npy")
+            if os.path.exists(dot_path):
+                try:
+                    self._saved_proj_dot_positions = np.load(dot_path)
+                    self.logger.info("Loaded saved projector dot positions for drift detection")
+                except Exception:
+                    self.logger.warning("Failed to load proj_dot_positions.npy", exc_info=True)
+                    self._saved_proj_dot_positions = None
             self.markers_calibrated.emit(markers)
             # Improvement 42: dedicated signal so UI can update "last calibrated" display
             self.calibration_restored.emit()
@@ -2036,7 +2086,46 @@ class Worker(QObject):
                 continue
 
             # Phase 1: DARK - projector OFF, collect dark reference
+            # Improvement 5: if dark_room_free=True, build synthetic dark ref from live frames
             if not self._calibrated and self._calib_phase == CalibPhase.DARK:
+                if self.dark_room_free:
+                    # Dark-room-free: accumulate frames with projector OFF, no room darkening needed
+                    self._calib_frame_count += 1
+                    gray_frame = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+                    if self._calib_frame_count > 2:  # skip first 2 settling frames
+                        gray_f64 = gray_frame.astype(np.float64)
+                        if self._calib_dark_sum is None:
+                            self._calib_dark_sum = gray_f64.copy()
+                            self._calib_dark_count = 1
+                        else:
+                            self._calib_dark_sum += gray_f64
+                            self._calib_dark_count += 1
+                    if self._calib_frame_count >= 12:  # collect 10 frames (12 - 2 skipped)
+                        if self._calib_dark_count > 0:
+                            raw_dark = (self._calib_dark_sum / self._calib_dark_count).astype(np.float32)
+                            # Smooth to remove noise while preserving background structure
+                            smoothed = cv2.GaussianBlur(raw_dark, (21, 21), 0)
+                            self._calib_dark_ref = smoothed.astype(np.uint8)
+                            if self._debug_mode:
+                                import os as _os
+                                _base = _os.path.dirname(_os.path.abspath(__file__))
+                                cv2.imwrite(_os.path.join(_base, "dark_ref_free.png"), self._calib_dark_ref)
+                        self._calib_dark_sum = None
+                        self._calib_dark_count = 0
+                        self._calib_phase = CalibPhase.ILLUMINATE
+                        self._calib_frame_count = 0
+                        self.logger.info("Calibration (dark-room-free): synthetic dark reference captured, switching to illuminate phase")
+                    self.calibration_progress.emit(CalibPhase.DARK.name, self._calib_frame_count, 12)
+                    cv2.putText(main_frame, f"CALIBRATING - Dark ref (free) {self._calib_frame_count}/12",
+                                (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                    cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                    qt_main = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
+                    self.frame_ready.emit(qt_main)
+                    cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB, dst=self._rgb_buffer)
+                    qt_proj = QImage(self._rgb_buffer.data, w, h, self._rgb_buffer.strides[0], QImage.Format_RGB888).copy()
+                    self.projector_frame_ready.emit(qt_proj)
+                    self.trackers_detected.emit(0)
+                    continue
                 self._calib_frame_count += 1
                 # No exposure lock — let auto-exposure handle each phase naturally
                 gray_frame = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
@@ -2225,6 +2314,7 @@ class Worker(QObject):
 
             # Phase 4: PROJ_SCAN - project 4 corner dots, detect in camera, compute homography
             # Improvement 35: use enum consistently (was string "proj_scan")
+            # Improvement 4: after 4-corner pass, do a 3×3 grid pass for multi-point refinement
             if not self._calibrated and self._calib_phase in (CalibPhase.PROJ_SCAN, "proj_scan"):
                 self._calib_frame_count += 1
                 proj_w, proj_h = self._proj_resolution
@@ -2236,19 +2326,26 @@ class Worker(QObject):
                     (int(proj_w * (1 - inset)), int(proj_h * (1 - inset))),  # BR
                     (int(proj_w * inset), int(proj_h * (1 - inset))),        # BL
                 ]
-                # Draw 4 large bright dots on projector output (scaled to camera buffer size)
-                projector_output.fill(0)
-                for (px, py) in proj_corners:
-                    bx = int(px * w / proj_w)
-                    by = int(py * h / proj_h)
-                    cv2.circle(projector_output, (bx, by), 30, (255, 255, 255), -1)
 
-                # At frame 30, detect the dots in camera and compute homography
-                if self._calib_frame_count == 30:
-                    gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
-                    if self._calib_dark_ref is not None:
+                # _proj_scan_subphase: 0 = 4-corner pass, 1 = 3×3 grid refinement pass
+                if self._proj_scan_subphase == 0:
+                    # Draw 4 large bright dots on projector output (scaled to camera buffer size)
+                    projector_output.fill(0)
+                    for (px, py) in proj_corners:
+                        bx = int(px * w / proj_w)
+                        by = int(py * h / proj_h)
+                        cv2.circle(projector_output, (bx, by), 30, (255, 255, 255), -1)
+                else:
+                    # Improvement 4: draw 3×3 grid of dots
+                    self._proj_grid_positions = self._display_proj_grid_dots(
+                        projector_output, 3, proj_w, proj_h, w, h)
+
+                def _detect_blobs_from_frame(frame_bgr, dark_ref):
+                    """Shared blob detection helper for proj scan."""
+                    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                    if dark_ref is not None:
                         diff = np.clip(
-                            gray.astype(np.float32) - self._calib_dark_ref.astype(np.float32),
+                            gray.astype(np.float32) - dark_ref.astype(np.float32),
                             0, 255
                         ).astype(np.uint8)
                     else:
@@ -2260,7 +2357,6 @@ class Worker(QObject):
                     kk = np.ones((5, 5), np.uint8)
                     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kk)
                     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kk)
-
                     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     blobs = []
                     for cnt in contours:
@@ -2272,8 +2368,14 @@ class Worker(QObject):
                         area = cv2.contourArea(cnt)
                         blobs.append((area, cx_b, cy_b))
                     blobs.sort(key=lambda x: -x[0])
+                    return blobs, diff, diff_max, thresh_val, binary
+
+                # At frame 30 (subphase 0): detect 4 corner dots
+                if self._calib_frame_count == 30 and self._proj_scan_subphase == 0:
+                    blobs, diff, diff_max, thresh_val, binary = _detect_blobs_from_frame(
+                        main_frame, self._calib_dark_ref)
                     self.logger.info(
-                        "Proj scan: found %d blobs (need 4): %s",
+                        "Proj scan (4-corner): found %d blobs (need 4): %s",
                         len(blobs),
                         [(int(b[1]), int(b[2]), int(b[0])) for b in blobs[:8]]
                     )
@@ -2294,31 +2396,130 @@ class Worker(QObject):
                         if H is not None:
                             self._cam_to_proj_H = H
                             self.logger.info(
-                                "Camera→Projector homography computed. Cam corners: %s → Proj corners: %s",
+                                "Camera→Projector homography computed (4-corner). Cam: %s → Proj: %s",
                                 cam_ordered.tolist(), proj_pts.tolist()
                             )
-                            # Save debug image
-                            _base_ps = os.path.dirname(os.path.abspath(__file__))
-                            dbg = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
-                            labels = ["TL", "TR", "BR", "BL"]
-                            for i_d, (cx_d, cy_d) in enumerate(cam_ordered):
-                                cv2.circle(dbg, (int(cx_d), int(cy_d)), 10, (0, 0, 255), -1)
-                                cv2.putText(dbg, labels[i_d], (int(cx_d) + 12, int(cy_d)),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                             if self._debug_mode:
+                                _base_ps = os.path.dirname(os.path.abspath(__file__))
+                                dbg = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
+                                labels = ["TL", "TR", "BR", "BL"]
+                                for i_d, (cx_d, cy_d) in enumerate(cam_ordered):
+                                    cv2.circle(dbg, (int(cx_d), int(cy_d)), 10, (0, 0, 255), -1)
+                                    cv2.putText(dbg, labels[i_d], (int(cx_d) + 12, int(cy_d)),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                                 cv2.imwrite(os.path.join(_base_ps, "proj_scan_debug.png"), dbg)
                         else:
-                            self.logger.warning("findHomography returned None")
+                            self.logger.warning("findHomography returned None (4-corner pass)")
+
+                        # Improvement 3: drift detection — compare detected corner positions
+                        # to saved positions from previous calibration
+                        self._last_proj_dot_cam_pts = cam_ordered.tolist()
+                        if self._saved_proj_dot_positions is not None:
+                            try:
+                                saved = np.array(self._saved_proj_dot_positions, dtype=np.float32)
+                                if saved.shape == cam_ordered.shape:
+                                    drift = float(np.mean(np.linalg.norm(cam_ordered - saved, axis=1)))
+                                    self.logger.info("Projector drift vs saved positions: %.1f px", drift)
+                                    if drift > 15.0:
+                                        self._projector_moved = True
+                                        warn_msg = (
+                                            f"Projector may have moved since last calibration "
+                                            f"(drift: {drift:.1f}px). Re-calibration recommended."
+                                        )
+                                        self.logger.warning(warn_msg)
+                                        self.calibration_warning.emit(warn_msg)
+                            except Exception:
+                                self.logger.warning("Drift check failed", exc_info=True)
+
+                        # Switch to 3×3 grid refinement subphase
+                        self._proj_scan_subphase = 1
+                        self._calib_frame_count = 0  # reset counter for grid phase
                     else:
                         self.logger.warning(
-                            "Proj scan: only %d blobs, using projector rect fallback",
+                            "Proj scan: only %d blobs (4-corner), using projector rect fallback",
                             len(blobs)
                         )
+                        # Skip grid phase — go straight to fallback + finalize
+                        self._proj_scan_subphase = 2  # signal finalize
+
+                    # Always write debug image
+                    if self._debug_mode:
+                        _base_ps2 = os.path.dirname(os.path.abspath(__file__))
+                        dbg2 = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
+                        cv2.putText(dbg2, f"Proj scan: {len(blobs)} blobs (4-corner), thresh={int(thresh_val)}, max={int(diff_max)}",
+                                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                        for bi, (ba, bx_d, by_d) in enumerate(blobs[:8]):
+                            cv2.circle(dbg2, (int(bx_d), int(by_d)), 8, (0, 255, 0), 2)
+                            cv2.putText(dbg2, f"#{bi} a={int(ba)}", (int(bx_d) + 10, int(by_d)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+                        cv2.imwrite(os.path.join(_base_ps2, "proj_scan_all_blobs.png"), dbg2)
+                        cv2.imwrite(os.path.join(_base_ps2, "proj_scan_binary.png"), binary)
+
+                # Improvement 4: at frame 30 of grid subphase, detect 9 grid dots
+                elif self._calib_frame_count == 30 and self._proj_scan_subphase == 1:
+                    blobs, diff, diff_max, thresh_val, binary = _detect_blobs_from_frame(
+                        main_frame, self._calib_dark_ref)
+                    self.logger.info(
+                        "Proj scan (3×3 grid): found %d blobs (want 9): %s",
+                        len(blobs),
+                        [(int(b[1]), int(b[2]), int(b[0])) for b in blobs[:12]]
+                    )
+
+                    if len(blobs) >= 6 and self._proj_grid_positions is not None:
+                        # Use all detected blobs up to the number of grid positions
+                        n_pts = min(len(blobs), len(self._proj_grid_positions))
+                        cam_pts_all = np.float32([(b[1], b[2]) for b in blobs[:n_pts]])
+                        proj_pts_all = np.float32(self._proj_grid_positions[:n_pts])
+                        # Sort cam blobs into grid order using nearest-neighbour matching to proj pts
+                        # (project grid positions through approximate H to camera space for ordering)
+                        matched_cam = []
+                        matched_proj = []
+                        used = set()
+                        for gp in self._proj_grid_positions:
+                            # find closest cam blob not yet used
+                            best_d = float("inf")
+                            best_i = -1
+                            for bi2, (_, bx2, by2) in enumerate(blobs):
+                                if bi2 in used:
+                                    continue
+                                dist2 = (bx2 - gp[0] * w / proj_w) ** 2 + (by2 - gp[1] * h / proj_h) ** 2
+                                if dist2 < best_d:
+                                    best_d = dist2
+                                    best_i = bi2
+                            if best_i >= 0:
+                                used.add(best_i)
+                                matched_cam.append((blobs[best_i][1], blobs[best_i][2]))
+                                matched_proj.append(gp)
+                        if len(matched_cam) >= 6:
+                            cam_arr = np.float32(matched_cam)
+                            proj_arr = np.float32(matched_proj)
+                            H_refined, mask_h = cv2.findHomography(cam_arr, proj_arr, cv2.RANSAC, 3.0)
+                            if H_refined is not None:
+                                self._cam_to_proj_H = H_refined
+                                inliers = int(mask_h.sum()) if mask_h is not None else len(matched_cam)
+                                self.logger.info(
+                                    "Multi-point homography refined with %d/%d points (RANSAC inliers: %d)",
+                                    len(matched_cam), len(self._proj_grid_positions), inliers
+                                )
+                            else:
+                                self.logger.warning("Multi-point findHomography returned None — keeping 4-corner result")
+                        else:
+                            self.logger.warning("Grid pass: not enough matched pairs (%d) — keeping 4-corner result", len(matched_cam))
+                    else:
+                        self.logger.warning(
+                            "Grid pass: only %d blobs (need 6+) — keeping 4-corner homography",
+                            len(blobs)
+                        )
+                    self._proj_scan_subphase = 2  # signal finalize
+
+                # Finalize when subphase == 2 (triggered this frame or via insufficient-blob fallback)
+                if self._proj_scan_subphase == 2 or (
+                        self._proj_scan_subphase == 1 and self._calib_frame_count > 30):
+                    self._proj_scan_subphase = 0  # reset for next calibration
 
                     # Fallback: if dot-based homography failed, use _proj_camera_rect
                     if self._cam_to_proj_H is None and self._proj_camera_rect is not None:
                         rx, ry, rw, rh = self._proj_camera_rect
-                        # Camera rect maps to full projector output
                         cam_rect = np.float32([
                             [rx, ry], [rx + rw, ry],
                             [rx + rw, ry + rh], [rx, ry + rh]
@@ -2335,19 +2536,6 @@ class Worker(QObject):
                                 rx, ry, rw, rh, proj_w, proj_h
                             )
 
-                    # Always save debug image so we can see what the camera saw
-                    _base_ps2 = os.path.dirname(os.path.abspath(__file__))
-                    dbg2 = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
-                    cv2.putText(dbg2, f"Proj scan: {len(blobs)} blobs found (need 4), thresh={int(thresh_val)}, max={int(diff_max)}",
-                                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-                    for bi, (ba, bx_d, by_d) in enumerate(blobs[:8]):
-                        cv2.circle(dbg2, (int(bx_d), int(by_d)), 8, (0, 255, 0), 2)
-                        cv2.putText(dbg2, f"#{bi} a={int(ba)}", (int(bx_d) + 10, int(by_d)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-                    if self._debug_mode:
-                        cv2.imwrite(os.path.join(_base_ps2, "proj_scan_all_blobs.png"), dbg2)
-                        cv2.imwrite(os.path.join(_base_ps2, "proj_scan_binary.png"), binary)
-
                     # Finalize calibration (with or without homography)
                     markers = self._pending_markers
                     self._calibrated = True
@@ -2359,8 +2547,10 @@ class Worker(QObject):
                     self._save_calibration()
 
                 # Status overlay and frame emission
-                self.calibration_progress.emit("Projector Scan", self._calib_frame_count, 30)
-                cv2.putText(main_frame, f"CALIBRATING - Projector scan {self._calib_frame_count}/30",
+                _scan_label = "4-corner" if self._proj_scan_subphase == 0 else "grid"
+                _scan_total = 30 if self._proj_scan_subphase <= 1 else 30
+                self.calibration_progress.emit("Projector Scan", self._calib_frame_count, _scan_total)
+                cv2.putText(main_frame, f"CALIBRATING - Projector scan ({_scan_label}) {self._calib_frame_count}/{_scan_total}",
                             (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                 qt_main = QImage(
                     cv2.cvtColor(main_frame, cv2.COLOR_BGR2RGB).tobytes(),

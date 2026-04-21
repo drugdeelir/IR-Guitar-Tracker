@@ -1242,10 +1242,17 @@ class ProjectionMappingApp(QMainWindow):
         return ordered
 
     def detect_projector_bounds(self, off_image, on_image):
+        """Detect projector bounds from on/off image pair.
+
+        Returns (normalized_points, auto_accepted, confidence_msg) where:
+          - normalized_points: list of 4 [x,y] floats in [0,1] range, or None on failure
+          - auto_accepted: True if confidence thresholds were met (Improvement 1)
+          - confidence_msg: human-readable confidence description (empty string if None)
+        """
         off_frame = self._qimage_to_bgr(off_image)
         on_frame = self._qimage_to_bgr(on_image)
         if off_frame is None or on_frame is None:
-            return None
+            return None, False, ""
 
         h, w = on_frame.shape[:2]
         diff = cv2.absdiff(on_frame, off_frame)
@@ -1269,12 +1276,12 @@ class ProjectionMappingApp(QMainWindow):
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not contours:
                 self.logger.error("Projector bounds detection failed after fallback")
-                return None
+                return None, False, ""
 
-        best_quad = None
-        best_score = -1.0
         image_area = float(w * h)
 
+        # Collect all valid candidates with scores (Improvement 2: multi-projector scoring)
+        candidates = []  # list of (score, quad, area_ratio, rect_score_val, contour_area)
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < image_area * 0.05:
@@ -1294,15 +1301,29 @@ class ProjectionMappingApp(QMainWindow):
             quad_area = abs(cv2.contourArea(np.array(quad, dtype=np.float32)))
             x, y, bw, bh = cv2.boundingRect(np.array(quad, dtype=np.int32))
             rect_area = max(float(bw * bh), 1.0)
-            rectangularity = quad_area / rect_area
-            score = (quad_area / image_area) * 0.8 + rectangularity * 0.2
+            rect_score_val = quad_area / rect_area  # 1.0 = perfect rectangle
+            area_ratio = quad_area / image_area
 
-            if score > best_score:
-                best_score = score
-                best_quad = quad
+            # Improvement 2: score = rect_score * sqrt(area), favouring large rectangular regions
+            multi_score = rect_score_val * (quad_area ** 0.5)
+            candidates.append((multi_score, quad, area_ratio, rect_score_val, quad_area))
 
-        if best_quad is None:
-            return None
+        if not candidates:
+            return None, False, ""
+
+        # Improvement 2: sort candidates by score descending; pick top one
+        candidates.sort(key=lambda x: -x[0])
+        best = candidates[0]
+        best_score, best_quad, best_area_ratio, best_rect_score, best_area = best
+
+        # Improvement 2: warn if runner-up is close to winner
+        if len(candidates) >= 2:
+            runner_up_score = candidates[1][0]
+            if runner_up_score >= best_score * 0.80:
+                warn_msg = "Multiple projector regions detected — auto-selected best candidate. Please verify."
+                self.logger.warning(warn_msg)
+                if hasattr(self, "worker") and hasattr(self.worker, "calibration_warning"):
+                    self.worker.calibration_warning.emit(warn_msg)
 
         ordered = self._order_quad_points(best_quad)
         normalized = []
@@ -1311,7 +1332,21 @@ class ProjectionMappingApp(QMainWindow):
                 float(max(0.0, min(1.0, x / max(w, 1)))),
                 float(max(0.0, min(1.0, y / max(h, 1)))),
             ])
-        return normalized
+
+        # Improvement 1: auto-accept if confidence thresholds are met
+        # area_ratio > 0.05 AND rect_score > 0.75 AND only 1 candidate
+        auto_accepted = (
+            best_area_ratio > 0.05
+            and best_rect_score > 0.75
+            and len(candidates) == 1
+        )
+        # Combined confidence metric for display (weighted area_ratio + rect_score)
+        combined_confidence = best_area_ratio * 0.5 + best_rect_score * 0.5
+        confidence_msg = f"Projector bounds auto-detected (confidence: {combined_confidence:.0%})"
+        if auto_accepted:
+            self.logger.info("Projector bounds auto-accepted: area_ratio=%.2f rect_score=%.2f",
+                             best_area_ratio, best_rect_score)
+        return normalized, auto_accepted, confidence_msg
 
 
     def _draw_polygon_overlay(self, image, points, color=Qt.green):
@@ -1553,7 +1588,7 @@ class ProjectionMappingApp(QMainWindow):
             return
 
         still = still_on
-        bounds = self.detect_projector_bounds(still_off, still_on)
+        bounds, auto_accepted, confidence_msg = self.detect_projector_bounds(still_off, still_on)
         initial_points = []
         if bounds:
             initial_points = [
@@ -1570,21 +1605,27 @@ class ProjectionMappingApp(QMainWindow):
                 QPoint(0, still.height() - 1),
             ]
 
-        bounds_dialog = PolygonMaskDialog("Confirm projector bounds", self)
-        bounds_dialog.set_pixmap(QPixmap.fromImage(still))
-        if initial_points:
-            bounds_dialog.set_points(initial_points)
+        # Improvement 1: if confidence thresholds are met, skip the confirmation dialog
+        if auto_accepted and bounds:
+            self.logger.info("Projector bounds auto-accepted: %s", confidence_msg)
+            self.statusBar().showMessage(confidence_msg, 5000)
+            confirmed_points = initial_points
+        else:
+            bounds_dialog = PolygonMaskDialog("Confirm projector bounds", self)
+            bounds_dialog.set_pixmap(QPixmap.fromImage(still))
+            if initial_points:
+                bounds_dialog.set_points(initial_points)
 
-        QMessageBox.information(
-            self,
-            "Stage 1",
-            "Review the auto-scanned projector bounds. Drag/click 4 points if needed, then confirm.",
-        )
-        if not bounds_dialog.exec_() or len(bounds_dialog.get_points()) != 4:
-            QMessageBox.warning(self, "Stage 1", "Projector bounds were not confirmed.")
-            return
+            QMessageBox.information(
+                self,
+                "Stage 1",
+                "Review the auto-scanned projector bounds. Drag/click 4 points if needed, then confirm.",
+            )
+            if not bounds_dialog.exec_() or len(bounds_dialog.get_points()) != 4:
+                QMessageBox.warning(self, "Stage 1", "Projector bounds were not confirmed.")
+                return
 
-        confirmed_points = bounds_dialog.get_points()
+            confirmed_points = bounds_dialog.get_points()
         normalized = [
             [p.x() / max(still.width(), 1), p.y() / max(still.height(), 1)]
             for p in confirmed_points
