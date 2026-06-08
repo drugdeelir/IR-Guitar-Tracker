@@ -371,8 +371,8 @@ class ProjectionMappingApp(QMainWindow):
                         data = _migrate_settings(data)
                         self.logger.info("Restored settings from backup")
                         return self._validate_settings(data)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.warning("Could not restore settings from backup: %s", e)
                 return {"_corrupted": True}
         return {}
 
@@ -448,8 +448,8 @@ class ProjectionMappingApp(QMainWindow):
                 try:
                     import shutil
                     shutil.copy2(str(SETTINGS_PATH), str(_backup))
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning("Could not rotate settings backup: %s", e)
             _tmp = SETTINGS_PATH.with_suffix('.tmp')
             _tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding='utf-8')
             _tmp.replace(SETTINGS_PATH)

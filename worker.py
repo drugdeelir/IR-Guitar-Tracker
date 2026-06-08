@@ -124,7 +124,7 @@ class Worker(QObject):
         self.smoothed_points = []
         self.smoothing_alpha = 0.05   # EMA fallback (unused if Kalman active)
         self.tracking_lost_frames = 0
-        self.max_lost_tracking_frames = 15
+        self.max_lost_tracking_frames = 30
         self.expected_marker_count = 4  # number of IR markers on the guitar
 
         # Kalman filters: one per marker point for ultra-smooth tracking
@@ -509,11 +509,16 @@ class Worker(QObject):
             if best_hi >= 0:
                 # Update existing history entry with smoothed position and velocity
                 hcx, hcy, hpeak, hage, hhits, hvx, hvy = self._blob_history[best_hi]
-                alpha = 0.15  # moderate smoothing on history — Kalman handles the rest
+                # Use raw delta for velocity before position smoothing to avoid
+                # double-damping: raw_delta reflects true motion, Kalman handles
+                # final smoothing on the output side.
+                raw_vx = ncx - hcx
+                raw_vy = ncy - hcy
+                alpha = 0.4  # more responsive history — Kalman handles final smoothing
                 new_hcx = hcx * (1 - alpha) + ncx * alpha
                 new_hcy = hcy * (1 - alpha) + ncy * alpha
-                new_vx = hvx * 0.8 + (ncx - hcx) * 0.2
-                new_vy = hvy * 0.8 + (ncy - hcy) * 0.2
+                new_vx = hvx * 0.7 + raw_vx * 0.3
+                new_vy = hvy * 0.7 + raw_vy * 0.3
                 self._blob_history[best_hi] = (new_hcx, new_hcy, nscore, 0, hhits + 1, new_vx, new_vy)
                 matched_history[best_hi] = True
                 matched_new[ni] = True
@@ -578,6 +583,17 @@ class Worker(QObject):
                     int(self._local_search_radius + max_vel * 2)
                 )
         radius = _adaptive_radius
+
+        # Use velocity-predicted positions as search centers so fast-moving
+        # markers don't drift out of the ROI between frames.
+        if self._kalman_initialized and len(self._kalman_filters) == len(search_centers):
+            predicted_centers = []
+            for i, (cx, cy) in enumerate(search_centers):
+                vx = float(self._kalman_filters[i].statePost[2, 0])
+                vy = float(self._kalman_filters[i].statePost[3, 0])
+                predicted_centers.append((cx + vx, cy + vy))
+            search_centers = predicted_centers
+
         result = []
 
         for cx, cy in search_centers:
@@ -1383,9 +1399,9 @@ class Worker(QObject):
         for i, (prev, curr) in enumerate(zip(self.smoothed_points, matched)):
             kf = self._kalman_filters[i]
 
-            # Large jump: temporarily inflate measurement noise so the filter
-            # trusts the measurement rather than its stale prediction (#30).
-            # This avoids the hard reset lurch while still snapping to new position.
+            # Large jump: inflate measurement noise so the filter doesn't thrash
+            # between prediction and measurement. Decay back gradually rather than
+            # snapping to 8.0 immediately, which avoids the abrupt lurch on recovery.
             dist = ((prev[0] - curr[0]) ** 2 + (prev[1] - curr[1]) ** 2) ** 0.5
             if dist > 60:
                 kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 80.0
@@ -1406,8 +1422,11 @@ class Worker(QObject):
             measurement = np.array([[float(curr[0])], [float(curr[1])]], dtype=np.float32)
             corrected = kf.correct(measurement)
 
-            # Decay measurement noise back to normal after a large jump
-            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 8.0
+            # Gradually decay measurement noise back to the baseline (8.0) rather
+            # than snapping instantly, so recovery from a large-jump inflation is smooth.
+            current_mn = float(kf.measurementNoiseCov[0, 0])
+            decayed_mn = current_mn * 0.5 + 8.0 * 0.5
+            kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * decayed_mn
 
             sx = int(round(float(corrected[0, 0])))
             sy = int(round(float(corrected[1, 0])))

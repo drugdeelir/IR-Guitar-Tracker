@@ -6,3 +6,4 @@ python-rtmidi==1.5.8
 pyinstaller==6.8.0
 scipy>=1.10.0
 psutil>=5.9.0
+Pillow>=10.0.0

@@ -38,8 +38,8 @@ def check_camera():
         if not opened:
             print("\nWarning: No camera detected on index 0.")
             print("         Connect the IR camera before starting calibration.\n")
-    except Exception:
-        pass  # opencv not yet installed — skip this check
+    except Exception as e:
+        print(f"Warning: camera check skipped ({e})")
 
 
 def check_codec():
@@ -57,8 +57,8 @@ def check_codec():
         if not ok:
             print("\nWarning: Video codec (mp4v) unavailable.")
             print("         Cue video playback may fail. Install K-Lite Codec Pack or VLC.\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: codec check skipped ({e})")
 
 
 def check_screens():
@@ -74,8 +74,8 @@ def check_screens():
         else:
             print(f"\nWarning: Only {n} screen detected.")
             print("         Connect the projector before starting for best results.\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: screen check skipped ({e})")
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +105,8 @@ def check_disk_space():
             print(f"\nWarning: Only {free_mb} MB free on disk. Log files and calibration cache may fill it.")
         else:
             print(f"Disk space: {free_mb} MB free — OK")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: disk space check skipped ({e})")
 
 
 def main() -> int:
