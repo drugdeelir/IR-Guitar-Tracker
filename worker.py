@@ -73,6 +73,108 @@ class DetectionParams:
     fog_contrast_threshold: float = 18.0
 
 
+class CueReader:
+    """Background video decoder with a double-buffered latest frame.
+
+    Decodes a cue video on its own daemon thread at the clip's native frame
+    rate, so the render thread never blocks on disk I/O or codec stalls and
+    playback speed is decoupled from render FPS. Handles looping / one-shot
+    internally. ``read()`` is non-blocking and returns the most recent frame.
+    """
+
+    def __init__(self, path, loop=True, logger=None):
+        self.path = path
+        self.loop = loop
+        self._logger = logger
+        self._cap = cv2.VideoCapture(path)
+        self._opened = self._cap.isOpened()
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stop = threading.Event()
+        # On-demand decoding: pause the decode thread when nothing has read() a
+        # frame recently, so cues that aren't being composited (idle, during
+        # calibration, or non-active cues) don't burn CPU in the background.
+        self._last_read = time.perf_counter()
+        self._idle_after = 0.5
+        fps = 30.0
+        try:
+            fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+        except Exception:
+            fps = 30.0
+        # Clamp to a sane range; some files report 0 or absurd values.
+        self._frame_interval = 1.0 / max(1.0, min(120.0, fps))
+        self._thread = None
+        if self._opened:
+            # Prime the first frame synchronously so the very first read() has data.
+            ret, frame = self._cap.read()
+            if ret:
+                self._frame = frame
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def is_opened(self):
+        return self._opened
+
+    def set_loop(self, loop):
+        self.loop = bool(loop)
+
+    def _run(self):
+        next_t = time.perf_counter()
+        while not self._stop.is_set():
+            # On-demand: if nobody has consumed a frame recently, idle instead of
+            # decoding so inactive/idle cues don't waste CPU in the background.
+            if (time.perf_counter() - self._last_read) > self._idle_after:
+                if self._stop.wait(0.1):
+                    break
+                next_t = time.perf_counter()
+                continue
+            ret, frame = self._cap.read()
+            if not ret:
+                if self.loop:
+                    if not self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                        # Seek unsupported for this codec — reopen the file.
+                        try:
+                            self._cap.release()
+                        except Exception:
+                            pass
+                        self._cap = cv2.VideoCapture(self.path)
+                    continue
+                # One-shot: hold the last decoded frame, idle quietly.
+                if self._stop.wait(0.02):
+                    break
+                continue
+            with self._lock:
+                self._frame = frame
+            # Pace to the clip's native frame rate (wall-clock), drift-corrected.
+            next_t += self._frame_interval
+            sleep = next_t - time.perf_counter()
+            if sleep > 0:
+                if self._stop.wait(sleep):
+                    break
+            else:
+                # Falling behind — reset the schedule to avoid runaway catch-up.
+                next_t = time.perf_counter()
+
+    def read(self):
+        self._last_read = time.perf_counter()
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame
+
+    def release(self):
+        self._stop.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=0.5)
+            except Exception:
+                pass
+        try:
+            self._cap.release()
+        except Exception:
+            pass
+
+
 class Worker(QObject):
     frame_ready = pyqtSignal(QImage)
     projector_frame_ready = pyqtSignal(QImage)
@@ -167,6 +269,41 @@ class Worker(QObject):
         self._calibrated_positions = None  # list of (x,y) marker centers
         self._local_search_radius = 50    # pixels around each marker to search
 
+        # Rigid-body constraint: the guitar is a rigid object, so the marker
+        # constellation can only rotate/scale/translate as a unit. After Kalman
+        # smoothing we fit a similarity transform from this template to the
+        # current points and reproject, which kills independent-marker shear and
+        # lets us reconstruct occluded markers exactly. (Improvement: rigid body)
+        self._rigid_template = None       # Nx2 centred template of marker offsets
+        self._rigid_enabled = True
+        self._rigid_blend = 0.6           # how strongly to pull points onto the rigid fit
+
+        # Optical-flow occlusion bridge: when IR markers vanish we follow the
+        # surrounding surface texture with Lucas-Kanade so brief occlusions
+        # (hand-overs, wipes) don't drop the lock. (Improvement: optical flow)
+        self._flow_enabled = True
+        self._flow_prev_gray = None       # reference gray frame at moment of loss
+        self._flow_prev_pts = None        # Nx1x2 float32 points to follow
+        self._flow_lk_params = dict(
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+
+        # Rolling dark-reference refresh: ambient IR drifts during a show, so we
+        # periodically blend a fresh baseline into the dark reference while the
+        # stage is idle (no markers tracked). (Improvement: rolling dark ref)
+        self._dark_refresh_enabled = True
+        self._dark_refresh_interval = 300.0   # seconds between refresh attempts
+        self._dark_refresh_blend = 0.2        # EMA weight of the new baseline
+        self._last_dark_refresh = 0.0
+        self._dark_refresh_buf = []           # frames accumulated while idle
+
+        # Per-mask homography smoothing: exponential-average the 3x3 warp matrix
+        # itself so sub-pixel point jitter doesn't make the projected content
+        # shimmer. (Improvement: homography smoothing)
+        self._prev_transforms: Dict[int, np.ndarray] = {}
+        self._transform_smooth = 0.6      # weight of new matrix vs previous
+
         self._projector_output_buffer = None
         self._mask_buffer = None
         self._buffer_shape = None
@@ -216,6 +353,19 @@ class Worker(QObject):
             cv2.setUseOptimized(True)
         except Exception:
             pass
+
+        # GPU acceleration via OpenCL (Transparent API / UMat). Detected once at
+        # startup; used to offload the large final projector warp to the GPU when
+        # available. Falls back transparently to CPU when not.
+        self._use_opencl = False
+        try:
+            if cv2.ocl.haveOpenCL():
+                cv2.ocl.setUseOpenCL(True)
+                self._use_opencl = bool(cv2.ocl.useOpenCL())
+        except Exception:
+            self._use_opencl = False
+        if self._use_opencl:
+            self.logger.info("OpenCL acceleration enabled for projector warp")
 
         # Frame-drop tracking for performance_degraded signal (#44)
         self._low_fps_since = None   # timestamp when FPS first dropped below threshold
@@ -352,6 +502,11 @@ class Worker(QObject):
         self._marker_distances = None
         self._calib_phase = CalibPhase.IDLE
         self._blob_history = []
+        # Drop the rigid template and optical-flow refs so they're re-learned
+        # from the new calibration rather than carrying stale geometry over.
+        self._rigid_template = None
+        self._flow_prev_gray = None
+        self._flow_prev_pts = None
         with self._state_lock:
             self.smoothed_points = []
             self._kalman_filters = []
@@ -671,10 +826,12 @@ class Worker(QObject):
         self._auto_thresh_info = f"local_search r={radius} found={len(result)}"
         return result
 
-    def _extract_detected_points(self, main_frame):
+    def _extract_detected_points(self, main_frame, gray=None):
         """Main detection entry point. Compute gray/HSV once and pass to
-        local or global search to avoid duplicate conversions (#41)."""
-        gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+        local or global search to avoid duplicate conversions (#41).
+        ``gray`` may be supplied by the caller to avoid a second conversion."""
+        if gray is None:
+            gray = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
         sat_channel = cv2.cvtColor(main_frame, cv2.COLOR_BGR2HSV)[:, :, 1]
         if self._calibrated and self._calibrated_positions:
             return self._extract_detected_points_local(main_frame, gray, sat_channel)
@@ -1364,7 +1521,93 @@ class Worker(QObject):
 
         return kf
 
-    def _stabilize_tracked_points(self, tracked_points):
+    def _ensure_rigid_template(self, points):
+        """Capture the rigid marker template (centred relative geometry) once.
+
+        Prefers the calibrated marker positions (pose-independent shape); falls
+        back to the first stable full-count set of points."""
+        if self._rigid_template is not None:
+            return
+        src = None
+        if (self._calibrated_positions
+                and len(self._calibrated_positions) == self.expected_marker_count):
+            src = self._calibrated_positions
+        elif len(points) == self.expected_marker_count:
+            src = points
+        if src is None:
+            return
+        arr = np.array(src, dtype=np.float32)
+        self._rigid_template = arr - arr.mean(axis=0)
+
+    def _apply_rigid_constraint(self, points):
+        """Pull marker points onto the best similarity fit of the rigid template.
+
+        Fits rotation + uniform scale + translation (a rigid body with depth
+        scaling) from the template to the current points, then blends each point
+        toward its fitted position. Removes independent-marker shear/jitter and
+        keeps the guitar's shape intact. Returns points unchanged if no template
+        or the fit fails."""
+        if not self._rigid_enabled or self._rigid_template is None:
+            return points
+        if len(points) != len(self._rigid_template):
+            return points
+        try:
+            tmpl = self._rigid_template.reshape(-1, 1, 2)
+            dst = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+            # Partial affine = rotation + uniform scale + translation (similarity).
+            M, _ = cv2.estimateAffinePartial2D(
+                tmpl, dst, method=cv2.LMEDS, refineIters=10
+            )
+            if M is None or not np.all(np.isfinite(M)):
+                return points
+            fitted = cv2.transform(tmpl, M).reshape(-1, 2)
+            blend = self._rigid_blend
+            out = []
+            for (px, py), (fx, fy) in zip(points, fitted):
+                out.append((px * (1.0 - blend) + float(fx) * blend,
+                            py * (1.0 - blend) + float(fy) * blend))
+            return out
+        except cv2.error as exc:
+            self.logger.debug("_apply_rigid_constraint failed: %s", exc)
+            return points
+
+    def _optical_flow_bridge(self, gray):
+        """Follow markers through an occlusion using Lucas-Kanade optical flow.
+
+        Returns a list of (x, y) points if flow succeeds for the full set, else
+        None. Updates the reference frame/points so successive lost frames chain
+        together."""
+        if not self._flow_enabled or gray is None:
+            return None
+        if self._flow_prev_gray is None or self._flow_prev_pts is None:
+            return None
+        if len(self._flow_prev_pts) != self.expected_marker_count:
+            return None
+        try:
+            new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                self._flow_prev_gray, gray, self._flow_prev_pts, None,
+                **self._flow_lk_params
+            )
+        except cv2.error as exc:
+            self.logger.debug("optical flow bridge failed: %s", exc)
+            return None
+        if new_pts is None or status is None or int(status.sum()) < len(status):
+            # Lost at least one point — let the caller fall back to Kalman/rigid.
+            return None
+        pts = [(float(p[0][0]), float(p[0][1])) for p in new_pts]
+        # Chain: this frame becomes the reference for the next lost frame.
+        self._flow_prev_gray = gray
+        self._flow_prev_pts = new_pts.reshape(-1, 1, 2).astype(np.float32)
+        return pts
+
+    def _seed_optical_flow(self, gray, points):
+        """Remember the current frame + points as the optical-flow reference."""
+        if not self._flow_enabled or gray is None or not points:
+            return
+        self._flow_prev_gray = gray
+        self._flow_prev_pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+
+    def _stabilize_tracked_points(self, tracked_points, gray=None):
         if not tracked_points:
             self.tracking_lost_frames += 1
             if self.smoothed_points and self.tracking_lost_frames <= self.max_lost_tracking_frames:
@@ -1373,22 +1616,45 @@ class Worker(QObject):
                     with self._state_lock:
                         for kf in self._kalman_filters:
                             kf.predict()
+                # Optical-flow bridge: try to follow visible surface texture so a
+                # brief occlusion doesn't freeze the marks in place.
+                flow_pts = self._optical_flow_bridge(gray)
+                if flow_pts is not None:
+                    constrained = self._apply_rigid_constraint(flow_pts)
+                    self.smoothed_points = [
+                        (int(round(x)), int(round(y))) for x, y in constrained
+                    ]
+                    # Nudge the Kalman state toward the flow estimate so recovery
+                    # is seamless when the IR markers reappear.
+                    if self._kalman_initialized and len(self._kalman_filters) == len(constrained):
+                        with self._state_lock:
+                            for kf, (x, y) in zip(self._kalman_filters, constrained):
+                                kf.statePost[0, 0] = float(x)
+                                kf.statePost[1, 0] = float(y)
                 return self.smoothed_points
             self.smoothed_points = []
             self._kalman_filters = []
             self._kalman_initialized = False
+            self._flow_prev_gray = None
+            self._flow_prev_pts = None
             return []
 
         self.tracking_lost_frames = 0
+        self._ensure_rigid_template(tracked_points)
 
-        # If number of points changed, reinitialize Kalman filters
+        # If number of points changed, reinitialize Kalman filters.
+        # Coerce to int tuples: local-search returns sub-pixel floats and the
+        # downstream debug draw (cv2.circle) rejects non-integer centres.
         if len(self.smoothed_points) != len(tracked_points):
-            self.smoothed_points = [tuple(p) for p in tracked_points]
+            self.smoothed_points = [
+                (int(round(p[0])), int(round(p[1]))) for p in tracked_points
+            ]
             self._kalman_filters = [
                 self._init_kalman_filter(float(p[0]), float(p[1]))
                 for p in tracked_points
             ]
             self._kalman_initialized = True
+            self._seed_optical_flow(gray, self.smoothed_points)
             return self.smoothed_points
 
         # Match new points to previous positions to prevent identity swapping
@@ -1428,29 +1694,53 @@ class Worker(QObject):
             decayed_mn = current_mn * 0.5 + 8.0 * 0.5
             kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * decayed_mn
 
-            sx = int(round(float(corrected[0, 0])))
-            sy = int(round(float(corrected[1, 0])))
-            stabilized.append((sx, sy))
+            stabilized.append((float(corrected[0, 0]), float(corrected[1, 0])))
 
-        self.smoothed_points = stabilized
-        return stabilized
+        # Rigid-body constraint: enforce the guitar's known shape on the smoothed
+        # points, removing independent shear and reconstructing any drifted marker.
+        constrained = self._apply_rigid_constraint(stabilized)
+        # Write the rigid result back into the Kalman state so it doesn't fight
+        # the constraint on the next frame.
+        if (self._rigid_template is not None
+                and len(constrained) == len(self._kalman_filters)):
+            with self._state_lock:
+                for kf, (x, y) in zip(self._kalman_filters, constrained):
+                    kf.statePost[0, 0] = float(x)
+                    kf.statePost[1, 0] = float(y)
+
+        result = [(int(round(x)), int(round(y))) for x, y in constrained]
+        self.smoothed_points = result
+        self._seed_optical_flow(gray, result)
+        return result
+
+    @staticmethod
+    def _marker_spread(points):
+        """Rotation-invariant scale metric: mean distance of all markers from
+        their centroid. Uses every marker, so depth is robust to which two
+        markers happen to be visible or how the guitar is rotated."""
+        arr = np.asarray(points, dtype=np.float64)
+        if arr.shape[0] < 2:
+            return 0.0
+        center = arr.mean(axis=0)
+        return float(np.linalg.norm(arr - center, axis=1).mean())
 
     def _calculate_destination_points(self, tracked_points):
         dst_pts_raw = np.float32(tracked_points)
         if self.baseline_distance > 0 and len(tracked_points) >= 2:
-            current_distance = np.linalg.norm(
-                np.array(tracked_points[0]) - np.array(tracked_points[1])
-            )
-            scale_factor = (
-                (current_distance / self.baseline_distance - 1.0)
-                * self.depth_sensitivity
-                + 1.0
-            )
-            center = np.mean(dst_pts_raw, axis=0)
-            return (dst_pts_raw - center) * scale_factor + center
+            # Use the full-constellation spread (all markers) rather than the
+            # distance between just two, so depth scaling is stable under rotation.
+            current_spread = self._marker_spread(tracked_points)
+            if current_spread > 0:
+                scale_factor = (
+                    (current_spread / self.baseline_distance - 1.0)
+                    * self.depth_sensitivity
+                    + 1.0
+                )
+                center = np.mean(dst_pts_raw, axis=0)
+                return (dst_pts_raw - center) * scale_factor + center
         return dst_pts_raw
 
-    def _compute_transform(self, src_pts, dst_pts):
+    def _compute_transform(self, src_pts, dst_pts, cache_key=None):
         try:
             if len(src_pts) == 4:
                 M = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -1465,10 +1755,70 @@ class Worker(QObject):
             if abs(np.linalg.det(M[:2, :2])) < 1e-6:
                 self.logger.debug("_compute_transform: near-singular matrix rejected (det≈0)")
                 return None
+            # Homography smoothing: exponentially average the matrix itself so
+            # residual sub-pixel point jitter doesn't make the projection shimmer.
+            if cache_key is not None:
+                prev = self._prev_transforms.get(cache_key)
+                if prev is not None and prev.shape == M.shape:
+                    # Skip blending on a large change (re-acquire / big move) to
+                    # avoid lag; detected via translation delta of the matrix.
+                    delta = float(np.hypot(M[0, 2] - prev[0, 2], M[1, 2] - prev[1, 2]))
+                    if delta < 80.0:
+                        a = self._transform_smooth
+                        blended = (M * a + prev * (1.0 - a)).astype(M.dtype)
+                        # Only keep the blend if it's still a valid, non-degenerate
+                        # transform; otherwise fall back to the fresh matrix.
+                        if (np.all(np.isfinite(blended))
+                                and abs(np.linalg.det(blended[:2, :2])) >= 1e-6):
+                            M = blended
+                self._prev_transforms[cache_key] = M
+                # Bound the cache so stale mask ids don't accumulate.
+                if len(self._prev_transforms) > 64:
+                    self._prev_transforms.pop(next(iter(self._prev_transforms)))
             return M
         except cv2.error as exc:
             self.logger.debug("_compute_transform cv2 error: %s", exc)
             return None
+
+    def _warp_perspective_accel(self, src, M, dsize):
+        """warpPerspective that offloads to the GPU via OpenCL/UMat when available.
+
+        Used for the large full-frame projector warp. Falls back to plain CPU
+        warping if OpenCL is unavailable or anything goes wrong."""
+        if self._use_opencl:
+            try:
+                result = cv2.warpPerspective(cv2.UMat(src), M, dsize)
+                return result.get()
+            except cv2.error as exc:
+                self.logger.debug("OpenCL warp failed, falling back to CPU: %s", exc)
+                self._use_opencl = False
+        return cv2.warpPerspective(src, M, dsize)
+
+    def _maybe_refresh_dark_reference(self, gray, now, tracking_active):
+        """Periodically blend a fresh baseline into the dark reference while the
+        stage is idle, so ambient-IR drift during a show doesn't poison the
+        differential-brightness scoring."""
+        if not self._dark_refresh_enabled or gray is None:
+            return
+        if self._calib_dark_ref is None or tracking_active:
+            # Only refresh when nothing is being tracked (a true idle baseline).
+            self._dark_refresh_buf = []
+            return
+        if (now - self._last_dark_refresh) < self._dark_refresh_interval:
+            return
+        if gray.shape != self._calib_dark_ref.shape:
+            return
+        self._dark_refresh_buf.append(gray)
+        if len(self._dark_refresh_buf) >= 10:
+            # Round (not truncate) so the refreshed baseline doesn't drift darker.
+            fresh = np.round(np.mean(self._dark_refresh_buf, axis=0)).astype(np.uint8)
+            a = self._dark_refresh_blend
+            self._calib_dark_ref = cv2.addWeighted(
+                self._calib_dark_ref, 1.0 - a, fresh, a, 0
+            )
+            self._dark_refresh_buf = []
+            self._last_dark_refresh = now
+            self.logger.info("Dark reference refreshed (ambient-IR drift compensation)")
 
     def _get_cached_source_points(self, mask):
         key = id(mask)
@@ -2165,14 +2515,23 @@ class Worker(QObject):
             with self._state_lock:
                 _blackout = self._blackout
 
+            # Compute grayscale once per frame and share it with detection, the
+            # optical-flow occlusion bridge, and the rolling dark-ref refresh.
+            gray_full = cv2.cvtColor(main_frame, cv2.COLOR_BGR2GRAY)
+
             t0 = time.perf_counter()
-            all_detected_points = self._extract_detected_points(main_frame)
+            all_detected_points = self._extract_detected_points(main_frame, gray_full)
             detect_ms = (time.perf_counter() - t0) * 1000.0
 
             t0 = time.perf_counter()
             tracked_points = self._match_marker_configuration(all_detected_points)
-            tracked_points = self._stabilize_tracked_points(tracked_points)
+            tracked_points = self._stabilize_tracked_points(tracked_points, gray_full)
             match_ms = (time.perf_counter() - t0) * 1000.0
+
+            # Refresh the idle dark reference to track ambient-IR drift during a show.
+            self._maybe_refresh_dark_reference(
+                gray_full, time.perf_counter(), bool(tracked_points)
+            )
 
             self.trackers_detected.emit(len(tracked_points))
 
@@ -2188,9 +2547,9 @@ class Worker(QObject):
                 self.tracking_state_changed.emit(_new_state)
 
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
-                self._calibration_distances.append(
-                    np.linalg.norm(np.array(tracked_points[0]) - np.array(tracked_points[1]))
-                )
+                # Baseline uses the full-constellation spread to match the metric
+                # in _calculate_destination_points (all markers, rotation-stable).
+                self._calibration_distances.append(self._marker_spread(tracked_points))
                 if len(self._calibration_distances) >= 20:
                     self.baseline_distance = float(np.median(self._calibration_distances))
                     self._calibrate_depth_flag = False
@@ -2305,43 +2664,34 @@ class Worker(QObject):
                         [bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]
                     ])
 
-                if cue_path not in self.video_captures:
-                    cap_new = cv2.VideoCapture(cue_path)
-                    if not cap_new.isOpened():
+                # Cue videos are decoded on background threads (CueReader) so the
+                # render loop never blocks on disk I/O or codec stalls. Looping /
+                # one-shot is handled inside the reader. The dict is shared with
+                # set_masks() on the UI thread, so all lookups/mutations are done
+                # under _video_captures_lock to avoid a KeyError mid cue-change.
+                loop_mode = getattr(mask, "loop_mode", "loop") != "oneshot"
+                with self._video_captures_lock:
+                    cap_cue = self.video_captures.get(cue_path)
+                    if cap_cue is not None:
+                        self.video_captures.move_to_end(cue_path)
+                if cap_cue is None:
+                    # Open outside the lock — VideoCapture construction is slow and
+                    # only the render thread ever inserts, so there's no double-open.
+                    reader_new = CueReader(cue_path, loop=loop_mode, logger=self.logger)
+                    if not reader_new.is_opened():
                         self.logger.error("Could not open cue video: %s", cue_path)
-                        cap_new.release()
+                        reader_new.release()
                         continue
-                    # LRU eviction: release oldest if over 10 open captures
-                    while len(self.video_captures) >= 10:
-                        _, evicted = self.video_captures.popitem(last=False)
-                        evicted.release()
-                    self.video_captures[cue_path] = cap_new
+                    with self._video_captures_lock:
+                        # LRU eviction: stop oldest reader if over 10 open readers
+                        while len(self.video_captures) >= 10:
+                            _, evicted = self.video_captures.popitem(last=False)
+                            evicted.release()
+                        self.video_captures[cue_path] = reader_new
+                    cap_cue = reader_new
 
-                # Move to end (most recently used)
-                self.video_captures.move_to_end(cue_path)
-                cap_cue = self.video_captures[cue_path]
+                cap_cue.set_loop(loop_mode)
                 ret_cue, frame_cue = cap_cue.read()
-
-                if not ret_cue:
-                    # Improvement 39: respect loop_mode per mask
-                    if getattr(mask, "loop_mode", "loop") == "oneshot":
-                        # oneshot: hold on last frame — advance cue to trigger next or just hold
-                        # Try to seek back to just before the end to serve the last decoded frame
-                        total_frames = int(cap_cue.get(cv2.CAP_PROP_FRAME_COUNT))
-                        if total_frames > 1:
-                            cap_cue.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
-                            ret_cue, frame_cue = cap_cue.read()
-                        if not ret_cue:
-                            continue  # truly at end and oneshot — skip
-                    else:
-                        # Loop mode: try cheap seek first, fall back to reopen
-                        if not cap_cue.set(cv2.CAP_PROP_POS_FRAMES, 0):
-                            cap_cue.release()
-                            del self.video_captures[cue_path]
-                            cap_cue = cv2.VideoCapture(cue_path)
-                            if cap_cue.isOpened():
-                                self.video_captures[cue_path] = cap_cue
-                        ret_cue, frame_cue = cap_cue.read() if cap_cue.isOpened() else (False, None)
 
                 if not ret_cue:
                     continue
@@ -2351,7 +2701,7 @@ class Worker(QObject):
                     src_pts = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]])
                     matrix = cv2.getPerspectiveTransform(src_pts, dst_rect)
                 else:
-                    matrix = self._compute_transform(src_pts, dst_pts)
+                    matrix = self._compute_transform(src_pts, dst_pts, cache_key=id(mask))
 
                 if matrix is None:
                     continue
@@ -2433,7 +2783,7 @@ class Worker(QObject):
             # projector pixel space so content aligns with the physical scene.
             if self._cam_to_proj_H is not None:
                 proj_w, proj_h = self._proj_resolution
-                warped = cv2.warpPerspective(projector_output, self._cam_to_proj_H, (proj_w, proj_h))
+                warped = self._warp_perspective_accel(projector_output, self._cam_to_proj_H, (proj_w, proj_h))
                 qt_image_proj = QImage(
                     cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).tobytes(),
                     proj_w, proj_h, proj_w * 3, QImage.Format_RGB888)
@@ -2544,6 +2894,9 @@ class Worker(QObject):
         for cache_id in list(self._transform_cache.keys()):
             if cache_id not in valid_mask_ids:
                 del self._transform_cache[cache_id]
+        for cache_id in list(self._prev_transforms.keys()):
+            if cache_id not in valid_mask_ids:
+                del self._prev_transforms[cache_id]
 
         with self._video_captures_lock:
             for cue in list(self.video_captures.keys()):
