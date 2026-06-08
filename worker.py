@@ -71,6 +71,7 @@ class DetectionParams:
     kalman_motion_pn: float = 1.0
     kalman_motion_threshold: float = 5.0  # px/frame above which motion pn is used
     fog_contrast_threshold: float = 18.0
+    rigid_blend: float = 0.6          # 0 = off, 1 = full rigid-body pull
 
 
 class CueReader:
@@ -449,6 +450,10 @@ class Worker(QObject):
 
     def set_depth_sensitivity(self, value):
         self.depth_sensitivity = value
+
+    def set_rigid_blend(self, value: float) -> None:
+        """Set rigid body blend strength (0.0 = off, 1.0 = full pull onto rigid fit)."""
+        self._dp.rigid_blend = float(max(0.0, min(1.0, value)))
 
     def set_ir_threshold(self, value: int) -> None:
         self.ir_threshold = value
@@ -1561,7 +1566,7 @@ class Worker(QObject):
             if M is None or not np.all(np.isfinite(M)):
                 return points
             fitted = cv2.transform(tmpl, M).reshape(-1, 2)
-            blend = self._rigid_blend
+            blend = self._dp.rigid_blend
             out = []
             for (px, py), (fx, fy) in zip(points, fitted):
                 out.append((px * (1.0 - blend) + float(fx) * blend,
@@ -2715,7 +2720,7 @@ class Worker(QObject):
                 if bw <= 0 or bh <= 0:
                     continue
 
-                warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
+                warped_cue = self._warp_perspective_accel(frame_cue, matrix, (w, h))
 
                 mask_image = self._mask_buffer
                 mask_image.fill(0)
@@ -2783,14 +2788,23 @@ class Worker(QObject):
             # projector pixel space so content aligns with the physical scene.
             if self._cam_to_proj_H is not None:
                 proj_w, proj_h = self._proj_resolution
-                warped = self._warp_perspective_accel(projector_output, self._cam_to_proj_H, (proj_w, proj_h))
-                qt_image_proj = QImage(
-                    cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).tobytes(),
-                    proj_w, proj_h, proj_w * 3, QImage.Format_RGB888)
+                out_frame = self._warp_perspective_accel(projector_output, self._cam_to_proj_H, (proj_w, proj_h))
+                out_w, out_h = proj_w, proj_h
             else:
-                qt_image_proj = QImage(
-                    cv2.cvtColor(projector_output, cv2.COLOR_BGR2RGB).tobytes(),
-                    w, h, w * 3, QImage.Format_RGB888)
+                out_frame = projector_output
+                out_w, out_h = w, h
+
+            # Apply manual 4-corner keystone when the operator has moved any
+            # warp handle away from its default full-frame corner position.
+            if not self._is_default_warp():
+                ks_src = np.float32([[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]])
+                ks_dst = np.float32([[p[0] * out_w, p[1] * out_h] for p in self.warp_points])
+                ks_M = cv2.getPerspectiveTransform(ks_src, ks_dst)
+                out_frame = self._warp_perspective_accel(out_frame, ks_M, (out_w, out_h))
+
+            qt_image_proj = QImage(
+                cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB).tobytes(),
+                out_w, out_h, out_w * 3, QImage.Format_RGB888)
             self.projector_frame_ready.emit(qt_image_proj)
             projector_ms = (time.perf_counter() - t0) * 1000.0
 

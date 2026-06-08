@@ -440,6 +440,7 @@ class ProjectionMappingApp(QMainWindow):
                 self.marker_count_spin.value() or 4,
             "window_geometry": self.saveGeometry().toBase64().data().decode(),
             "splitter_sizes": self.main_splitter.sizes(),
+            "rigid_blend": self.rigid_blend_slider.value(),
         }
         try:
             # Rotate backup files
@@ -538,6 +539,11 @@ class ProjectionMappingApp(QMainWindow):
         if hasattr(self, 'marker_count_spin'):
             self.marker_count_spin.setValue(int(marker_count))
             self.worker.set_expected_marker_count(int(marker_count))
+
+        rigid_blend = self.settings.get("rigid_blend", 60)
+        if hasattr(self, 'rigid_blend_slider'):
+            self.rigid_blend_slider.setValue(int(rigid_blend))
+            self.worker.set_rigid_blend(int(rigid_blend) / 100.0)
 
     def _run_marker_selection_dialog(self, *, use_live_capture=True, reference_pixmap=None, title="Select IR Markers", ir_assist=True):
         self.marker_selection_dialog.setWindowTitle(title)
@@ -1030,6 +1036,26 @@ class ProjectionMappingApp(QMainWindow):
         self.marker_count_spin.valueChanged.connect(self.worker.set_expected_marker_count)
         marker_count_row.addWidget(self.marker_count_spin)
         ir_layout.addLayout(marker_count_row)
+
+        # Rigid-body blend: how strongly markers are pulled onto the guitar's rigid shape
+        rigid_blend_row = QHBoxLayout()
+        rigid_blend_row.addWidget(QLabel("Rigid Blend:"))
+        self.rigid_blend_value_label = QLabel("60")
+        self.rigid_blend_value_label.setMinimumWidth(32)
+        rigid_blend_row.addWidget(self.rigid_blend_value_label)
+        ir_layout.addLayout(rigid_blend_row)
+        self.rigid_blend_slider = QSlider(Qt.Horizontal)
+        self.rigid_blend_slider.setRange(0, 100)
+        self.rigid_blend_slider.setValue(60)
+        self.rigid_blend_slider.setToolTip(
+            "How strongly to enforce the guitar's rigid body shape during tracking "
+            "(0 = off, 100 = full). Reduce on steep perspective tilt."
+        )
+        self.rigid_blend_slider.valueChanged.connect(
+            lambda v: self.rigid_blend_value_label.setText(str(v))
+        )
+        self.rigid_blend_slider.valueChanged.connect(self.update_rigid_blend)
+        ir_layout.addWidget(self.rigid_blend_slider)
 
         # Improvement 55: calibration state indicator label
         self.calib_state_label = QLabel("State: Not calibrated")
@@ -1726,6 +1752,9 @@ class ProjectionMappingApp(QMainWindow):
 
     def update_depth_sensitivity(self, value):
         self.worker.set_depth_sensitivity(value / 100.0)
+
+    def update_rigid_blend(self, value: int) -> None:
+        self.worker.set_rigid_blend(value / 100.0)
 
     @pyqtSlot(int)
     def show_camera_error(self, index):
