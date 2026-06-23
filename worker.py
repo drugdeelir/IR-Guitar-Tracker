@@ -96,6 +96,8 @@ class Worker(QObject):
     calibration_warning = pyqtSignal(str)
     # Improvement 10: emitted when multiple guitar-shaped candidates are found during DETECT phase
     guitar_candidates_ready = pyqtSignal(list)
+    # Improvement 20: emitted when auto-recalibration is triggered due to sustained low confidence
+    auto_recalibration_triggered = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -299,6 +301,15 @@ class Worker(QObject):
 
         # Internal state for confidence computation
         self._last_reprojection_error = float("inf")  # set by _match_marker_configuration
+
+        # Improvement 13: live mask preview overlay (mask id(mask) to preview, or None)
+        self._preview_mask_id: Optional[int] = None
+
+        # Improvement 19: alignment diagnostic overlay toggle
+        self._show_diagnostics: bool = False
+
+        # Improvement 20: consecutive low-confidence frames counter for auto-recalibration
+        self._low_confidence_frames: int = 0
 
     def _camera_backends(self):
         """Return backends to try for sustained camera capture (not probing).
@@ -2772,6 +2783,29 @@ class Worker(QObject):
                         "Calibration complete. %d markers, homography=%s",
                         len(markers), "YES" if self._cam_to_proj_H is not None else "NO"
                     )
+
+                    # Improvement 18: post-calibration homography validation
+                    if self._cam_to_proj_H is not None:
+                        try:
+                            _cam_dot_pts = getattr(self, '_last_proj_dot_cam_pts', None)
+                            if _cam_dot_pts and len(_cam_dot_pts) == 4:
+                                _cam_arr = np.float32(_cam_dot_pts).reshape(-1, 1, 2)
+                                _reproj = cv2.perspectiveTransform(_cam_arr, self._cam_to_proj_H).reshape(-1, 2)
+                                _proj_expected = np.float32(proj_corners)
+                                _max_err = float(np.max(np.linalg.norm(_reproj - _proj_expected, axis=1)))
+                                self.logger.info("Post-calibration homography reprojection error: %.1f px", _max_err)
+                                if _max_err > 10.0:
+                                    _wmsg = f"Homography reprojection error {_max_err:.1f}px — consider re-calibrating."
+                                    self.logger.warning(_wmsg)
+                                    self.calibration_warning.emit(_wmsg)
+                            _det = float(np.linalg.det(self._cam_to_proj_H[:2, :2]))
+                            if abs(_det) < 0.01 or abs(_det) > 100.0:
+                                _wmsg = f"Homography appears degenerate (det={_det:.3f}) — re-calibration required."
+                                self.logger.warning(_wmsg)
+                                self.calibration_warning.emit(_wmsg)
+                        except Exception:
+                            self.logger.warning("Post-calibration validation failed", exc_info=True)
+
                     self.markers_calibrated.emit(markers)
                     self._save_calibration()
 
@@ -2883,6 +2917,26 @@ class Worker(QObject):
             if _new_state != self._tracking_state:
                 self._tracking_state = _new_state
                 self.tracking_state_changed.emit(_new_state)
+
+            # Improvement 20: auto-recalibration on sustained low tracking confidence
+            if (self.tracking_confidence < 0.4 and not self._fog_detected
+                    and self._calib_phase == CalibPhase.DONE and self._calibrated
+                    and self._calib_dark_ref is not None and self._calib_illum_ref is not None):
+                self._low_confidence_frames += 1
+                if self._low_confidence_frames >= 60:
+                    self._low_confidence_frames = 0
+                    self.logger.warning(
+                        "Tracking confidence below 0.4 for 60 frames — triggering automatic re-detect")
+                    self._calib_phase = CalibPhase.DETECT
+                    self._calib_frame_count = 0
+                    self._detect_diff_frames = []
+                    self._calibrated = False
+                    _rc_msg = "Tracking confidence degraded — automatic re-detection triggered."
+                    self.calibration_warning.emit(_rc_msg)
+                    self.auto_recalibration_triggered.emit()
+            else:
+                if self.tracking_confidence >= 0.4 or self._fog_detected:
+                    self._low_confidence_frames = 0
 
             if self._calibrate_depth_flag and len(tracked_points) >= 2:
                 self._calibration_distances.append(
@@ -3027,7 +3081,8 @@ class Worker(QObject):
                         _stale_age = self._homography_age.get(_mask_id, float('inf'))
                         if _stale_H is not None and _stale_age <= self._stale_homography_max_age:
                             _use_stale_homography = True
-                            _stale_opacity_factor = 0.5  # render at half opacity
+                            # Improvement 15: linear fade over stale age (1.0 → 0.0 over max_age frames)
+                            _stale_opacity_factor = max(0.0, 1.0 - _stale_age / float(self._stale_homography_max_age))
                         else:
                             continue
 
@@ -3117,6 +3172,14 @@ class Worker(QObject):
                     self._homography_age[_mask_id] = 0
 
                 # Compute destination bounding box and warp only that ROI to reduce cost
+                # Improvement 16: clamp destination polygon vertices to camera frame bounds
+                _pre_clamp = dst_pts.copy()
+                dst_pts = np.column_stack([
+                    np.clip(dst_pts[:, 0], 0.0, float(w - 1)),
+                    np.clip(dst_pts[:, 1], 0.0, float(h - 1)),
+                ]).astype(np.float32)
+                if not np.array_equal(dst_pts, _pre_clamp):
+                    self.logger.debug("Mask '%s': polygon clamped to camera frame bounds", mask.name)
                 dst_int = np.int32(dst_pts)
                 bx, by, bw, bh = cv2.boundingRect(dst_int)
                 bx, by = max(0, bx), max(0, by)
@@ -3125,16 +3188,35 @@ class Worker(QObject):
                 if bw <= 0 or bh <= 0:
                     continue
 
-                warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
-
-                mask_image = self._mask_buffer
-                mask_image.fill(0)
-                cv2.fillPoly(mask_image, [dst_int], (255, 255, 255))
-
-                # Composite only within the bounding rect for efficiency
                 roi_proj = projector_output[by:by+bh, bx:bx+bw]
-                roi_warp = warped_cue[by:by+bh, bx:bx+bw]
-                roi_mask = mask_image[by:by+bh, bx:bx+bw]
+                # Improvement 17: sub-pixel ROI warp with anti-aliased mask edges
+                _subpixel = False
+                if bw > 4 and bh > 4:
+                    try:
+                        _S = 2
+                        _M2 = (np.float64([[_S, 0, -float(_S * bx)],
+                                           [0, _S, -float(_S * by)],
+                                           [0,  0,  1.0]])
+                               @ matrix.astype(np.float64))
+                        _warped_2x = cv2.warpPerspective(
+                            frame_cue, _M2, (_S * bw, _S * bh), flags=cv2.INTER_LINEAR)
+                        roi_warp = cv2.resize(_warped_2x, (bw, bh), interpolation=cv2.INTER_AREA)
+                        _mask_2x = np.zeros((_S * bh, _S * bw), dtype=np.uint8)
+                        _roi_pts_2x = np.int32(
+                            (dst_int.reshape(-1, 2) - np.array([bx, by])) * _S)
+                        cv2.fillPoly(_mask_2x, [_roi_pts_2x], 255)
+                        _mask_1x = cv2.resize(_mask_2x, (bw, bh), interpolation=cv2.INTER_AREA)
+                        roi_mask = cv2.cvtColor(_mask_1x, cv2.COLOR_GRAY2BGR)
+                        _subpixel = True
+                    except Exception:
+                        _subpixel = False
+                if not _subpixel:
+                    warped_cue = cv2.warpPerspective(frame_cue, matrix, (w, h))
+                    mask_image = self._mask_buffer
+                    mask_image.fill(0)
+                    cv2.fillPoly(mask_image, [dst_int], (255, 255, 255))
+                    roi_warp = warped_cue[by:by+bh, bx:bx+bw]
+                    roi_mask = mask_image[by:by+bh, bx:bx+bw]
 
                 # Apply per-mask opacity with fade-in/out animation support
                 opacity = self._get_mask_effective_opacity(mask, time.perf_counter())
@@ -3147,8 +3229,8 @@ class Worker(QObject):
                 # Build a binary alpha channel from the mask polygon (0 or 255)
                 alpha_bin = roi_mask[:, :, 0:1]  # shape (H,W,1), values 0 or 255
 
-                if opacity >= 0.999 and blend_mode == 'normal':
-                    # Fast path: fully opaque normal blend
+                if opacity >= 0.999 and blend_mode == 'normal' and not _subpixel:
+                    # Fast path: fully opaque normal blend (binary mask only)
                     roi_proj[:] = cv2.add(
                         cv2.bitwise_and(roi_proj, cv2.bitwise_not(roi_mask)),
                         cv2.bitwise_and(roi_warp, roi_mask)
@@ -3169,6 +3251,81 @@ class Worker(QObject):
 
                     roi_proj[:] = np.clip(blended, 0, 255).astype(np.uint8)
             warp_compose_ms = (time.perf_counter() - t0) * 1000.0
+
+            # Improvement 13: live mask preview overlay on camera feed
+            if self._preview_mask_id is not None and self._calibrated:
+                try:
+                    _prev_mask = next((m for m in self.masks if id(m) == self._preview_mask_id), None)
+                    if _prev_mask is not None and _prev_mask.source_points:
+                        _drew_preview = False
+                        if (tracked_points and getattr(_prev_mask, 'marker_anchor_points', None)
+                                and len(_prev_mask.marker_anchor_points) >= 4):
+                            _ps = self._get_cached_source_points(_prev_mask)
+                            _pd = self._calculate_destination_points(tracked_points)
+                            _pa = np.float32(_prev_mask.marker_anchor_points)
+                            if len(_pa) >= 4 and len(_pd) >= 4:
+                                _pmx = cv2.getPerspectiveTransform(_pa[:4], np.float32(_pd[:4]))
+                                if _pmx is not None:
+                                    _dpoly = cv2.perspectiveTransform(
+                                        _ps.reshape(-1, 1, 2), _pmx).reshape(-1, 2)
+                                    _ov = main_frame.copy()
+                                    cv2.fillPoly(_ov, [np.int32(_dpoly)], (0, 200, 0))
+                                    cv2.addWeighted(main_frame, 0.7, _ov, 0.3, 0, main_frame)
+                                    cv2.polylines(main_frame, [np.int32(_dpoly)], True, (255, 255, 255), 2)
+                                    _drew_preview = True
+                        if not _drew_preview and len(_prev_mask.source_points) >= 3:
+                            _sp_arr = np.int32(_prev_mask.source_points)
+                            _ov = main_frame.copy()
+                            cv2.fillPoly(_ov, [_sp_arr], (0, 200, 0))
+                            cv2.addWeighted(main_frame, 0.7, _ov, 0.3, 0, main_frame)
+                            cv2.polylines(main_frame, [_sp_arr], True, (255, 255, 255), 2)
+                except Exception:
+                    pass
+
+            # Improvement 19: alignment diagnostic overlay
+            if self._show_diagnostics and self._calibrated:
+                # Guitar polygon in green
+                if self._guitar_polygon and len(self._guitar_polygon) >= 3:
+                    _gp = np.int32(self._guitar_polygon)
+                    cv2.polylines(main_frame, [_gp], True, (0, 255, 0), 2)
+                    _gc = _gp.mean(axis=0).astype(int)
+                    cv2.putText(main_frame, "Guitar", (_gc[0] - 20, _gc[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # Guitar bounds rectangle in cyan
+                if self._guitar_bounds:
+                    _gx1, _gy1, _gx2, _gy2 = (int(v) for v in self._guitar_bounds)
+                    cv2.rectangle(main_frame, (_gx1, _gy1), (_gx2, _gy2), (255, 255, 0), 1)
+                # Marker positions with IDs in yellow
+                for _mi, _sp in enumerate(self.smoothed_points):
+                    cv2.circle(main_frame, (int(_sp[0]), int(_sp[1])), 10, (0, 255, 255), 2)
+                    cv2.putText(main_frame, f"M{_mi}",
+                                (int(_sp[0]) + 12, int(_sp[1]) - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                # Inter-marker distance lines in white
+                for _di, _p1 in enumerate(self.smoothed_points):
+                    for _dj, _p2 in enumerate(self.smoothed_points):
+                        if _dj <= _di:
+                            continue
+                        cv2.line(main_frame,
+                                 (int(_p1[0]), int(_p1[1])), (int(_p2[0]), int(_p2[1])),
+                                 (255, 255, 255), 1)
+                # Homography grid: project 4×4 grid from projector to camera space
+                if self._cam_to_proj_H is not None:
+                    try:
+                        _H_inv = np.linalg.inv(self._cam_to_proj_H)
+                        _pw, _ph = self._proj_resolution
+                        _gpts = np.float32([
+                            [x * _pw / 3, y * _ph / 3]
+                            for x in range(4) for y in range(4)
+                        ])
+                        _cam_g = cv2.perspectiveTransform(
+                            _gpts.reshape(-1, 1, 2), _H_inv).reshape(-1, 2)
+                        for _gp2 in _cam_g:
+                            cv2.circle(main_frame, (int(_gp2[0]), int(_gp2[1])), 3, (255, 0, 0), -1)
+                    except Exception:
+                        pass
+                cv2.putText(main_frame, f"DIAG | Conf:{self.tracking_confidence:.2f}",
+                            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
 
             if self._capture_still_frame_flag:
                 qt_image_still = QImage(
@@ -3317,3 +3474,11 @@ class Worker(QObject):
                 if cue not in current_cues:
                     self.video_captures[cue].release()
                     del self.video_captures[cue]
+
+    def set_preview_mask(self, mask_id: Optional[int]) -> None:
+        """Improvement 13: set which mask id(mask) to preview as overlay on camera feed. None = off."""
+        self._preview_mask_id = mask_id
+
+    def set_show_diagnostics(self, enabled: bool) -> None:
+        """Improvement 19: toggle alignment diagnostic overlay on the camera feed."""
+        self._show_diagnostics = bool(enabled)

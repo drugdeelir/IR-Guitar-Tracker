@@ -298,6 +298,11 @@ class ProjectionMappingApp(QMainWindow):
         self.worker.diagnostic_info.connect(self._on_diagnostic_info, Qt.QueuedConnection)
         # Improvement 10: connect guitar multi-candidate signal
         self.worker.guitar_candidates_ready.connect(self._on_guitar_candidates_ready, Qt.QueuedConnection)
+        # Improvement 18/3: calibration quality warnings
+        self.worker.calibration_warning.connect(self._on_calibration_warning, Qt.QueuedConnection)
+        # Improvement 20: auto-recalibration triggered notification
+        self.worker.auto_recalibration_triggered.connect(
+            self._on_auto_recalibration_triggered, Qt.QueuedConnection)
 
         # Screen-change recovery: repopulate projector combo when displays change
         _app = QApplication.instance()
@@ -1449,9 +1454,6 @@ class ProjectionMappingApp(QMainWindow):
             f"Calibration complete — {len(marker_positions)} markers detected.", "success", 6000
         )
 
-        if not hasattr(self, '_guitar_video_path') or not self._guitar_video_path:
-            return
-
         # Use actual camera resolution from worker (set once frames start)
         cam_w = self.worker.frame_width or getattr(self, '_cam_w', 640)
         cam_h = self.worker.frame_height or getattr(self, '_cam_h', 480)
@@ -1459,9 +1461,6 @@ class ProjectionMappingApp(QMainWindow):
         self._cam_h = cam_h
 
         # Use the actual guitar polygon from silhouette detection if available.
-        # This is built in worker._detect_markers_from_diff from the actual
-        # contour shape, giving a much more accurate mask than the old
-        # 4-marker T-shape extrapolation.
         guitar_polygon = getattr(self.worker, '_guitar_polygon', None)
         if guitar_polygon and len(guitar_polygon) >= 3:
             guitar_points = [(int(x), int(y)) for x, y in guitar_polygon]
@@ -1482,6 +1481,20 @@ class ProjectionMappingApp(QMainWindow):
                 (min(xs) - pad, max(ys) + pad),
             ]
             self.logger.info("Fallback guitar rect from markers: %s", guitar_points)
+
+        # Improvement 14: auto-fit dynamic guitar mask from silhouette when no dynamic mask exists
+        _has_dynamic = any(getattr(m, 'linked_marker_count', 0) > 0 for m in self.masks)
+        if not _has_dynamic and guitar_polygon and len(guitar_polygon) >= 3:
+            auto_mask = self.ensure_mask(
+                "Guitar (Auto)", guitar_points, mask_type="dynamic", linked_marker_count=4)
+            auto_mask.marker_anchor_points = [list(p) for p in list(marker_positions)[:4]]
+            self.logger.info("Auto-created dynamic guitar mask from silhouette polygon")
+
+        if not hasattr(self, '_guitar_video_path') or not self._guitar_video_path:
+            self.worker.set_masks(self.masks)
+            self.refresh_mask_views(select_index=0)
+            self.worker.set_active_cue_index(-1)
+            return
 
         guitar_mask = self.ensure_mask("Guitar", guitar_points, mask_type="static")
         if not guitar_mask.cues or not any(c for c in guitar_mask.cues):
@@ -2506,6 +2519,26 @@ class ProjectionMappingApp(QMainWindow):
         QTimer.singleShot(5000, lambda: self.logger.info(
             "Guitar candidate auto-selection confirmed (best of %d candidates).", n
         ))
+
+    def _on_calibration_warning(self, msg: str) -> None:
+        """Improvement 18/3: show calibration quality warnings from the worker."""
+        self.logger.warning("Calibration warning: %s", msg)
+        self._status_message(msg, "warning", 8000)
+
+    def _on_auto_recalibration_triggered(self) -> None:
+        """Improvement 20: notify user when auto-recalibration fires due to low confidence."""
+        self._status_message(
+            "Auto re-calibration triggered due to low tracking confidence.", "warning", 6000)
+
+    def keyPressEvent(self, event) -> None:
+        """Improvement 19: 'D' toggles the diagnostic overlay on the camera feed."""
+        if event.key() == 68:  # Qt.Key_D
+            if hasattr(self, 'worker'):
+                _new = not self.worker._show_diagnostics
+                self.worker.set_show_diagnostics(_new)
+                self._status_message(
+                    f"Diagnostic overlay {'ON' if _new else 'OFF'}", "info", 2000)
+        super().keyPressEvent(event)
 
     def _on_calibration_restored(self) -> None:
         """Improvement 83: update UI when calibration loads from cache."""
